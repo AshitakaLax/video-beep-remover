@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "video-beep-remover"
+dynamic = ["version"]
+description = "Mute a configurable list of words in video files, using Whisper speech recognition and FFmpeg."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Levi Balling" }]
+requires-python = ">=3.11"
+classifiers = [
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio :: Editors",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = [
+  "charset-normalizer>=3",
+  "faster-whisper>=1.1",
+  "guessit>=3.4",
+  "httpx>=0.25",
+  "numpy>=1.24",
+  "platformdirs>=4",
+  "pydantic>=2.6",
+  "pysubs2>=1.6",
+  "rapidfuzz>=3",
+  "rich>=13",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+sync = ["ffsubsync>=0.4.25"]  # re-times subtitles that fail the sync check
+dev = [
+  "hypothesis>=6",
+  "mypy>=1.10",
+  "pytest>=8",
+  "respx>=0.20",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+vbr = "video_beep_remover.cli:main"
+video-beep-remover = "video_beep_remover.cli:main"
+
+[tool.hatch.version]
+path = "src/video_beep_remover/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/video_beep_remover"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+  "ffmpeg: needs ffmpeg and ffprobe on PATH (skipped when missing)",
+  "asr: downloads and runs a Whisper model (opt-in with VBR_RUN_ASR_TESTS=1)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # typographic characters (–, →, ×) in strings and comments are intended
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]  # expected FFmpeg command lines are long
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["faster_whisper.*", "ctranslate2.*"]
+ignore_missing_imports = true
