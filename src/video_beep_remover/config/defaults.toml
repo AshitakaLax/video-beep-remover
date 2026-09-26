@@ -146,6 +146,7 @@ subtitle_streams = "censor"         # "censor" | "copy" | "drop"
 subtitle_mask = "first_letter"      # "first_letter" (f***) | "asterisks" (****) | "remove"
 report = true                       # <output stem>.vbr.json
 edl = false                         # <input stem>.edl next to the input: Kodi / MPlayer mute the original file
+review_srt = false                  # <output stem>.review.srt: one cue per muted span, to spot-check in a player
 
 [cache]
 dir = "auto"                        # per-user cache dir

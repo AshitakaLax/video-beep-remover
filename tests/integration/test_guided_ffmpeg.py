@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from helpers import FakeTranscriber, StrictUI, decode, make_clip, say, srt, tone_gain
+from helpers import FakeTranscriber, StrictUI, decode, extract_subtitles, make_clip, say, srt, tone_gain
 from video_beep_remover.config import load_config
 from video_beep_remover.errors import VbrError
 from video_beep_remover.media.audio import SAMPLE_RATE
@@ -113,13 +113,26 @@ def test_targeted_transcribes_only_windows_around_flagged_cues(tmp_path: Path) -
     assert tone_gain(samples, (hell["start"] + hell["end"]) / 2) < 0.01
     assert tone_gain(samples, 21.0) == pytest.approx(1.0, abs=0.1)
 
+    # The subtitles it used get a censored copy next to the output, named so players load it.
+    copy = tmp_path / "movie.clean.en.srt"
+    assert result.subtitle_copy == copy
+    assert copy.read_text("utf-8") == SUBTITLES.replace("the hell is", "the h*** is")
+    assert report["output"]["subtitle_copy"] == {
+        "source": str(tmp_path / "movie.en.srt"), "path": str(copy), "masked": 2
+    }  # fmt: skip
 
-def test_embedded_subtitles_are_used_first(tmp_path: Path) -> None:
+
+def test_embedded_subtitles_are_used_first_and_censored_in_the_output(tmp_path: Path) -> None:
     source = clip(tmp_path, sidecar=None, embedded=SUBTITLES)
-    _, report = Run(tmp_path, words=spoken(), **{"analysis.strategy": "targeted"}).process(source)
+    run = Run(tmp_path, words=spoken(), **{"analysis.strategy": "targeted"})
+    result, report = run.process(source, dry_run=False)
     assert report["subtitle"]["source"] == "embedded"
     assert report["strategy"]["used"] == "targeted"
     assert len(report["detections"]) == 2
+    assert report["output"]["subtitles"] == [{"stream": 2, "codec": "subrip", "language": None, "masked": 2}]
+    assert result.output is not None and result.subtitle_copy is None
+    text = extract_subtitles(result.output)
+    assert "What the h*** is going on" in text and "Get the f*** out" in text and "Freaking" in text
 
 
 def test_explicit_subtitles_skip_the_search(tmp_path: Path) -> None:

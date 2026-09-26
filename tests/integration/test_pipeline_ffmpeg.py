@@ -113,3 +113,52 @@ def test_prompt_and_language_reach_the_transcriber(tmp_path: Path) -> None:
     assert call["language"] == "en"
     assert call["seconds"] == pytest.approx(3.0, abs=0.05)
     assert isinstance(call["prompt"], str) and call["prompt"].startswith("Fuck")
+
+
+def test_review_subtitles_name_each_muted_span(tmp_path: Path) -> None:
+    source = make_clip(tmp_path / "movie.mkv")
+    run = pipeline(tmp_path)
+    scanned = run.process(source, RunOptions(dry_run=True, review_srt=True))
+    assert scanned.review == tmp_path / "movie.review.srt"
+    assert scanned.review.read_text("utf-8") == "1\n00:00:01,880 --> 00:00:02,520\n[muted] damn\n"
+
+    cleaned = run.process(source, RunOptions(review_srt=True))
+    assert cleaned.review == tmp_path / "movie.clean.review.srt"
+    shift = json.loads((tmp_path / "movie.clean.vbr.json").read_text("utf-8"))["output"]["timeline_shift"]
+    start, end = (f"00:00:0{t + shift:.3f}".replace(".", ",") for t in (1.88, 2.52))
+    assert cleaned.review.read_text("utf-8") == f"1\n{start} --> {end}\n[muted] damn\n"
+
+
+def test_render_mutes_the_spans_of_a_hand_edited_report(tmp_path: Path) -> None:
+    source = make_clip(tmp_path / "movie.mkv")
+    run = pipeline(tmp_path)
+    run.process(source, RunOptions(dry_run=True))
+    report_path = tmp_path / "movie.vbr.json"
+    report = json.loads(report_path.read_text("utf-8"))
+    report["intervals"] = [{"start": 4.5, "end": 5.0}, {"start": 4.0, "end": 4.6}]  # "damn" is let through
+    report_path.write_text(json.dumps(report), "utf-8")
+
+    result = run.render_report(source, report_path, RunOptions())
+    assert (result.status, result.output, result.intervals) == ("cleaned", tmp_path / "movie.clean.mkv", 1)
+    samples = decode(tmp_path / "movie.clean.mkv")
+    assert tone_gain(samples, 4.8) < 0.01  # the two spans overlap, so they merge: 4.0-5.0
+    assert tone_gain(samples, 2.2, window=0.05) == pytest.approx(1.0, abs=0.05)
+    assert json.loads(report_path.read_text("utf-8")) == report  # the report is only read
+
+    other = make_clip(tmp_path / "other.mkv", duration=9.0)
+    with pytest.raises(UsageError, match="made for a different file"):
+        run.render_report(other, report_path, RunOptions())
+    assert run.render_report(other, report_path, RunOptions(), force=True).status == "cleaned"
+
+
+@pytest.mark.parametrize(
+    ("intervals", "message"),
+    [(None, 'no "intervals" list'), ([{"start": 2}], 'intervals\\[0\\]: needs a numeric "start" and "end"'),
+     ([{"start": 3, "end": 2}], "end must be after start")],
+)  # fmt: skip
+def test_render_rejects_unusable_intervals(tmp_path: Path, intervals: Any, message: str) -> None:
+    source = make_clip(tmp_path / "movie.mkv", duration=2.0)
+    report = tmp_path / "edited.json"
+    report.write_text(json.dumps({"intervals": intervals} if intervals is not None else {}), "utf-8")
+    with pytest.raises(UsageError, match=message):
+        pipeline(tmp_path).render_report(source, report, RunOptions())

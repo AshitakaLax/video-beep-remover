@@ -167,7 +167,20 @@ def _summarize(result: FileResult) -> str:
         return f"{name}: nothing to mute, no output written"
     if result.status == "copied":
         return f"{name}: nothing to mute, copied → {result.output} ({result.strategy})"
-    return f"{name}: muted {result.intervals} spans → {result.output} ({result.strategy})"
+    how = "from the report" if result.strategy == "report" else result.strategy
+    return f"{name}: muted {result.intervals} spans → {result.output} ({how})"
+
+
+def _print_result(ui: ConsoleUI, result: FileResult) -> None:
+    console.print(f"[green]✔[/] {escape(_summarize(result))}")
+    for label, path in (
+        ("report", result.report),
+        ("EDL", result.edl),
+        ("review subtitles", result.review),
+        ("censored subtitles", result.subtitle_copy),
+    ):
+        if path:
+            ui.info(f"  {label}: {path}")
 
 
 def _run(
@@ -206,11 +219,7 @@ def _run(
             failures += 1
             ui.error(f"{path.name}: {exc}")
             continue
-        console.print(f"[green]✔[/] {escape(_summarize(result))}")
-        if result.report:
-            ui.info(f"  report: {result.report}")
-        if result.edl:
-            ui.info(f"  EDL: {result.edl}")
+        _print_result(ui, result)
     if failures:
         ui.error(f"{failures} of {len(files)} files failed")
         raise typer.Exit(EXIT_PARTIAL)
@@ -233,6 +242,13 @@ LanguageOpt = Annotated[str | None, typer.Option(help="Spoken language, e.g. en.
 AudioStreamOpt = Annotated[int | None, typer.Option(help="ffprobe index of the dialogue audio stream.")]
 ReportOpt = Annotated[Path | None, typer.Option(help="Where to write the JSON report.")]
 EdlOpt = Annotated[bool, typer.Option("--edl", help="Also write <input>.edl, a mute list for Kodi/MPlayer.")]
+ReviewOpt = Annotated[
+    bool,
+    typer.Option("--review-srt", help="Also write .review.srt: one cue per muted span, for spot checks."),
+]
+OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")]
+OverwriteOpt = Annotated[bool, typer.Option("--overwrite", help="Replace existing outputs.")]
+KeepTempOpt = Annotated[bool, typer.Option("--keep-temp", help="Keep temporary files for debugging.")]
 RecursiveOpt = Annotated[bool, typer.Option("--recursive", "-r", help="Search folders recursively.")]
 VerboseOpt = Annotated[bool, typer.Option("--verbose", "-v", help="Show debug output.")]
 QuietOpt = Annotated[bool, typer.Option("--quiet", "-q", help="Only show results and errors.")]
@@ -242,7 +258,7 @@ QuietOpt = Annotated[bool, typer.Option("--quiet", "-q", help="Only show results
 def clean(
     inputs: InputsArg,
     config: ConfigOpt = None,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")] = None,
+    output: OutputOpt = None,
     strategy: StrategyOpt = None,
     subtitles: SubtitlesOpt = None,
     no_fallback: NoFallbackOpt = False,
@@ -255,14 +271,13 @@ def clean(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Detect only; same as `vbr scan`.")] = False,
     report: ReportOpt = None,
     edl: EdlOpt = False,
-    overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace existing outputs.")] = False,
+    review_srt: ReviewOpt = False,
+    overwrite: OverwriteOpt = False,
     skip_existing: Annotated[
         bool, typer.Option("--skip-existing", help="Skip inputs whose output exists.")
     ] = False,
     recursive: RecursiveOpt = False,
-    keep_temp: Annotated[
-        bool, typer.Option("--keep-temp", help="Keep temporary files for debugging.")
-    ] = False,
+    keep_temp: KeepTempOpt = False,
     verbose: VerboseOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
@@ -272,6 +287,7 @@ def clean(
         output=output,
         report=report,
         edl=edl,
+        review_srt=review_srt,
         overwrite=overwrite,
         skip_existing=skip_existing,
         keep_temp=keep_temp,
@@ -310,13 +326,23 @@ def scan(
     audio_stream: AudioStreamOpt = None,
     report: ReportOpt = None,
     edl: EdlOpt = False,
-    overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace an existing EDL.")] = False,
+    review_srt: ReviewOpt = False,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Replace an existing EDL or review subtitles.")
+    ] = False,
     recursive: RecursiveOpt = False,
     verbose: VerboseOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
     """Find the listed words and write a report (and optional EDL), without writing video."""
-    options = RunOptions(dry_run=True, report=report, edl=edl, overwrite=overwrite, subtitles=subtitles)
+    options = RunOptions(
+        dry_run=True,
+        report=report,
+        edl=edl,
+        review_srt=review_srt,
+        overwrite=overwrite,
+        subtitles=subtitles,
+    )
     _run(
         inputs,
         config,
@@ -333,6 +359,50 @@ def scan(
         audio_stream=audio_stream,
         recursive=recursive,
     )
+
+
+@app.command("render")
+def render_command(
+    video: Annotated[Path, typer.Argument(help="Video file.", show_default=False)],
+    report: Annotated[
+        Path,
+        typer.Option(
+            "--report",
+            help="A vbr report; its intervals are muted, and nothing is detected.",
+            show_default=False,
+        ),
+    ],
+    config: ConfigOpt = None,
+    output: OutputOpt = None,
+    categories: CategoriesOpt = None,
+    audio_stream: AudioStreamOpt = None,
+    edl: EdlOpt = False,
+    review_srt: ReviewOpt = False,
+    overwrite: OverwriteOpt = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Render even if the report was made for a different file.")
+    ] = False,
+    keep_temp: KeepTempOpt = False,
+    verbose: VerboseOpt = False,
+    quiet: QuietOpt = False,
+) -> None:
+    """Mute the spans listed in a report, e.g. one you edited by hand, without detecting anything.
+
+    Only the report's "intervals" are read; the word list is used for the subtitles."""
+    _setup_logging(verbose)
+    ui = ConsoleUI(quiet=quiet)
+    options = RunOptions(
+        output=output, edl=edl, review_srt=review_srt, overwrite=overwrite, keep_temp=keep_temp
+    )
+    try:
+        loaded = load_config(config, overrides=_overrides(audio_stream=audio_stream))
+        if not video.is_file():
+            raise UsageError(f"not found: {video}")
+        pipeline = Pipeline(loaded, ui=ui, categories=categories.split(",") if categories else None)
+        result = pipeline.render_report(video, report, options, force=force)
+    except VbrError as exc:
+        raise _fail(exc) from exc
+    _print_result(ui, result)
 
 
 @app.command("subs")

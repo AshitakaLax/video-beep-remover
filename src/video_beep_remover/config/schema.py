@@ -113,6 +113,7 @@ class OutputConfig(_Model):
     subtitle_mask: Literal["first_letter", "asterisks", "remove"] = "first_letter"
     report: bool = True
     edl: bool = False
+    review_srt: bool = False
 
 
 class CacheConfig(_Model):

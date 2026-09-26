@@ -183,7 +183,9 @@ def select_subtitles(
     only when local subtitles fail."""
     config = ctx.config
     selection = SubtitleSelection(None, [], ())
-    loader = SubtitleLoader(ctx.ff, info.path, workdir, online=search.online)
+    # Every text stream is extracted in the one pass, so censoring the output's subtitles needs no second one.
+    text_streams = [(s.index, s.codec) for s in info.subtitle_streams if s.is_text_subtitle]
+    loader = SubtitleLoader(ctx.ff, info.path, workdir, online=search.online, also=text_streams)
     transcribe: Callable[[float, float], Sequence[Word]] | None = None
     notes: list[str] = []
 

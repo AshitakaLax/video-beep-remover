@@ -1,6 +1,7 @@
 """Find, merge and validate the configuration (DESIGN.md §4.1)."""
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -159,6 +160,12 @@ def load_config(
     except ValidationError as exc:
         raise ConfigError(format_validation_error(exc, source)) from exc
     return LoadedConfig(config=config, source=source, data=data)
+
+
+def config_hash(config: Config) -> str:
+    """A short fingerprint of the settings (secrets left out), recorded in every output's VBR_CENSORED tag."""
+    text = json.dumps(redact(config.model_dump(mode="json")), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
 def redact(data: Any) -> Any:
