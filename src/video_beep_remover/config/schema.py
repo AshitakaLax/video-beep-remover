@@ -35,6 +35,7 @@ class CensorConfig(_Model):
     min_duration_ms: int = Field(250, ge=0, le=5000)
     merge_gap_ms: int = Field(250, ge=0, le=5000)
     fade_ms: int = Field(10, ge=1, le=100)
+    refine_edges: bool = False
 
 
 class TargetedConfig(_Model):
@@ -71,6 +72,7 @@ class AnalysisConfig(_Model):
 
 class TranscriptionConfig(_Model):
     backend: Literal["faster-whisper", "whisperx"] = "faster-whisper"
+    align_model: str = "auto"
     model: str = "auto"
     anchor_model: str = "base.en"
     device: Literal["auto", "cuda", "cpu"] = "auto"

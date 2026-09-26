@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from helpers import FakeTranscriber, StrictUI, Track, decode, make_clip, tone_gain, words
+from helpers import FakeTranscriber, StrictUI, Track, decode, make_clip, run_ffmpeg, tone_gain, words
 from video_beep_remover.config import load_config
 from video_beep_remover.errors import UsageError, VbrError
 from video_beep_remover.media.ffmpeg import FFmpeg
@@ -203,3 +203,19 @@ def test_a_full_transcript_is_cached_and_serves_the_next_run(tmp_path: Path) -> 
     assert len(fake.calls) == 1 and "decode" not in report["timings"]
     assert report["transcription"]["from_cache"] == "all"
     assert [d["heard"] for d in report["detections"]] == ["damn"]
+
+
+def test_refined_edges_move_into_nearby_pauses(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mkv"
+    # A tone with two 50 ms pauses, exact to the sample, just outside the padded span 1.88-2.60
+    tone = "sin(2*PI*440*t)*not(between(t,1.79,1.84)+between(t,2.64,2.69))"
+    run_ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24:duration=6",
+               "-f", "lavfi", "-i", f"aevalsrc='{tone}':s=48000:d=6",
+               "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "flac", str(source))  # fmt: skip
+    result = pipeline(tmp_path, **{"censor.refine_edges": True}).process(source, RunOptions())
+    assert result.status == "cleaned"
+    report = json.loads((tmp_path / "movie.clean.vbr.json").read_text("utf-8"))
+    # Each 10 ms fade now runs inside a pause: the fade out at the start, the fade in at the end.
+    [interval] = report["intervals"]
+    assert 1.79 <= interval["start"] <= 1.83 and 2.65 <= interval["end"] <= 2.69
+    assert report["output"]["verified_spans"] == 1 and "refine" in report["timings"]

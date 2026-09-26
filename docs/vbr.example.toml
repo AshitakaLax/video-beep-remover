@@ -68,10 +68,11 @@ terms = ["freak*", "frick*", "friggin*", "heck", "darn*", "shoot", "crud", "effi
 # ---------------------------------------------------------------------------
 [censor]
 pad_before_ms = 120                 # widen each detected word a little on both sides
-pad_after_ms = 200                  # more after: Whisper places word ends early (DESIGN.md Appendix C)
+pad_after_ms = 200                  # more after: Whisper places word ends early (with backend = "whisperx", try 120)
 min_duration_ms = 250               # very short gaps sound like glitches
 merge_gap_ms = 250                  # join muted spans closer than this
 fade_ms = 10                        # smooth fade at each edge, inside the padding; avoids clicks
+refine_edges = false                # move each edge outward, up to 80 ms, to the quietest 10 ms nearby
 
 # ---------------------------------------------------------------------------
 # How profanity is found
@@ -104,7 +105,8 @@ min_fidelity = 0.6                  # 0-1; below this, subtitles are too paraphr
 ffsubsync = "fallback"              # "never" | "fallback": re-time subtitles that fail (needs the [sync] extra)
 
 [transcription]
-backend = "faster-whisper"          # "faster-whisper" | "whisperx"
+backend = "faster-whisper"          # "faster-whisper" | "whisperx": re-time words by forced alignment ([align] extra)
+align_model = "auto"                # whisperx only: a wav2vec2 model; auto has one for en, fr, de, es, it and 36 more
 model = "auto"                      # e.g. "large-v3-turbo", "small.en"; auto picks by device and strategy
 anchor_model = "base.en"            # small, fast model used only for sync anchors
 device = "auto"                     # "auto" | "cuda" | "cpu"

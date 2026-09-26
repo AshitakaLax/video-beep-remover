@@ -25,6 +25,7 @@ from video_beep_remover.config.loader import LoadedConfig, cache_root, config_ha
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.detect.matcher import detect_in_words
+from video_beep_remover.detect.refine import refine_edges
 from video_beep_remover.errors import ConfigError, SubtitleError, UsageError, VbrError
 from video_beep_remover.media.audio import (
     SAMPLE_RATE,
@@ -218,7 +219,7 @@ class Pipeline:
         if not self.lexicon.terms and not self.lexicon.masked_patterns:
             raise ConfigError("the word list is empty: enable a category or add terms")
         self.prompt = build_prompt(self.config.transcription.initial_prompt, self.lexicon)
-        self._factory = transcriber_factory or self._load_faster_whisper
+        self._factory = transcriber_factory or self._load_transcriber
         self._transcribers: dict[ModelChoice, Transcriber] = {}
         self.detect_speech: SpeechDetector = speech_detector or silero_speech
         self.subtitle_cache = SubtitleCache(cache_root(self.config))
@@ -247,13 +248,23 @@ class Pipeline:
             return None
         return OnlineSubtitles(self.config, info, client=self.opensubtitles(), cache=self.subtitle_cache)
 
-    def _load_faster_whisper(self, choice: ModelChoice) -> Transcriber:
+    def _load_transcriber(self, choice: ModelChoice) -> Transcriber:
         settings = self.config.transcription
-        return FasterWhisperTranscriber(
+        whisper = FasterWhisperTranscriber(
             choice,
             beam_size=settings.beam_size,
             batch_size=settings.batch_size,
             vad_filter=settings.vad_filter,
+            offline=self.config.offline,
+        )
+        if not choice.align:
+            return whisper
+        from video_beep_remover.asr.whisperx import WhisperXTranscriber
+
+        return WhisperXTranscriber(
+            whisper,
+            language=self.config.analysis.language,
+            align_model=settings.align_model,
             offline=self.config.offline,
         )
 
@@ -291,6 +302,8 @@ class Pipeline:
             # and editing the list should not make everything be transcribed again.
             prompt=None if role == "anchor" else settings.initial_prompt,
             vad_filter=settings.vad_filter,
+            # Only when aligning, so that turning alignment on left the other keys as they were.
+            **({"align_model": settings.align_model} if choice.align else {}),
         )
         if key not in scope.stores:
             scope.stores[key] = self.transcript_cache.store(
@@ -485,6 +498,25 @@ class Pipeline:
             self._scope = _CacheScope(found, stream.index, info.duration, speech)
         try:
             analysis = self._analyse(source, info, stream, job.workdir, track, job.lap, job.options.subtitles)
+            detections = analysis.detections
+            intervals = build_intervals(
+                detections,
+                duration=info.duration,
+                pad_before=cfg.censor.pad_before_ms / 1000,
+                pad_after=cfg.censor.pad_after_ms / 1000,
+                min_duration=cfg.censor.min_duration_ms / 1000,
+                merge_gap=cfg.censor.merge_gap_ms / 1000,
+            )
+            if cfg.censor.refine_edges and intervals:
+                audio: AudioSource = (
+                    ArrayAudioSource(track.audio)
+                    if track.audio is not None
+                    else SeekingAudioSource(self.ff, source, stream.index)
+                )
+                intervals = refine_edges(
+                    intervals, audio, duration=info.duration, merge_gap=cfg.censor.merge_gap_ms / 1000
+                )
+                job.lap("refine")
         finally:
             self._scope = None
             track.release()
@@ -492,15 +524,6 @@ class Pipeline:
                 track.path.unlink(missing_ok=True)  # the decoded track is not needed for rendering
             if found is not None:
                 self.transcript_cache.evict(int(cfg.cache.max_size_gb * 1024**3))
-        detections = analysis.detections
-        intervals = build_intervals(
-            detections,
-            duration=info.duration,
-            pad_before=cfg.censor.pad_before_ms / 1000,
-            pad_after=cfg.censor.pad_after_ms / 1000,
-            min_duration=cfg.censor.min_duration_ms / 1000,
-            merge_gap=cfg.censor.merge_gap_ms / 1000,
-        )
         result.detections, result.intervals = len(detections), len(intervals)
         result.strategy = analysis.strategy
         heard = sum(d.source == "asr" for d in detections)
@@ -535,6 +558,7 @@ class Pipeline:
             },
             **analysis.report,
             "transcription": {
+                "backend": ("whisperx" if model.align else "faster-whisper") if model else None,
                 "model": model.name if model else None,
                 "device": model.device if model else None,
                 "compute_type": model.compute_type if model else None,

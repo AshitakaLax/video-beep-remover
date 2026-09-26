@@ -108,7 +108,7 @@ def _setup_logging(verbose: bool) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     # Model downloads log an "unauthenticated requests" warning that is only noise for this tool.
-    for noisy in ("faster_whisper", "httpx", "urllib3", "huggingface_hub"):
+    for noisy in ("faster_whisper", "whisperx", "httpx", "urllib3", "huggingface_hub"):
         logging.getLogger(noisy).setLevel(logging.INFO if verbose else logging.ERROR)
 
 
@@ -658,6 +658,7 @@ def doctor(config: ConfigOpt = None) -> None:
             row("Whisper model", ok, f"{choice.describe()} is not downloaded yet; the first run downloads it")
     except ImportError:
         row("faster-whisper", False, "not installed: pip install faster-whisper")
+    row(*_whisperx_status(cfg))
 
     row(*_opensubtitles_status(cfg))
     from video_beep_remover.subtitles.ffsubsync import ffsubsync_command
@@ -672,6 +673,32 @@ def doctor(config: ConfigOpt = None) -> None:
     )
     console.print(table)
     raise typer.Exit(EXIT_DEPENDENCY if failed else EXIT_OK)
+
+
+def _whisperx_status(cfg: Config) -> tuple[str, bool | None, str]:
+    """doctor's WhisperX row: needed only by the whisperx backend, which also needs its models."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    name = "WhisperX"
+    try:
+        installed = version("whisperx")
+    except PackageNotFoundError:
+        if cfg.transcription.backend != "whisperx":
+            return name, None, "not installed; optional: pip install 'video-beep-remover[align]'"
+        return (
+            name,
+            False,
+            "not installed, but backend = \"whisperx\": pip install 'video-beep-remover[align]'",
+        )
+    if cfg.transcription.backend != "whisperx":
+        return name, None, f'{installed}, not used (transcription.backend = "faster-whisper")'
+    from video_beep_remover.asr.whisperx import status
+
+    try:
+        downloaded, details = status(cfg.analysis.language, cfg.transcription.align_model)
+    except VbrError as exc:
+        return name, False, f"{installed}: {exc}"
+    return name, True if downloaded else (False if cfg.offline else None), f"{installed}, aligner {details}"
 
 
 def _opensubtitles_status(cfg: Config) -> tuple[str, bool | None, str]:

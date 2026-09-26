@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -116,3 +117,33 @@ def test_subtitle_guided_strategies_find_what_full_transcription_finds(tmp_path:
         assert targeted[word]["source"] == "asr"
         assert abs(targeted[word]["start"] - full[word]["start"]) < 0.1
         assert abs(targeted[word]["end"] - full[word]["end"]) < 0.1
+
+
+@pytest.mark.skipif(shutil.which("espeak-ng") is None, reason="needs espeak-ng to synthesize speech")
+def test_whisperx_backend_widens_words_to_their_aligned_times(tmp_path: Path) -> None:
+    """transcription.backend = "whisperx" with the real aligner (needs the [align] extra)."""
+    pytest.importorskip("whisperx")
+    video = speech_film(tmp_path)
+    overrides = {
+        "transcription.device": "cpu",
+        "transcription.model": "small.en",
+        "analysis.strategy": "full",
+        "cache.transcripts": False,
+    }
+
+    def scan(backend: str) -> dict[str, Any]:
+        loaded = load_config(
+            None, env={}, cwd=tmp_path, overrides=overrides | {"transcription.backend": backend}
+        )
+        report = tmp_path / f"{backend}.json"
+        Pipeline(loaded).process(video, RunOptions(dry_run=True, report=report))
+        return json.loads(report.read_text("utf-8"))
+
+    plain, aligned = scan("faster-whisper"), scan("whisperx")
+    assert aligned["transcription"]["backend"] == "whisperx"
+    heard = {d["heard"].strip(",.!?").lower(): d for d in plain["detections"]}
+    widened = {d["heard"].strip(",.!?").lower(): d for d in aligned["detections"]}
+    assert {"hell", "fuck", "bastard"} <= set(widened)
+    for word in ("hell", "fuck", "bastard"):  # never narrower than Whisper's own times
+        assert widened[word]["start"] <= heard[word]["start"] + 0.001
+        assert widened[word]["end"] >= heard[word]["end"] - 0.001

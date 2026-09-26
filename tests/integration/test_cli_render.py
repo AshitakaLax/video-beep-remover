@@ -17,7 +17,7 @@ runner = CliRunner()
 @pytest.fixture(autouse=True)
 def scripted_speech(monkeypatch: pytest.MonkeyPatch) -> None:
     heard = words(("well", 1.0, 1.3), ("damn", 2.0, 2.4))
-    monkeypatch.setattr(Pipeline, "_load_faster_whisper", lambda self, choice: FakeTranscriber(heard))
+    monkeypatch.setattr(Pipeline, "_load_transcriber", lambda self, choice: FakeTranscriber(heard))
     monkeypatch.setattr("video_beep_remover.pipeline.silero_speech", lambda audio, on_progress=None: [])
 
 

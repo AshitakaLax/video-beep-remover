@@ -79,5 +79,5 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["faster_whisper.*", "ctranslate2.*"]
+module = ["faster_whisper.*", "ctranslate2.*", "whisperx.*", "nltk.*", "torch.*", "torchaudio.*"]
 ignore_missing_imports = true
