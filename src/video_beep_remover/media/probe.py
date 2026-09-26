@@ -14,6 +14,8 @@ from video_beep_remover.media.ffmpeg import FFmpeg
 VIDEO_SUFFIXES = frozenset(
     {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".mts", ".mpg", ".mpeg", ".wmv", ".flv"}
 )
+# Text subtitle codecs FFmpeg can convert to SRT or ASS. Image-based ones (PGS, VobSub, DVB) would need OCR.
+TEXT_SUBTITLE_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
 _COMMENTARY = re.compile(r"comment", re.IGNORECASE)
 _DESCRIPTION = re.compile(r"descri", re.IGNORECASE)
 
@@ -73,6 +75,10 @@ class StreamInfo:
         )
 
     @property
+    def is_text_subtitle(self) -> bool:
+        return self.kind == "subtitle" and (self.codec or "") in TEXT_SUBTITLE_CODECS
+
+    @property
     def is_attached_picture(self) -> bool:
         return bool(self.disposition.get("attached_pic"))
 
@@ -95,6 +101,7 @@ class MediaInfo:
     start_time: float
     size: int
     streams: tuple[StreamInfo, ...]
+    tags: Mapping[str, str] = field(default_factory=dict)  # container tags, keys in lower case
 
     @property
     def audio_streams(self) -> list[StreamInfo]:
@@ -158,6 +165,7 @@ def parse_probe(path: Path, data: Mapping[str, Any]) -> MediaInfo:
         start_time=_float(fmt.get("start_time")) or 0.0,
         size=_int(fmt.get("size")) or 0,
         streams=tuple(streams),
+        tags={str(k).lower(): str(v) for k, v in (fmt.get("tags") or {}).items()},
     )
 
 

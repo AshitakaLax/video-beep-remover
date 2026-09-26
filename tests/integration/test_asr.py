@@ -87,11 +87,14 @@ def speech_film(folder: Path) -> Path:
 def test_subtitle_guided_strategies_find_what_full_transcription_finds(tmp_path: Path) -> None:
     """The M2 criterion: with verbatim subtitles, targeted mode finds what full mode finds."""
     video = speech_film(tmp_path)
-    # A dense test film: three flagged lines in 45 s would otherwise trip the coverage guard.
+    # A dense test film: three flagged lines in 45 s would otherwise trip the coverage guard. The same
+    # model runs every strategy, so without cache.transcripts = false the later ones would reuse the
+    # full transcript instead of transcribing their own windows.
     overrides = {
         "transcription.device": "cpu",
         "transcription.model": "small.en",
         "analysis.targeted.max_coverage": 0.9,
+        "cache.transcripts": False,
     }
 
     def scan(strategy: str) -> dict[str, dict[str, float]]:

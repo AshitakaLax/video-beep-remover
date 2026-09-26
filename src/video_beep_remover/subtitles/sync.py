@@ -4,7 +4,6 @@ import statistics
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from itertools import combinations
 from typing import Literal
 
 from rapidfuzz import fuzz
@@ -15,7 +14,10 @@ from video_beep_remover.models import Cue, SyncModel, Word
 
 MATCH_THRESHOLD = 75.0  # rapidfuzz ratio (0-100) above which an anchor cue counts as heard
 MIN_SLOPE_SPAN_S = 60.0  # matched anchors must span this much before a scale is fitted, not just an offset
-SNAP_TOLERANCE = 0.001  # fitted scales this close to a standard frame-rate ratio snap to it
+SNAP_TOLERANCE = (
+    0.001  # a subtitle file's frame rate this close to a standard ratio of the video's snaps to it
+)
+TIE_S = 0.05  # fit(): a scale must lower the timing error by more than this to beat an earlier one
 MIN_SEARCH_S = 0.5
 _FPS_PAIRS = ((25, 23.976), (25, 24), (24, 23.976), (30, 29.97))  # film, PAL and NTSC rates
 STANDARD_RATIOS = (1.0, *(a / b for a, b in _FPS_PAIRS), *(b / a for a, b in _FPS_PAIRS))
@@ -126,21 +128,26 @@ def snap(scale: float) -> float:
 def fit(pairs: Sequence[tuple[float, float]], *, default_scale: float = 1.0) -> SyncModel:
     """Fit media = scale * subtitle + offset to (subtitle time, media time) pairs.
 
-    With three or more pairs that span at least MIN_SLOPE_SPAN_S, the scale is the Theil-Sen slope
-    (the median of the pairwise slopes), snapped to a standard frame-rate ratio when close. Otherwise
-    only the offset is fitted. The offset is the median residual and the error the median absolute
-    residual, so a few mismatched anchors do not move the fit."""
+    The scale is one a real mismatch produces: `default_scale` (1, or a frame-rate ratio applied up
+    front), or with three or more pairs that span at least MIN_SLOPE_SPAN_S, whichever standard
+    ratio leaves the smallest median absolute residual. A slope fitted freely follows the noise of a
+    few anchors instead: 0.3 % off puts the end of a two-hour film 20 s out. The offset is the median
+    residual and the error the median absolute residual, so a few mismatched anchors do not move the
+    fit; an earlier candidate wins unless a later one is better by more than TIE_S."""
     if not pairs:
         return SyncModel(scale=default_scale)
-    scale = default_scale
     xs = [x for x, _ in pairs]
+    candidates = [default_scale]
     if len(pairs) >= 3 and max(xs) - min(xs) >= MIN_SLOPE_SPAN_S:
-        slopes = [(y2 - y1) / (x2 - x1) for (x1, y1), (x2, y2) in combinations(pairs, 2) if x2 != x1]
-        if slopes:
-            scale = snap(statistics.median(slopes))
-    offset = statistics.median(y - scale * x for x, y in pairs)
-    error = statistics.median(abs(y - (scale * x + offset)) for x, y in pairs)
-    return SyncModel(scale=scale, offset=offset, error=error)
+        candidates += [ratio for ratio in STANDARD_RATIOS if ratio != default_scale]
+    best: SyncModel | None = None
+    for scale in candidates:
+        offset = statistics.median(y - scale * x for x, y in pairs)
+        error = statistics.median(abs(y - (scale * x + offset)) for x, y in pairs)
+        if best is None or error < best.error - TIE_S:
+            best = SyncModel(scale=scale, offset=offset, error=error)
+    assert best is not None
+    return best
 
 
 def check_sync(

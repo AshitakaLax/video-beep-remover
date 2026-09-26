@@ -11,7 +11,7 @@ Whisper speech recognition (via [faster-whisper](https://github.com/SYSTRAN/fast
 ```
 subtitles  →  cue 812 (01:13:02.0–01:13:05.0): "What the hell was that?"
 audio      →  transcribe 01:13:00.5–01:13:06.5 only  →  "hell" at 01:13:03.41–01:13:03.78
-ffmpeg     →  mute 01:13:03.29–01:13:03.90 · re-encode the audio track · copy video, subtitles, chapters
+ffmpeg     →  mute 01:13:03.29–01:13:03.98 · re-encode the audio track · copy video, subtitles, chapters
 ```
 
 ## 2. Goals and non-goals
@@ -55,11 +55,11 @@ $ vbr clean "The Movie (2019).mkv"
 |---|---|
 | `vbr clean INPUT...` | Detect and censor. Writes the cleaned file(s) and a report. Inputs can be files or folders (`--recursive`). |
 | `vbr scan INPUT...` | Detection only, the same as `clean --dry-run`. Writes the report and optional EDL, but no video. |
-| `vbr render INPUT --report FILE` | Render from a report, which may be hand-edited. Skips detection. |
+| `vbr render INPUT --report FILE` | Render from a report, which may be hand-edited. Skips detection. A report made for a different file (size, hash or duration) is refused without `--force`. |
 | `vbr subs INPUT` | Show subtitle candidates, their scores and the sync check. `--save PATH` writes the chosen subtitles, converted to the format PATH names. Exits with 1 if no candidate is usable. |
 | `vbr config init \| show \| check` | Write a starter config, print the effective merged config (secrets redacted), or validate it. |
 | `vbr doctor` | Check the FFmpeg version and encoders, CUDA, the model cache and the API credentials. |
-| `vbr cache info \| clear` | Inspect or clear the cache. It holds downloaded subtitles; transcripts and decoded audio join it in M4. |
+| `vbr cache info \| clear` | Inspect or clear the cache: downloaded subtitles and transcripts (§8.3). `clear --subtitles` or `--transcripts` clears one of them. |
 
 ### 3.3 Main options for `clean` and `scan`
 
@@ -75,7 +75,7 @@ $ vbr clean "The Movie (2019).mkv"
 | `--model NAME`, `--device cpu\|cuda` | `transcription.model`, `.device` | |
 | `--language CODE`, `--audio-stream N` | `analysis.language`, `.audio_stream` | |
 | `--dry-run` | n/a | The same as `vbr scan`. |
-| `--report PATH`, `--edl` | `output.report`, `output.edl` | |
+| `--report PATH`, `--edl`, `--review-srt` | `output.report`, `output.edl`, `output.review_srt` | |
 | `--overwrite`, `--skip-existing` | `output.overwrite` | `--skip-existing` is meant for batch runs. |
 | `--keep-temp`, `-v`, `-q` | n/a | Debugging and verbosity. |
 
@@ -212,7 +212,8 @@ flowchart TD
 ```
 src/video_beep_remover/
 ├── cli.py                 # Typer app → RunOptions
-├── pipeline.py            # per-file stages, strategy fallbacks, report, timings
+├── batch.py               # folders: skipping vbr's outputs, rendering in the background
+├── pipeline.py            # per-file stages, strategy fallbacks, report, timings; vbr render
 ├── guided.py              # subtitle-guided analysis: targeted and hybrid (§6.3-6.9)
 ├── models.py              # dataclasses shared by all stages (§5.3)
 ├── languages.py           # language codes in configs, container tags and file names
@@ -226,6 +227,7 @@ src/video_beep_remover/
 │   ├── probe.py           # ffprobe JSON → MediaInfo, stream selection
 │   ├── audio.py           # window and full-track decoding: SeekingAudioSource, ArrayAudioSource
 │   ├── render.py          # command files, filtergraph, stream mapping, codec choice, verification
+│   ├── dialogue.py        # do other audio streams carry the analysed dialogue? (cross-correlation)
 │   └── selftest.py        # `vbr doctor`'s mute test on a synthetic tone
 ├── subtitles/
 │   ├── acquire.py         # embedded and sidecar candidates, ranking, one-pass extraction
@@ -238,18 +240,20 @@ src/video_beep_remover/
 │   ├── names.py           # guessit: title, year, episode and release from file names; .nfo IMDb ids
 │   ├── cache.py           # downloaded subtitles, indexed by video fingerprint
 │   ├── ffsubsync.py       # optional re-sync with ffsubsync
-│   └── later: censor.py (M4)
+│   ├── censor.py          # masking listed words in SRT, WebVTT, ASS and other subtitle text
+│   └── output.py          # the output's subtitle streams, and the censored copy of a sidecar
 ├── asr/
 │   ├── base.py            # Transcriber protocol, Clip
 │   ├── faster_whisper.py  # default backend (sequential, or batched with packed windows)
 │   ├── vad.py             # Silero speech regions; trimming clips to their speech
-│   └── later: whisperx.py (M5), cache.py (M4)
+│   ├── cache.py           # transcripts and speech regions kept between runs (§8.3)
+│   └── later: whisperx.py (M5)
 ├── detect/
 │   ├── normalize.py, lexicon.py, matcher.py
 │   ├── planner.py         # flagging, windows, uncovered speech, coverage
 │   ├── confirm.py         # window transcripts → detections, confirmation, estimates
 │   └── intervals.py       # padding, min length, merge
-└── report/                # JSON report, EDL; review SRT later (M4)
+└── report/                # JSON report, EDL, review SRT; reading a report back for vbr render
 ```
 
 ### 5.3 Core data types
@@ -404,7 +408,7 @@ Files are decoded from UTF-8 or a BOM first. Failing that, the usual code page f
 - sorts cues, and merges a line repeated in overlapping cues (e.g. the same line on two ASS layers)
 - drops comments, drawings and empty cues
 
-Estimates (§6.9) use word positions in the cleaned text. Output censoring (§6.11) will also need a map from the cleaned text back to the original, to mask words there.
+Estimates (§6.9) use word positions in the cleaned text. Output censoring (§6.11) does not use it: it finds words in the text a viewer sees, where markup takes no space, and masks them in the original.
 
 ### 6.6 Sync and fidelity check
 
@@ -414,9 +418,9 @@ This check maps subtitle time to media time, `t_media = scale · t_sub + offset`
 2. **Search windows.** Search ±`trusted_search_s` (3 s) or ±`untrusted_search_s` (20 s) around each anchor's predicted position.
    - Anchors are processed in time order, and the prediction is refitted after every match. This tracking follows a drift that builds up slowly, such as NTSC's 0.1 % (7 s over two hours).
    - A frame-rate mismatch such as 25 vs 23.976 fps (4.3 %, about 2.5 minutes per hour) moves farther than the search between two anchors, so tracking alone loses it. If the candidate's `fps` differs from the video's frame rate by a standard ratio, that ratio is applied up front; otherwise ffsubsync has to find it.
-3. **Transcription.** Transcribe the anchor windows with the small `anchor_model` (`base.en`, or the multilingual `base` for other languages), with word timestamps. Each window is first trimmed to its speech, as in §6.8, so the first word of a line after a pause is not placed too early.
+3. **Transcription.** Transcribe the anchor windows with the small `anchor_model` (`base.en`, or the multilingual `base` for other languages), with word timestamps. Each window is first trimmed to its speech, as in §6.8, so the first word of a line after a pause is not placed too early. An anchor window holds several lines, though, and the pauses between them stay: the first word after one was often placed where the previous line ended, up to 2 s early (in the evaluation, Appendix C). So a word that starts in a pause, at least 0.3 s before speech resumes, and ends in the speech after it is moved to where speech resumes.
 4. **Matching.** Find the cue text in the recognized words with rapidfuzz: slide a token window and require a ratio of at least 75 (rapidfuzz scores run from 0 to 100). Each match yields a pair (cue start, word start).
-5. **Fit.** With three or more pairs spanning at least 60 s, compute a Theil–Sen slope. If it is within 0.1 % of a standard ratio, snap it to that ratio: 1, 25/23.976, 25/24, 24/23.976, 30/29.97, or the inverse of any of them. The offset is the median residual. With fewer or closer pairs, fit an offset only. The error is the median absolute residual.
+5. **Fit.** The scale is one that real mismatches produce: 1, 25/23.976, 25/24, 24/23.976, 30/29.97, or the inverse of any of them. With three or more pairs spanning at least 60 s, each of these is tried, and the one that leaves the smallest median absolute residual wins, unless it beats the default (1, or the ratio applied up front) by 50 ms or less. With fewer or closer pairs, only the offset is fitted. The offset is the median residual, and the error the median absolute residual. An earlier draft fitted a Theil–Sen slope and snapped it to a standard ratio within 0.1 %. With six rough anchors over a few minutes, that slope landed anywhere near 1, e.g. at 1.0026, which would put the end of a two-hour film 19 s out.
 6. **Fidelity.** Take the median `token_sort_ratio` between each anchor's text and the words heard, divided by 100. Fidelity is therefore a 0–1 fraction, on the same scale as `min_fidelity` and the report.
 7. **Decision.** The check passes if `matched ≥ min_matched_ratio`, `error ≤ max_error_s` and `fidelity ≥ min_fidelity`. `anchors = 0` skips the check and trusts the timing as it is. If it fails:
    - If the failure is about timing (anchors not heard where expected, or too large an error) and [ffsubsync](https://github.com/smacke/ffsubsync) is installed, run it. It uses speech-activity correlation, corrects frame-rate mismatches and handles offsets up to 60 s by default. Then check again with the trusted ±3 s search, since its output must be in sync. Subtitles that fail on fidelity are paraphrased, and ffsubsync cannot fix that. During implementation, subtitles 30 s late were re-timed in 0.6 s on a 44 s clip and then passed with a 0.08 s error.
@@ -484,7 +488,7 @@ The matcher runs over each window's words and produces detections: heard text, t
 
 Each detection `[start, end]` becomes an interval as follows:
 
-1. Widen it by `pad_before_ms` and `pad_after_ms`, because Whisper's word timestamps are approximate.
+1. Widen it by `pad_before_ms` (120 ms) and `pad_after_ms` (200 ms), because Whisper's word timestamps are approximate. Its word ends come early: 90–120 ms in the median on the evaluation set, up to 230 ms (Appendix C).
 2. Extend it symmetrically to `min_duration_ms`.
 3. Clamp it to `[0, duration]`.
 4. Sort the intervals and merge any that are less than `merge_gap_ms` apart.
@@ -505,7 +509,7 @@ For each censored stream, the renderer writes one **command file** into a job te
 
 ```
 4371.050-4383.290 [enter] afade@mute0 t out, [enter] afade@mute0 st 4383.290, [enter] afade@mute0 d 0.010;
-4383.300-4383.890 [enter] afade@mute0 t in, [enter] afade@mute0 st 4383.890, [enter] afade@mute0 d 0.010;
+4383.300-4383.970 [enter] afade@mute0 t in, [enter] afade@mute0 st 4383.970, [enter] afade@mute0 d 0.010;
 ```
 
 Each line fires once, when the first audio frame that starts inside its time range arrives. The ranges are the stable stretches where the old and new settings give the same gain: full volume between intervals, silence inside one. So it doesn't matter which frame delivers a command.
@@ -559,15 +563,20 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
 
 **Other audio streams (`other_audio_streams`)**
 
-- `auto` (default): streams with the analyzed stream's language get the same intervals, which covers e.g. a stereo downmix next to the 5.1 mix. Other languages, commentary and audio description are dropped with a warning, since keeping them would leave uncensored speech in the file. A cheap guard checks that the streams really carry the same dialogue before applying the intervals: it cross-correlates their 16 kHz mono downmixes around a few detections. The threshold is tuned by the benchmark.
+- `auto` (default): streams with the analyzed stream's language get the same intervals, which covers e.g. a stereo downmix next to the 5.1 mix. Other languages, commentary and audio description are dropped with a warning, since keeping them would leave uncensored speech in the file. A cheap guard checks that a same-language stream really carries the same dialogue before applying the intervals. It decodes both streams' 16 kHz mono downmixes around up to five muted spans spread over the file, each widened by 1 s, and takes the median of their normalized cross-correlation within ±0.1 s of lag. At 0.5 or more the stream is censored; below, it is dropped with a note naming the correlation, e.g. for a mislabelled dub or an offset track. Spans where either stream is silent prove nothing and are skipped. In synthetic tests a downmix scores above 0.9 and unrelated audio below 0.1; the threshold is to be tuned on the evaluation set. The report lists every check under `output.audio_checks`.
 - `censor`, `copy` or `drop` apply one rule to all of them.
 
 **Subtitle streams in the output (`subtitle_streams`)**
 
-- `censor` (default): text streams are extracted, listed words are masked per `subtitle_mask` (`f***`, `****` or removed) with the same matcher, and the streams are muxed back in place. Image-based streams are copied with a warning. A sidecar file used for analysis gets a censored copy next to the output.
+- `censor` (default): text streams are masked per `subtitle_mask` (`f***`, `****` or removed) with the same matcher as the audio, and muxed back in place.
+  - **Extraction.** The analysis extracts every text stream in its one pass over the file (§6.3), not just the candidates, so the render reuses them. Without that pass, e.g. in `full` mode, the render extracts them in one pass of its own. ASS stays ASS; the other text codecs become SRT.
+  - **Masking.** Words are found in the text a viewer sees: HTML-like tags, ASS override blocks and WebVTT tags take no space, and `\N` separates words. The file is then edited in place, so markup, styling, timing and layout survive untouched: in SRT and WebVTT the lines after each timing line, in ASS the text field of each `Dialogue` line. Other formats go through pysubs2. Words the subtitles already mask (`f***`) stay as they are with `first_letter`. Hint words are never masked. `remove` keeps line breaks, even inside a removed phrase. In SRT and WebVTT, a blank line ends a cue, so a line left empty is dropped, and so is a cue left with nothing to show.
+  - **Muxing.** Each censored file is a separate FFmpeg input, mapped at the stream's position and encoded with the codec the container takes (`mov_text` in MP4, `webvtt` in WebM, else the source's `srt` or `ass`). Language, title and disposition are re-applied from the probe.
+  - Streams in a language other than the word list's are masked too, with a note that the list does not cover their language. Image-based streams (PGS, VobSub, DVB) are copied with a warning. A stream that cannot be extracted or read is dropped, since copying it would keep its words.
+  - The subtitle file the analysis used, if it was a sidecar or `--subtitles`, gets a masked copy next to the output, named after it so players load it with the cleaned file: `Movie.en.sdh.srt` becomes `Movie.clean.en.sdh.srt`, and `Subs/English.srt` becomes `Movie.clean.en.srt`.
 - `copy` or `drop`.
 
-**Nothing to censor.** `when_clean = "copy"` does a plain stream copy (`-map 0 -c copy`), which takes seconds. `"skip"` writes nothing. Every output is tagged `VBR_CENSORED=<version>;<config hash>`, so later runs can skip processed files.
+**Nothing to censor.** `when_clean = "copy"` does a plain stream copy (`-map 0 -c copy`), which takes seconds; the subtitle streams are still masked, since a line can hold a listed word the audio does not. `"skip"` writes nothing. Every output is tagged `VBR_CENSORED=<version>;<config hash>`, so later runs can skip processed files (§8.2). The hash covers the effective settings, secrets left out. MP4 keeps a tag of its own only with `-movflags +use_metadata_tags`, which is added.
 
 ### 6.12 Reports and other outputs
 
@@ -586,27 +595,34 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
                "sync": {"checked": true, "scale": 1.0, "offset": 0.04, "error": 0.09, "anchors": 6, "matched": 6,
                         "fidelity": 0.91}},
   "windows": {"flagged_cues": {"lexicon": 38, "masked": 3, "hint": 2}, "uncovered_regions": 9, "count": 36,
-              "audio_seconds": 281.0, "coverage": 0.038, "expanded": 2},
+              "audio_seconds": 281.0, "coverage": 0.038, "expanded": 2, "cached": 0, "partly_cached": 0},
   "confirmation": {"strong_flags": 41, "confirmed": 40},
+  "transcription": {"model": "large-v3-turbo", "device": "cuda", "compute_type": "float16", "words": 3120,
+                    "from_cache": "none"},
   "detections": [{"start": 4383.41, "end": 4383.78, "heard": "hell", "term": "hell", "category": "mild",
                   "confidence": 0.94, "source": "asr", "cue": 812}],
   "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
-  "intervals": [{"start": 4383.29, "end": 4383.90}],
+  "intervals": [{"start": 4383.29, "end": 4383.98}],
+  "output": {"path": "The Movie (2019).clean.mkv", "muted_spans": [{"start": 4383.29, "end": 4383.98}],
+             "verified_spans": 44, "timeline_shift": 0.0,
+             "audio_checks": [{"stream": 2, "same_dialogue": true, "correlation": 0.97, "lag": 0.0}],
+             "subtitles": [{"stream": 4, "codec": "subrip", "language": "eng", "masked": 45}],
+             "subtitle_copy": null, "notes": []},
   "timings": {"probe": 0.3, "decode": 41.2, "subtitles": 7.4, "vad": 30.5, "transcribe": 52.0, "render": 72.5}
 }
 ```
 
-`vbr render --report` reads only `intervals`, so users can add, delete or adjust spans by hand.
+`vbr render --report` mutes the report's `intervals` as they are (sorted, and merged where they overlap), so users can add, delete or adjust spans by hand. It reads `detections` only to label the review SRT, and `input` to refuse a report made for a different file (by size, OpenSubtitles hash or duration) unless `--force` is given. It writes the same outputs as `clean`, subtitles included, except the report itself, which it never rewrites.
 
 **EDL** (`--edl`). A mute list in the Kodi and MPlayer format, written next to the input as `<input stem>.edl`. Each line is `start end 1`, where action 1 means mute:
 
 ```
-4383.29	4383.90	1
+4383.29	4383.98	1
 ```
 
 Players that support EDL can mute the *original* file at playback time, with no rendering at all. Because the tool only mutes, the EDL describes the same edits as the cleaned file, apart from the fades.
 
-**Review SRT** (optional). One cue per interval showing the detected word. Load it in a player next to the cleaned file to spot-check the result.
+**Review SRT** (`--review-srt`, `output.review_srt`). One cue per muted span, naming what was heard there, e.g. `[muted] hell` or `[muted] f*** (estimated from subtitles)`. It is written as `<output stem>.review.srt`, so a player loads it with the cleaned file, with times moved by the output's `timeline_shift`. A dry run names it after the input, to play the original.
 
 ## 7. Strategy selection and fallbacks
 
@@ -648,20 +664,28 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 4. **Model sizing.** A small model handles sync anchors. The large model runs only on the windows that matter, which makes it affordable even on CPU.
 5. **Coverage guard.** When windows would pile up, the run switches to full mode instead of transcribing overlapping context.
 6. **Cheap rendering.** Video is stream-copied. Censoring uses command files, whose cost does not grow with the number of intervals.
-7. **Caching and batching.** Caches are described in §8.3. In batch mode the model stays loaded, and the render of one file overlaps with analysis of the next.
+7. **Caching and batching.** Caches are described in §8.3. In batch mode the model stays loaded, and each file is rendered in a background thread while the next one is analysed: rendering is mostly FFmpeg reading and writing the whole file, analysis mostly speech recognition. Renders run one at a time, the last file's in the foreground with its progress bar, and results are still reported in input order. A background render reports its warnings with the file's result, since only one live display may run at a time.
 8. **EDL output.** No rendering at all for players that support mute lists.
 
 ### 8.3 Caching
 
 ```
-<cache>/subtitles/<provider>/<file_id>.<ext>       + index.json: fingerprint → downloaded files
-<cache>/asr/<fingerprint>/<stream>/<model>-<params-hash>.jsonl   # transcribed spans, with words
-<cache>/audio/<fingerprint>-<stream>.f32           # 16 kHz mono (~230 MB/h), LRU-evicted
+<cache>/subtitles/<provider>/<file_id>.<ext>                        + index.json: fingerprint → downloaded files
+<cache>/asr/<fingerprint>/<stream>/<model>-<settings-hash>.jsonl    # transcribed spans, one per line, with words
+<cache>/asr/<fingerprint>/<stream>/speech.json                      # speech regions found by VAD (hybrid)
 ```
 
-- **Fingerprint.** The fingerprint is the OpenSubtitles hash plus the file size, which is cheap to compute.
-- **Transcripts.** The transcript cache is span-based. The planner subtracts spans that are already transcribed (minus their unreliable edges), and a cached full transcript serves any strategy. Re-running with an edited word list usually needs **no new speech recognition**, only matching and rendering.
-- **Eviction.** Least-recently-used entries are evicted when the cache exceeds `cache.max_size_gb`.
+- **Fingerprint.** The fingerprint is the OpenSubtitles hash plus the file size, which is cheap to compute. Files under 128 KiB have none and are not cached.
+- **Settings.** The settings hash covers what changes what the model hears: model, precision, batching, language, beam size, VAD, and the `initial_prompt` *setting*. It leaves out the word list, even though `"auto"` words the prompt from it, so that editing the list reuses what was heard. Anchors are cached under their own model and no prompt.
+- **Transcripts.** Each line holds a window as planned, the clip actually transcribed (trimmed to speech) and its words. A window is served from the cache when:
+  - the same window was transcribed before; or
+  - one transcript covers it reliably, i.e. without its last 0.3 s at an edge that could cut a word; or
+  - a whole-track transcript exists: a cached `full` run serves any strategy that uses the same model.
+
+  A window only partly covered is transcribed only in its gaps. Each gap reaches 2 s into the cached pieces around it, so the pieces can be joined in the middle of an overlap, as for split windows (§6.8). Silence trimmed off a cached clip counts as heard. The model is loaded only if something is missing, so re-running with an edited word list usually needs **no new speech recognition**, only matching and rendering. The wider re-check of an unconfirmed cue (§6.9) is never pieced together, since its purpose is to hear the cue again with more context; it is cached like any other window.
+- **Speech regions.** `hybrid` needs VAD over the whole track, which means decoding all of it. The regions are cached, so a re-run decodes nothing and reads windows by seeking. An earlier draft cached the decoded track itself (16 kHz mono, about 230 MB per hour); with speech regions and transcripts cached, it would rarely be read, so it is not kept.
+- **Eviction.** Least recently used transcript files are deleted when they exceed `cache.max_size_gb`; reading a file counts as a use. Downloaded subtitles are never evicted: they are small, and replacing one costs download quota. `cache.transcripts = false` keeps no transcripts at all.
+- **Measured.** With real Whisper (small.en, CPU) on the 45 s synthetic film of the ASR tests: 12.4 s for the first `hybrid` run, 0.1 s for a second, 6.6 s after two words were added to the list (14.6 s without the cache, with the same detections to within 40 ms), and 0.1 s for that again.
 
 ## 9. Failure modes and edge cases
 
@@ -670,6 +694,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | FFmpeg or ffprobe missing or older than 5.1 | Exit code 3 with an install hint (`vbr doctor`). |
 | No audio stream, or an encrypted stream | Error for that file. |
 | Commentary or audio-description tracks | Never auto-selected; dropped by `other_audio_streams = "auto"`. |
+| A same-language track that is another dub or out of sync | The dialogue check (§6.11) drops it rather than muting the wrong moments. |
 | Audio starts before or after the video; MPEG-TS offsets | Media-timeline rules (§6.2). |
 | Subtitles offset, drifting or at the wrong fps | Anchor tracking and fps snapping, then ffsubsync, the next candidate and finally the fallback. |
 | Subtitles paraphrase or soften profanity | Hint words; low fidelity triggers the full fallback. `hybrid` does not re-check softened cues (see §7). |
@@ -683,6 +708,10 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | DTS or TrueHD source | Codec table: FLAC in MKV. |
 | FFmpeg silently rejects a mute command | The post-render check finds a span that isn't silent, deletes the output and exits with code 1 (§6.11). |
 | Output already exists | Error unless `--overwrite`; `--skip-existing` for batches. |
+| A folder holds vbr's own outputs | Files named as another input's output, or tagged `VBR_CENSORED`, are skipped; a tagged file named on the command line is processed with a warning. |
+| Two inputs of a batch would be written to the same output (e.g. `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o DIR`) | The later one fails before anything is rendered, even with `--overwrite`, so neither output is lost; the batch goes on. |
+| Image-based subtitle streams (PGS, VobSub) | Copied uncensored, with a warning: editing them would need OCR. |
+| A report edited by hand for `vbr render` | Intervals are sorted and merged; malformed ones are an error naming their index. A report for another file needs `--force`. |
 | Run interrupted (Ctrl-C) | Partial output deleted. Caches keep the finished work. |
 | File smaller than 128 KiB | No OpenSubtitles hash; metadata search only. |
 | Network error or quota exhausted | Warning, then the next source, and eventually the fallback. |
@@ -728,6 +757,10 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - wall time
   
   They are reported per strategy, model and prompt setting. This set decides the defaults marked "to be tuned" and gates releases.
+
+  `scripts/evaluate.py SET_DIR` runs every strategy over a folder of clips, each annotated in `<stem>.truth.json` (`{"words": [{"start", "end", "word"}]}`), with any subtitles next to it. It reports recall (listed words muted over at least 95 % of their length), partial recall (at least half), precision (detections that overlap a listed word), the median and worst start and end error of detected words, extra muted seconds, seconds of audio transcribed and wall time, the last three per minute of video. `--set KEY=VALUE` overrides settings, to compare them.
+
+  No real annotated clips are in the repository: film clips cannot be shared. `scripts/make_synthetic_set.py` builds a stand-in set from espeak-ng speech: eight clips of about four minutes, several voices and speeds, noise and a music-like bed, and subtitles that are verbatim, masked, softened, missing lines, late by 1.7 s or absent. Every listed word is synthesized on its own, so its timing is exact. Synthetic speech is much cleaner than a soundtrack, so this set catches regressions and shows systematic effects, but it cannot tune the defaults for real films. Results are in Appendix C.
 - **CI.** GitHub Actions runs ruff, mypy and pytest on Linux, macOS and Windows with Python 3.11–3.13. Linux also runs against FFmpeg 5.1, 6.1 and 7.x.
 
 ## 12. Dependencies and packaging
@@ -766,6 +799,8 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | M4 Complete v1 | Output subtitle censoring, review SRT, `render --report`, `other_audio_streams`, folder batch mode, span-based transcript cache | The v1 feature set is complete, and defaults are tuned on the evaluation set. |
 | M5 Polish | WhisperX backend, edge refinement, packaging and release, docs | Published to PyPI. |
 
+M0 to M4 are implemented. M4's defaults were checked on a synthetic evaluation set, which changed `pad_after_ms` and fixed the sync fit (Appendix C); tuning them on real film clips is still to do.
+
 ## 14. Alternatives considered
 
 - **Subtitle timing only, with no speech recognition.** Cues are 1–6 s long, so this would mute whole sentences. It survives only as the `cue` fallback.
@@ -787,7 +822,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 **Still open**
 
 1. Does the `initial_prompt = "auto"` priming reduce masked output without adding false positives? This is decided on the evaluation set, and so is the alternative of faster-whisper `hotwords`.
-2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present?
+2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present? On the synthetic set, word ends came 90–120 ms early in the median and up to 230 ms early, so `pad_after_ms` went from 120 to 200 ms; starts came early too (Appendix C). Real speech should confirm both values.
 3. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
 4. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
 5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
@@ -862,3 +897,42 @@ Before writing this design, the FFmpeg parts were prototyped to check the key as
 - FFmpeg filters (`asendcmd`, `volume`, `asetnsamples`, `amix`, `sine`, `pan`, timeline editing): <https://ffmpeg.org/ffmpeg-filters.html>
 - FFmpeg 7 deprecation of `-filter_complex_script` in favour of `-/filter_complex`: <https://patchwork.ffmpeg.org/project/ffmpeg/patch/20240117092233.8503-5-anton@khirnov.net/>
 - Kodi EDL format (action 1 = mute): <https://kodi.wiki/view/Edit_decision_list>
+
+## Appendix C. Evaluation on the synthetic set
+
+**Setup.** `scripts/evaluate.py` over the set that `scripts/make_synthetic_set.py` builds (§11): eight clips, 35 minutes, 48 annotated listed words. Each clip is about 4.4 minutes, with a flagged line every 20 s or so, far denser than a film. The machine was a 4-vCPU container without a GPU, so Whisper ran int8 on the CPU with the default models: small.en for `full`, large-v3-turbo for windows, and base.en for anchors.
+
+**Metrics.** Recall counts a listed word muted over at least 95 % of its length; partial recall, at least half. Precision is the share of detections that overlap a listed word. Errors are detected minus annotated. Extra, audio and time are per minute of video.
+
+**With the tuned defaults** (`pad_after_ms = 200`):
+
+| Strategy | Recall | Partial | Precision | Start error, median / worst | End error, median / worst | Extra | Audio transcribed | Time |
+|---|---|---|---|---|---|---|---|---|
+| `full` | 95.8 % | 95.8 % | 100 % | −77 / −217 ms | −117 / −226 ms | 0.4 s | 60 s | 8.8 s |
+| `targeted` | 87.5 % | 87.5 % | 100 % | −90 / −249 ms | −88 / −226 ms | 0.4 s | 16 s | 7.5 s |
+| `hybrid` | 93.8 % | 93.8 % | 100 % | −95 / −248 ms | −88 / −226 ms | 0.4 s | 17 s | 8.9 s |
+
+Each row ran without the transcript cache.
+
+**Padding after the word.** `pad_after_ms` swept with the transcripts cached. At 200 ms every word that was detected at all is fully muted; more changes nothing here. In the sweep, `hybrid` reused the windows `targeted` had transcribed; on its own (above) it heard one more word, the softened clip's "damn".
+
+| `pad_after_ms` | `full` | `targeted` | `hybrid` | Extra per minute |
+|---|---|---|---|---|
+| 120 (the earlier default) | 75.0 % | 66.7 % | 68.8 % | 0.3 s |
+| 160 | 93.8 % | 83.3 % | 87.5 % | 0.4 s |
+| 200 (the new default) | 95.8 % | 87.5 % | 91.7 % | 0.4 s |
+| 250 | 95.8 % | 87.5 % | 91.7 % | 0.5 s |
+| 300 | 95.8 % | 87.5 % | 91.7 % | 0.5 s |
+
+**Findings.**
+
+1. **Word ends come early.** Whisper places the end of a word 90–120 ms early in the median and up to 230 ms early. With 120 ms of padding after, a quarter of the words kept an audible tail, hence the new default of 200 ms. Starts come early too, by 80–90 ms, so the 120 ms before a word leaves plenty of margin. On real speech the next word may start right away, and 200 ms can clip its onset; the real evaluation set should confirm the value (open question 2).
+2. **No false positives.** Hint words ("freaking", "heck") and near-misses ("hello", "shell", "assess", "class") were never muted.
+3. **What each strategy misses is what §7 says it misses.** All misses left are whole words:
+   - `targeted` and `hybrid` cannot find a word the subtitles soften into an ordinary word ("nonsense", "creep", "fool" in the `softened` clip); a hint word ("heck", "frick") is caught.
+   - `targeted` also misses lines the subtitles leave out, which `hybrid` catches.
+   - small.en, used by `full` on the CPU, did not recognize "damn" in two of the voices; large-v3-turbo in the windows did.
+4. **Speed on a CPU.** The windows cover a quarter of this dense set, and running large-v3-turbo on them costs about as much as small.en on everything. On a film, where flagged lines are minutes apart, the windows cover a few percent (§8.1). On a GPU both use large-v3-turbo.
+5. **The sync check, fixed on the way (§6.6).** The first run rejected subtitles 1.7 s late under `hybrid` (timing error 0.53 s) and accepted them under `targeted` with a scale of 1.0026, when the truth was a plain offset. Anchor words that follow a pause were placed up to 2 s early, and the fit followed them to a scale no real mismatch produces. With both fixed, the same clip passes with errors of 0.05 and 0.09 s.
+
+**Not measured here.** Real soundtracks, accents and subtitles; the prompt setting (open question 1); `fade_ms` on real speech (open question 6); the dialogue check's threshold (§6.11); and GPU timings. These need a set of real annotated clips.

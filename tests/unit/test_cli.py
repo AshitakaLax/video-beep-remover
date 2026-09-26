@@ -6,7 +6,8 @@ import respx
 from typer.testing import CliRunner
 
 from video_beep_remover import __version__
-from video_beep_remover.cli import app, collect_inputs
+from video_beep_remover.batch import collect_inputs
+from video_beep_remover.cli import app
 from video_beep_remover.config.schema import Config
 from video_beep_remover.errors import UsageError
 
@@ -61,8 +62,13 @@ def test_collect_inputs_finds_videos_in_folders(tmp_path: Path) -> None:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
-    assert [p.name for p in collect_inputs([tmp_path], recursive=False)] == ["a.MP4", "b.mkv"]
-    assert [p.name for p in collect_inputs([tmp_path], recursive=True)] == ["a.MP4", "b.mkv", "d.mkv"]
+    assert [i.path.name for i in collect_inputs([tmp_path], recursive=False)] == ["a.MP4", "b.mkv"]
+    found = collect_inputs([tmp_path, tmp_path / "b.mkv"], recursive=True)
+    assert [(i.path.name, i.from_folder) for i in found] == [
+        ("a.MP4", True),
+        ("b.mkv", False),
+        ("d.mkv", True),
+    ]
     try:
         collect_inputs([tmp_path / "sub" / "none"], recursive=False)
     except UsageError as exc:
@@ -109,10 +115,20 @@ def test_doctor_checks_the_opensubtitles_key(tmp_path: Path) -> None:
 def test_cache_info_and_clear(tmp_path: Path) -> None:
     config = tmp_path / "vbr.toml"
     config.write_text(f'[cache]\ndir = "{(tmp_path / "c").as_posix()}"\n', "utf-8")
+    from video_beep_remover.asr.cache import Transcript, TranscriptCache
+    from video_beep_remover.models import Word
     from video_beep_remover.subtitles.cache import SubtitleCache
 
     SubtitleCache(tmp_path / "c").store(5, b"x" * 2048)
+    store = TranscriptCache(tmp_path / "c").store("abc-1", 1, "small.en", "k", 60.0)
+    store.add_window(1.0, 5.0, Transcript(1.0, 5.0, (Word("hi", 2.0, 2.2),)))
     info = runner.invoke(app, ["cache", "info", "-c", str(config)])
-    assert info.exit_code == 0 and "1 files, 2 KiB" in info.output
+    assert info.exit_code == 0 and "subtitles: 1 files, 2 KiB" in info.output
+    assert "transcripts: 1 files, 0.0 MiB of at most 5 GB" in info.output
+    only = runner.invoke(app, ["cache", "clear", "--transcripts", "-c", str(config)])
+    assert (
+        only.exit_code == 0 and "removed 1 transcript files" in only.output and "subtitle" not in only.output
+    )
     cleared = runner.invoke(app, ["cache", "clear", "-c", str(config)])
-    assert cleared.exit_code == 0 and "removed 1 files" in cleared.output
+    assert cleared.exit_code == 0 and "removed 1 downloaded subtitle files" in cleared.output
+    assert "removed 0 transcript files" in cleared.output

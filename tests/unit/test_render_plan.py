@@ -130,16 +130,62 @@ def test_other_audio_policies(policy: str, expected: str | None) -> None:
     assert actions.get(2) == expected
 
 
-def test_subtitles_are_dropped_unless_copied_and_data_streams_are_dropped() -> None:
+def test_text_subtitles_are_censored_image_ones_copied_and_data_streams_dropped() -> None:
     streams = (stream(1, language="eng"), stream(2, "subtitle", codec="subrip"), stream(3, "data"),
-               stream(4, "attachment", codec="ttf"))  # fmt: skip
-    assert plan(OutputConfig(), *streams) == {0: "copy", 1: "censor", 4: "copy"}
+               stream(4, "attachment", codec="ttf"), stream(5, "subtitle", codec="hdmv_pgs_subtitle"))  # fmt: skip
+    assert plan(OutputConfig(), *streams) == {0: "copy", 1: "censor", 2: "censor", 4: "copy", 5: "copy"}
     assert plan(OutputConfig(subtitle_streams="copy"), *streams) == {
         0: "copy",
         1: "censor",
         2: "copy",
         4: "copy",
+        5: "copy",
     }
+    assert plan(OutputConfig(subtitle_streams="drop"), *streams) == {0: "copy", 1: "censor", 4: "copy"}
+
+
+def test_subtitle_notes_name_image_streams_and_other_languages() -> None:
+    media = info(stream(1, language="eng"), stream(2, "subtitle", codec="subrip", language="fre"),
+                 stream(3, "subtitle", codec="subrip", language="eng"), stream(4, "subtitle", codec="dvd_subtitle"))  # fmt: skip
+    notes = plan_streams(media, media.streams[0], OutputConfig(), "en").notes
+    assert notes == (
+        "subtitle stream #2 subrip fre is masked with the 'en' word list, which does not cover its language",
+        "subtitle stream #4 dvd_subtitle copied uncensored: image-based subtitles cannot be edited",
+    )
+    dropped = plan_streams(media, media.streams[0], OutputConfig(), "en").drop(2, "could not extract it")
+    assert [a.stream.index for a in dropped.actions] == [1, 3, 4] and dropped.notes[
+        -1
+    ] == "could not extract it"
+
+
+def test_censored_subtitles_are_read_from_their_own_files_with_their_tags() -> None:
+    media = info(
+        stream(0, "video"),
+        stream(1, codec="aac", language="eng"),
+        stream(2, "subtitle", codec="subrip", language="eng", title="SDH", disposition={"default": 1}),
+        stream(3, "subtitle", codec="hdmv_pgs_subtitle", language="eng"),
+        stream(4, "subtitle", codec="ass", language="eng"),
+    )
+    streams_plan = plan_streams(media, media.streams[1], OutputConfig(), "en")
+    files = {2: Path("/work/censored-2.srt"), 4: Path("/work/censored-4.ass")}
+    command = build_command(stub_ffmpeg(), media, streams_plan, [], fade=0.01, output=OutputConfig(),
+                            target=Path("out.mkv"), subtitle_files=files, tag="0.1.0;abc")  # fmt: skip
+    args = command.args
+    assert [args[i + 1] for i, a in enumerate(args) if a == "-i"] == [
+        "file:" + str(Path("movie.mkv").resolve()), "file:" + str(files[2].resolve()), "file:" + str(files[4].resolve())
+    ]  # fmt: skip
+    assert [args[i + 1] for i, a in enumerate(args) if a == "-map"] == ["0:0", "0:1", "1:0", "0:3", "2:0"]
+    assert args[args.index("-c:s:0") + 1] == "srt" and args[args.index("-c:s:2") + 1] == "ass"
+    assert "-c:s:1" not in args  # the image-based stream is copied
+    assert args[args.index("-metadata:s:s:0") + 1] == "language=eng"
+    assert "title=SDH" in args and args[args.index("-disposition:s:0") + 1] == "default"
+    assert args[args.index("-disposition:s:2") + 1] == "0"
+    assert args[args.index("-metadata") + 1] == "VBR_CENSORED=0.1.0;abc"
+    mp4 = build_command(stub_ffmpeg(), info(*media.streams[:3], name="movie.mp4"), plan_streams(
+        info(*media.streams[:3], name="movie.mp4"), media.streams[1], OutputConfig(), "en"), [], fade=0.01,
+        output=OutputConfig(), target=Path("out.mp4"), subtitle_files=files, tag="0.1.0;abc")  # fmt: skip
+    assert mp4.args[mp4.args.index("-c:s:0") + 1] == "mov_text"
+    assert mp4.args[mp4.args.index("-movflags") + 1] == "+faststart+use_metadata_tags"
 
 
 def test_build_command_maps_in_order_and_reapplies_stream_tags() -> None:

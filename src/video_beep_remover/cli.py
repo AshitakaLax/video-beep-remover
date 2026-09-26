@@ -15,6 +15,7 @@ from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, T
 from rich.table import Table
 
 from video_beep_remover import __version__
+from video_beep_remover.batch import Outcome, collect_inputs, run_batch, skip_outputs
 from video_beep_remover.config.loader import (
     LoadedConfig,
     cache_root,
@@ -36,7 +37,6 @@ from video_beep_remover.errors import (
     UsageError,
     VbrError,
 )
-from video_beep_remover.media.probe import VIDEO_SUFFIXES
 from video_beep_remover.pipeline import FileResult, Pipeline, RunOptions
 from video_beep_remover.pipeline import Progress as ProgressFn
 
@@ -49,7 +49,9 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Create, show and check configuration files.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
-cache_app = typer.Typer(help="Inspect or clear the cache of downloaded subtitles.", no_args_is_help=True)
+cache_app = typer.Typer(
+    help="Inspect or clear the cache of downloaded subtitles and transcripts.", no_args_is_help=True
+)
 app.add_typer(cache_app, name="cache")
 
 console = Console(stderr=True, highlight=False)
@@ -115,26 +117,6 @@ def _fail(error: VbrError) -> typer.Exit:
     return typer.Exit(error.exit_code)
 
 
-def collect_inputs(paths: list[Path], recursive: bool) -> list[Path]:
-    files: list[Path] = []
-    for path in paths:
-        if path.is_dir():
-            found = path.rglob("*") if recursive else path.iterdir()
-            files += sorted(
-                p
-                for p in found
-                if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES and ".partial." not in p.name
-            )
-        elif path.is_file():
-            files.append(path)
-        else:
-            raise UsageError(f"not found: {path}")
-    unique = list(dict.fromkeys(p.resolve() for p in files))
-    if not unique:
-        raise UsageError("no video files found")
-    return unique
-
-
 def _overrides(**flags: Any) -> dict[str, Any]:
     keys = {
         "strategy": "analysis.strategy",
@@ -167,7 +149,20 @@ def _summarize(result: FileResult) -> str:
         return f"{name}: nothing to mute, no output written"
     if result.status == "copied":
         return f"{name}: nothing to mute, copied → {result.output} ({result.strategy})"
-    return f"{name}: muted {result.intervals} spans → {result.output} ({result.strategy})"
+    how = "from the report" if result.strategy == "report" else result.strategy
+    return f"{name}: muted {result.intervals} spans → {result.output} ({how})"
+
+
+def _print_result(ui: ConsoleUI, result: FileResult) -> None:
+    console.print(f"[green]✔[/] {escape(_summarize(result))}")
+    for label, path in (
+        ("report", result.report),
+        ("EDL", result.edl),
+        ("review subtitles", result.review),
+        ("censored subtitles", result.subtitle_copy),
+    ):
+        if path:
+            ui.info(f"  {label}: {path}")
 
 
 def _run(
@@ -183,7 +178,9 @@ def _run(
     ui = ConsoleUI(quiet=quiet)
     try:
         loaded = load_config(config, overrides=_overrides(**flags))
-        files = collect_inputs(inputs, flags.get("recursive", False))
+        files, skipped = skip_outputs(
+            collect_inputs(inputs, flags.get("recursive", False)), loaded.config.output.path, options.output
+        )
         many = len(files) > 1
         if many and options.output is not None and options.output.exists() and not options.output.is_dir():
             raise UsageError("with several inputs, --output must be a directory")
@@ -194,23 +191,26 @@ def _run(
     except VbrError as exc:
         raise _fail(exc) from exc
 
+    for result in skipped:
+        _print_result(ui, result)
     failures = 0
-    for path in files:
-        try:
-            result = pipeline.process(path, options, many=many)
-        except DependencyError as exc:
-            raise _fail(exc) from exc  # would fail for every file: stop the batch
-        except VbrError as exc:
+
+    def report(outcome: Outcome) -> None:
+        nonlocal failures
+        for kind, message in outcome.messages:
+            (ui.warn if kind == "warn" else ui.info)(f"{outcome.path.name}: {message}")
+        if outcome.error is not None:
             if not many:
-                raise _fail(exc) from exc
+                raise _fail(outcome.error)
             failures += 1
-            ui.error(f"{path.name}: {exc}")
-            continue
-        console.print(f"[green]✔[/] {escape(_summarize(result))}")
-        if result.report:
-            ui.info(f"  report: {result.report}")
-        if result.edl:
-            ui.info(f"  EDL: {result.edl}")
+            ui.error(f"{outcome.path.name}: {outcome.error}")
+        elif outcome.result is not None:
+            _print_result(ui, outcome.result)
+
+    try:
+        run_batch(pipeline, files, options, report)
+    except DependencyError as exc:
+        raise _fail(exc) from exc  # would fail for every file: the batch stops
     if failures:
         ui.error(f"{failures} of {len(files)} files failed")
         raise typer.Exit(EXIT_PARTIAL)
@@ -233,6 +233,13 @@ LanguageOpt = Annotated[str | None, typer.Option(help="Spoken language, e.g. en.
 AudioStreamOpt = Annotated[int | None, typer.Option(help="ffprobe index of the dialogue audio stream.")]
 ReportOpt = Annotated[Path | None, typer.Option(help="Where to write the JSON report.")]
 EdlOpt = Annotated[bool, typer.Option("--edl", help="Also write <input>.edl, a mute list for Kodi/MPlayer.")]
+ReviewOpt = Annotated[
+    bool,
+    typer.Option("--review-srt", help="Also write .review.srt: one cue per muted span, for spot checks."),
+]
+OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")]
+OverwriteOpt = Annotated[bool, typer.Option("--overwrite", help="Replace existing outputs.")]
+KeepTempOpt = Annotated[bool, typer.Option("--keep-temp", help="Keep temporary files for debugging.")]
 RecursiveOpt = Annotated[bool, typer.Option("--recursive", "-r", help="Search folders recursively.")]
 VerboseOpt = Annotated[bool, typer.Option("--verbose", "-v", help="Show debug output.")]
 QuietOpt = Annotated[bool, typer.Option("--quiet", "-q", help="Only show results and errors.")]
@@ -242,7 +249,7 @@ QuietOpt = Annotated[bool, typer.Option("--quiet", "-q", help="Only show results
 def clean(
     inputs: InputsArg,
     config: ConfigOpt = None,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")] = None,
+    output: OutputOpt = None,
     strategy: StrategyOpt = None,
     subtitles: SubtitlesOpt = None,
     no_fallback: NoFallbackOpt = False,
@@ -255,14 +262,13 @@ def clean(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Detect only; same as `vbr scan`.")] = False,
     report: ReportOpt = None,
     edl: EdlOpt = False,
-    overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace existing outputs.")] = False,
+    review_srt: ReviewOpt = False,
+    overwrite: OverwriteOpt = False,
     skip_existing: Annotated[
         bool, typer.Option("--skip-existing", help="Skip inputs whose output exists.")
     ] = False,
     recursive: RecursiveOpt = False,
-    keep_temp: Annotated[
-        bool, typer.Option("--keep-temp", help="Keep temporary files for debugging.")
-    ] = False,
+    keep_temp: KeepTempOpt = False,
     verbose: VerboseOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
@@ -272,6 +278,7 @@ def clean(
         output=output,
         report=report,
         edl=edl,
+        review_srt=review_srt,
         overwrite=overwrite,
         skip_existing=skip_existing,
         keep_temp=keep_temp,
@@ -310,13 +317,23 @@ def scan(
     audio_stream: AudioStreamOpt = None,
     report: ReportOpt = None,
     edl: EdlOpt = False,
-    overwrite: Annotated[bool, typer.Option("--overwrite", help="Replace an existing EDL.")] = False,
+    review_srt: ReviewOpt = False,
+    overwrite: Annotated[
+        bool, typer.Option("--overwrite", help="Replace an existing EDL or review subtitles.")
+    ] = False,
     recursive: RecursiveOpt = False,
     verbose: VerboseOpt = False,
     quiet: QuietOpt = False,
 ) -> None:
     """Find the listed words and write a report (and optional EDL), without writing video."""
-    options = RunOptions(dry_run=True, report=report, edl=edl, overwrite=overwrite, subtitles=subtitles)
+    options = RunOptions(
+        dry_run=True,
+        report=report,
+        edl=edl,
+        review_srt=review_srt,
+        overwrite=overwrite,
+        subtitles=subtitles,
+    )
     _run(
         inputs,
         config,
@@ -333,6 +350,50 @@ def scan(
         audio_stream=audio_stream,
         recursive=recursive,
     )
+
+
+@app.command("render")
+def render_command(
+    video: Annotated[Path, typer.Argument(help="Video file.", show_default=False)],
+    report: Annotated[
+        Path,
+        typer.Option(
+            "--report",
+            help="A vbr report; its intervals are muted, and nothing is detected.",
+            show_default=False,
+        ),
+    ],
+    config: ConfigOpt = None,
+    output: OutputOpt = None,
+    categories: CategoriesOpt = None,
+    audio_stream: AudioStreamOpt = None,
+    edl: EdlOpt = False,
+    review_srt: ReviewOpt = False,
+    overwrite: OverwriteOpt = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Render even if the report was made for a different file.")
+    ] = False,
+    keep_temp: KeepTempOpt = False,
+    verbose: VerboseOpt = False,
+    quiet: QuietOpt = False,
+) -> None:
+    """Mute the spans listed in a report, e.g. one you edited by hand, without detecting anything.
+
+    Only the report's "intervals" are read; the word list is used for the subtitles."""
+    _setup_logging(verbose)
+    ui = ConsoleUI(quiet=quiet)
+    options = RunOptions(
+        output=output, edl=edl, review_srt=review_srt, overwrite=overwrite, keep_temp=keep_temp
+    )
+    try:
+        loaded = load_config(config, overrides=_overrides(audio_stream=audio_stream))
+        if not video.is_file():
+            raise UsageError(f"not found: {video}")
+        pipeline = Pipeline(loaded, ui=ui, categories=categories.split(",") if categories else None)
+        result = pipeline.render_report(video, report, options, force=force)
+    except VbrError as exc:
+        raise _fail(exc) from exc
+    _print_result(ui, result)
 
 
 @app.command("subs")
@@ -500,21 +561,40 @@ def config_check(config: ConfigOpt = None) -> None:
 @cache_app.command("info")
 def cache_info(config: ConfigOpt = None) -> None:
     """Show where the cache is and what it holds."""
+    from video_beep_remover.asr.cache import TranscriptCache
     from video_beep_remover.subtitles.cache import SubtitleCache
 
-    root = cache_root(_load_or_exit(config).config)
-    count, size = SubtitleCache(root).usage()
+    cfg = _load_or_exit(config).config
+    root = cache_root(cfg)
+    subtitles, subtitle_bytes = SubtitleCache(root).usage()
+    transcripts, transcript_bytes = TranscriptCache(root).usage()
     console.print(f"cache: {escape(str(root))}")
-    console.print(f"downloaded subtitles: {count} files, {size / 1024:.0f} KiB")
+    console.print(f"downloaded subtitles: {subtitles} files, {subtitle_bytes / 1024:.0f} KiB")
+    state = "" if cfg.cache.transcripts else " (not kept: cache.transcripts = false)"
+    console.print(
+        f"transcripts: {transcripts} files, {transcript_bytes / 1024**2:.1f} MiB "
+        f"of at most {cfg.cache.max_size_gb:g} GB{state}"
+    )
 
 
 @cache_app.command("clear")
-def cache_clear(config: ConfigOpt = None) -> None:
-    """Delete the downloaded subtitles. Downloading them again counts against your quota."""
+def cache_clear(
+    config: ConfigOpt = None,
+    subtitles: Annotated[
+        bool, typer.Option("--subtitles", help="Only the downloaded subtitles (downloading costs quota).")
+    ] = False,
+    transcripts: Annotated[bool, typer.Option("--transcripts", help="Only the transcripts.")] = False,
+) -> None:
+    """Delete what the cache holds: everything, or only the subtitles or the transcripts."""
+    from video_beep_remover.asr.cache import TranscriptCache
     from video_beep_remover.subtitles.cache import SubtitleCache
 
-    removed = SubtitleCache(cache_root(_load_or_exit(config).config)).clear()
-    console.print(f"removed {removed} files")
+    root = cache_root(_load_or_exit(config).config)
+    both = not subtitles and not transcripts
+    if subtitles or both:
+        console.print(f"removed {SubtitleCache(root).clear()} downloaded subtitle files")
+    if transcripts or both:
+        console.print(f"removed {TranscriptCache(root).clear()} transcript files")
 
 
 @app.command()

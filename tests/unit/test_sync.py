@@ -6,7 +6,15 @@ import pytest
 from helpers import say
 from video_beep_remover.config.schema import SyncConfig
 from video_beep_remover.models import Cue, SyncModel, Word
-from video_beep_remover.subtitles.sync import best_match, check_sync, choose_anchors, cue_tokens, fit, snap
+from video_beep_remover.subtitles.sync import (
+    STANDARD_RATIOS,
+    best_match,
+    check_sync,
+    choose_anchors,
+    cue_tokens,
+    fit,
+    snap,
+)
 
 VOCABULARY = [
     f"{a}{b}"
@@ -89,6 +97,25 @@ def test_fit_recovers_frame_rate_ratios_and_offsets(ratio: float) -> None:
     assert model.scale == ratio  # snapped exactly
     assert model.offset == pytest.approx(-2.5, abs=0.05)
     assert model.error < 0.05
+
+
+def test_fit_never_follows_the_noise_to_a_scale_no_mismatch_produces() -> None:
+    """Anchor times are rough (a word can be heard 0.4 s off). A free slope through six of them over
+    four minutes lands anywhere near 1, e.g. at 1.0026, which over a two-hour film would put the last
+    windows 19 s out. The fit keeps to the scales real mismatches produce."""
+    rng = random.Random(11)
+    xs = [7.0, 72.0, 113.0, 145.0, 177.0, 221.0]
+    for _ in range(200):
+        pairs = [(x, x - 1.6 + rng.uniform(-0.4, 0.4)) for x in xs]
+        model = fit(pairs)
+        assert model.scale in STANDARD_RATIOS and abs(model.scale - 1) < 0.0011  # 1, or NTSC's 0.1 %
+        assert model.to_media(7200) - (7200 - 1.6) == pytest.approx(0.0, abs=8.0)
+    # With anchors spread over the film, the 0.1 % that NTSC makes is told apart from 1.
+    film_xs = [600.0 * k for k in range(1, 12)]
+    assert fit([(x, x + rng.uniform(-0.4, 0.4)) for x in film_xs]).scale == 1.0
+    assert fit([(x, x * 1.001 + rng.uniform(-0.4, 0.4)) for x in film_xs]).scale == pytest.approx(
+        1.001, abs=1e-5
+    )
 
 
 def test_fit_uses_an_offset_only_for_few_or_close_pairs() -> None:

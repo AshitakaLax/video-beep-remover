@@ -15,8 +15,6 @@ from video_beep_remover.subtitles.parse import read_subtitle_file
 
 CandidateSource = Literal["explicit", "embedded", "sidecar", "opensubtitles"]
 
-# Text subtitle codecs FFmpeg can convert to SRT or ASS. Image-based ones (PGS, VobSub, DVB) would need OCR.
-TEXT_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
 SIDECAR_SUFFIXES = frozenset({".srt", ".ass", ".ssa", ".vtt"})
 SUBTITLE_DIRS = frozenset({"subs", "subtitles"})
 _SDH_TITLE = re.compile(r"\bSDH\b|\bCC\b|hearing|closed.?caption", re.IGNORECASE)
@@ -69,7 +67,7 @@ def embedded_candidates(info: MediaInfo) -> list[SubtitleCandidate]:
     """Text subtitle streams in the file itself. Commentary tracks are skipped."""
     found = []
     for stream in info.subtitle_streams:
-        if (stream.codec or "") not in TEXT_CODECS:
+        if not stream.is_text_subtitle:
             continue
         title = stream.title or ""
         if stream.disposition.get("comment") or _COMMENTARY_TITLE.search(title):
@@ -262,6 +260,36 @@ class SubtitleSearch:
         return self._results[source]
 
 
+def extracted_path(workdir: Path, stream: int, codec: str | None) -> Path:
+    """Where stream `stream` is extracted to: ASS stays ASS, every other text codec becomes SRT."""
+    return workdir / f"subtitles-{stream}.{'ass' if codec in ('ass', 'ssa') else 'srt'}"
+
+
+def extract_subtitle_streams(
+    ff: FFmpeg,
+    media: Path,
+    streams: Sequence[tuple[int, str | None]],
+    workdir: Path,
+    *,
+    on_progress: Callable[[float], None] | None = None,
+) -> dict[int, Path]:
+    """Extract text subtitle streams, given as (index, codec), in one pass over the file: extracting
+    means reading all of it. Streams already extracted into `workdir` are not extracted again."""
+    outputs = {index: extracted_path(workdir, index, codec) for index, codec in streams}
+    missing = {index: path for index, path in outputs.items() if not path.is_file()}
+    if missing:
+        args = ["-i", file_arg(media)]
+        for index, path in missing.items():
+            args += ["-map", f"0:{index}", "-f", path.suffix[1:], file_arg(path)]
+        try:
+            ff.run(args, on_progress=on_progress)
+        except MediaError as exc:
+            for path in missing.values():
+                path.unlink(missing_ok=True)
+            raise SubtitleError(f"could not extract the subtitle streams: {exc}") from exc
+    return outputs
+
+
 class SubtitleLoader:
     """Loads candidate text. Embedded streams are extracted in one pass over the file, the first time
     one of them is needed: extracting means reading the whole file."""
@@ -274,6 +302,7 @@ class SubtitleLoader:
         embedded: Sequence[SubtitleCandidate] = (),
         on_progress: Callable[[float], None] | None = None,
         online: OnlineSource | None = None,
+        also: Sequence[tuple[int, str | None]] = (),
     ) -> None:
         self.ff = ff
         self.media = media
@@ -281,6 +310,7 @@ class SubtitleLoader:
         self.embedded = [c for c in embedded if c.stream is not None]
         self.on_progress = on_progress
         self.online = online
+        self.also = list(also)  # (index, codec) of other text streams to extract in the same pass
         self._extracted: dict[int, Path] | None = None
 
     @property
@@ -289,20 +319,12 @@ class SubtitleLoader:
         return self._extracted is None and bool(self.embedded)
 
     def _extract(self) -> dict[int, Path]:
-        outputs: dict[int, Path] = {}
-        args = ["-i", file_arg(self.media)]
-        for candidate in self.embedded:
-            assert candidate.stream is not None
-            fmt = "ass" if candidate.codec in ("ass", "ssa") else "srt"
-            target = self.workdir / f"subtitles-{candidate.stream}.{fmt}"
-            args += ["-map", f"0:{candidate.stream}", "-f", fmt, file_arg(target)]
-            outputs[candidate.stream] = target
-        if outputs:
-            try:
-                self.ff.run(args, on_progress=self.on_progress)
-            except MediaError as exc:
-                raise SubtitleError(f"could not extract the subtitle streams: {exc}") from exc
-        return outputs
+        wanted = {c.stream: c.codec for c in self.embedded if c.stream is not None}
+        for index, codec in self.also:
+            wanted.setdefault(index, codec)
+        return extract_subtitle_streams(
+            self.ff, self.media, list(wanted.items()), self.workdir, on_progress=self.on_progress
+        )
 
     def text(self, candidate: SubtitleCandidate) -> str:
         if candidate.source == "opensubtitles":

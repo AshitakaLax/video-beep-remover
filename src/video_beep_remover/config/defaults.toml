@@ -68,7 +68,7 @@ terms = ["freak*", "frick*", "friggin*", "heck", "darn*", "shoot", "crud", "effi
 # ---------------------------------------------------------------------------
 [censor]
 pad_before_ms = 120                 # widen each detected word a little on both sides
-pad_after_ms = 120
+pad_after_ms = 200                  # more after: Whisper places word ends early (DESIGN.md Appendix C)
 min_duration_ms = 250               # very short gaps sound like glitches
 merge_gap_ms = 250                  # join muted spans closer than this
 fade_ms = 10                        # smooth fade at each edge, inside the padding; avoids clicks
@@ -146,10 +146,12 @@ subtitle_streams = "censor"         # "censor" | "copy" | "drop"
 subtitle_mask = "first_letter"      # "first_letter" (f***) | "asterisks" (****) | "remove"
 report = true                       # <output stem>.vbr.json
 edl = false                         # <input stem>.edl next to the input: Kodi / MPlayer mute the original file
+review_srt = false                  # <output stem>.review.srt: one cue per muted span, to spot-check in a player
 
 [cache]
 dir = "auto"                        # per-user cache dir
-max_size_gb = 5
+max_size_gb = 5                     # transcripts beyond this are deleted, least recently used first
+transcripts = true                  # keep transcripts, so re-running a file (e.g. after editing the word list) is fast
 
 [tools]
 ffmpeg = "ffmpeg"

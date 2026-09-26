@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from video_beep_remover.asr.base import Clip, Transcriber
+from video_beep_remover.asr.cache import Transcript, TranscriptStore
 from video_beep_remover.asr.faster_whisper import ModelChoice
-from video_beep_remover.asr.vad import SpeechDetector, trim_to_speech
+from video_beep_remover.asr.vad import Regions, SpeechDetector, snap_to_speech, trim_to_speech
 from video_beep_remover.config.schema import Config
 from video_beep_remover.detect.confirm import (
     attribute,
@@ -45,10 +46,11 @@ from video_beep_remover.subtitles.acquire import (
 )
 from video_beep_remover.subtitles.parse import parse_subtitles
 from video_beep_remover.subtitles.sync import STANDARD_RATIOS, SyncResult, check_sync, snap
-from video_beep_remover.ui import UI
+from video_beep_remover.ui import UI, Progress
 
 MIN_FLAGS_TO_ESCALATE = 3  # below this many strong flags, a poor confirmation rate proves nothing
 MIN_CLIP_S = 0.1
+OVERLAP_S = 2.0  # a stretch transcribed to fill a gap in the cache overlaps the cached pieces this much
 READ_WORKERS = 4
 
 
@@ -73,6 +75,11 @@ class Context:
     transcriber: Callable[[str], tuple[ModelChoice, Transcriber]]  # by role: "targeted", "anchor", ...
     detect_speech: SpeechDetector
     online: Callable[[MediaInfo], OnlineSource | None] = lambda info: None  # OpenSubtitles, if usable
+    transcripts: Callable[[str], TranscriptStore | None] = lambda role: None  # cached ones, by role
+    model_choice: Callable[[str], ModelChoice] | None = None  # the model for a role, without loading it
+
+    def choice(self, role: str) -> ModelChoice:
+        return self.model_choice(role) if self.model_choice else self.transcriber(role)[0]
 
 
 @dataclass(frozen=True)
@@ -158,14 +165,32 @@ def describe_sync(sync: SyncResult) -> str:
 
 
 def anchor_transcriber(ctx: Context, audio: AudioSource) -> Callable[[float, float], Sequence[Word]]:
-    _, model = ctx.transcriber("anchor")
+    """Transcribes anchor windows with the small model, which is loaded only if the cache lacks one."""
+    store = ctx.transcripts("anchor")
     language = ctx.config.analysis.language
+    model: Transcriber | None = None
 
     def transcribe(start: float, end: float) -> Sequence[Word]:
-        clip, _, _ = trim_to_speech(Clip(start, audio.read(start, end)), ctx.detect_speech)
-        if clip.duration < MIN_CLIP_S:
-            return []
-        return model.transcribe([clip], language=language, prompt=None)[0]
+        nonlocal model
+        cached = store.window(start, end) if store else None
+        if cached is not None:
+            return list(cached.words)
+        if model is None:
+            _, model = ctx.transcriber("anchor")
+        trimmed = trim_to_speech(Clip(start, audio.read(start, end)), ctx.detect_speech)
+        clip = trimmed.clip
+        words: list[Word] = []
+        if clip.duration >= MIN_CLIP_S:
+            # An anchor's first word decides its time, and an anchor window holds several lines.
+            words = snap_to_speech(
+                model.transcribe([clip], language=language, prompt=None)[0], trimmed.speech
+            )
+        if store:
+            transcript = Transcript(
+                clip.start, clip.start + clip.duration, tuple(words), trimmed.clean_start, trimmed.clean_end
+            )
+            store.add_window(start, end, transcript)
+        return words
 
     return transcribe
 
@@ -183,7 +208,9 @@ def select_subtitles(
     only when local subtitles fail."""
     config = ctx.config
     selection = SubtitleSelection(None, [], ())
-    loader = SubtitleLoader(ctx.ff, info.path, workdir, online=search.online)
+    # Every text stream is extracted in the one pass, so censoring the output's subtitles needs no second one.
+    text_streams = [(s.index, s.codec) for s in info.subtitle_streams if s.is_text_subtitle]
+    loader = SubtitleLoader(ctx.ff, info.path, workdir, online=search.online, also=text_streams)
     transcribe: Callable[[float, float], Sequence[Word]] | None = None
     notes: list[str] = []
 
@@ -229,7 +256,6 @@ def select_subtitles(
             if scale != 1.0:
                 entry["frame_rate_ratio"] = scale
             if transcribe is None:
-                # Loading the model shows its own status line, so not inside the one below.
                 transcribe = anchor_transcriber(ctx, audio)
             with ctx.ui.status(f"Checking the sync of {candidate.label}"):
                 sync = check(cues, trusted=candidate.trusted, scale=scale)
@@ -282,34 +308,100 @@ def _read_all(audio: AudioSource, windows: Sequence[Window]) -> list[Audio]:
         return list(pool.map(lambda w: audio.read(w.start, w.end), windows))
 
 
+def fill_gap(gap: tuple[float, float], window: Window, min_window: float) -> tuple[float, float]:
+    """The stretch to transcribe for a gap in the cached transcripts of `window`: the gap, reaching
+    OVERLAP_S into the transcripts around it so the pieces can be joined in the middle of an overlap,
+    and at least `min_window` long; never outside the window."""
+    start, end = max(window.start, gap[0] - OVERLAP_S), min(window.end, gap[1] + OVERLAP_S)
+    if end - start < min_window:
+        middle = (start + end) / 2
+        start, end = middle - min_window / 2, middle + min_window / 2
+        if start < window.start:
+            start, end = window.start, window.start + min_window
+        if end > window.end:
+            start, end = window.end - min_window, window.end
+        start = max(start, window.start)
+    return start, end
+
+
 def transcribe_windows(
     ctx: Context,
-    transcriber: Transcriber,
+    role: str,
     audio: AudioSource,
     windows: Sequence[Window],
     duration: float,
     label: str,
-) -> tuple[list[Detection], int]:
-    """Transcribe the windows (trimmed to their speech) and find listed words in them."""
-    with ctx.ui.status("Reading audio"):
-        samples = _read_all(audio, windows)
-        trimmed = [
-            trim_to_speech(Clip(w.start, a), ctx.detect_speech) for w, a in zip(windows, samples, strict=True)
-        ]
-    kept = [
-        (w, clip, (head, tail))
-        for w, (clip, head, tail) in zip(windows, trimmed, strict=True)
-        if clip.duration >= MIN_CLIP_S
-    ]
-    if not kept:
-        return [], 0
-    clips = [clip for _, clip, _ in kept]
-    effective = [Window(c.start, c.start + c.duration, w.reasons, w.cues) for w, c, _ in kept]
-    with ctx.ui.progress(label, sum(c.duration for c in clips)) as update:
-        transcripts = transcriber.transcribe(
-            clips, language=ctx.config.analysis.language, prompt=ctx.prompt, vad=False, on_progress=update
-        )
-    return detect_in_windows(ctx.lexicon, effective, transcripts, duration, [edges for _, _, edges in kept])
+    *,
+    stitch: bool = True,
+) -> tuple[list[Detection], int, tuple[int, int]]:
+    """Transcribe the windows (trimmed to their speech) and find listed words in them.
+
+    Cached transcripts are used first: what they reliably cover is neither read nor transcribed, only
+    the gaps are, and the model is loaded only if there are gaps. Without `stitch`, a window is served
+    from the cache only by one transcript heard with at least as much context (the wider re-check wants
+    the whole window heard in one go). Returns the detections, the number of words heard, and how many
+    windows the cache served entirely and in part."""
+    store = ctx.transcripts(role)
+    min_window = ctx.config.analysis.targeted.min_window_s
+    pieces: list[tuple[Window, Transcript]] = []
+    todo: list[tuple[Window, float, float]] = []  # (the planned window, start, end) to transcribe
+    complete = partial = 0
+    for window in windows:
+        found: list[Transcript] = []
+        gaps = [(window.start, window.end)]
+        if store and stitch:
+            found, gaps = store.cover(window.start, window.end)
+        elif store and (whole := store.window(window.start, window.end)) is not None:
+            found, gaps = [whole], []
+        pieces += [(window, transcript) for transcript in found]
+        complete += not gaps
+        partial += bool(gaps and found)
+        if not gaps:
+            continue
+        if not found:
+            todo.append((window, window.start, window.end))
+        else:
+            todo += [(window, *fill_gap(gap, window, min_window)) for gap in gaps]
+    if todo:
+        with ctx.ui.status("Reading audio"):
+            samples = _read_all(audio, [Window(start, end) for _, start, end in todo])
+            trimmed = [
+                trim_to_speech(Clip(start, a), ctx.detect_speech)
+                for (_, start, _), a in zip(todo, samples, strict=True)
+            ]
+        clips = [t.clip for t in trimmed if t.clip.duration >= MIN_CLIP_S]
+        heard: list[list[Word]] = []
+        if clips:
+            _, transcriber = ctx.transcriber(role)
+            with ctx.ui.progress(label, sum(c.duration for c in clips)) as update:
+                heard = transcriber.transcribe(
+                    clips,
+                    language=ctx.config.analysis.language,
+                    prompt=ctx.prompt,
+                    vad=False,
+                    on_progress=update,
+                )
+        results = iter(heard)
+        for (window, start, end), cut in zip(todo, trimmed, strict=True):
+            clip = cut.clip
+            words = tuple(next(results)) if clip.duration >= MIN_CLIP_S else ()
+            transcript = Transcript(
+                clip.start, clip.start + clip.duration, words, cut.clean_start, cut.clean_end
+            )
+            if store:  # even an empty one, so the next run does not read it again
+                store.add_window(start, end, transcript)
+            if clip.duration >= MIN_CLIP_S:
+                pieces.append((window, transcript))
+    if not pieces:
+        return [], 0, (complete, partial)
+    detections, count = detect_in_windows(
+        ctx.lexicon,
+        [Window(t.start, t.end, w.reasons, w.cues) for w, t in pieces],
+        [list(t.words) for _, t in pieces],
+        duration,
+        [(t.clean_start, t.clean_end) for _, t in pieces],
+    )
+    return detections, count, (complete, partial)
 
 
 def _flag_counts(flags: Sequence[FlaggedCue]) -> dict[str, int]:
@@ -325,10 +417,11 @@ def analyse(
     workdir: Path,
     *,
     explicit: Path | None = None,
-    track: Audio | None = None,
+    speech: Callable[[Progress], Regions] | None = None,
     lap: Callable[[str], None] = lambda name: None,
 ) -> GuidedResult:
-    """Run a subtitle-guided strategy. `track` is the decoded soundtrack, which `hybrid` needs."""
+    """Run a subtitle-guided strategy. `speech` finds the speech in the whole track, which `hybrid`
+    needs (from the decoded track, or from the cache)."""
     config = ctx.config
     settings = config.analysis.targeted
     duration = info.duration
@@ -358,10 +451,10 @@ def analyse(
     spans = flagged_windows(flags, sync, pad)
     uncovered: list[tuple[float, float]] = []
     if strategy == "hybrid":
-        assert track is not None
+        assert speech is not None
         with ctx.ui.progress("Finding speech", duration) as update:
-            speech = ctx.detect_speech(track, update)
-        uncovered = uncovered_speech(speech, choice.cues, sync)
+            regions = speech(update)
+        uncovered = uncovered_speech(regions, choice.cues, sync)
         spans += [Window(start, end, frozenset({"uncovered"})) for start, end in uncovered]
         lap("vad")
 
@@ -402,8 +495,10 @@ def analyse(
     words = 0
     model: ModelChoice | None = None
     if windows:
-        model, transcriber = ctx.transcriber(strategy)
-        detections, words = transcribe_windows(ctx, transcriber, audio, windows, duration, "Transcribing")
+        model = ctx.choice(strategy)
+        detections, words, (complete, partial) = transcribe_windows(
+            ctx, strategy, audio, windows, duration, "Transcribing"
+        )
         confirmed, unconfirmed = split_confirmed(flags, detections, sync, pad)
         if unconfirmed and settings.expand_by_s > 0:
             grow = settings.expand_by_s
@@ -414,8 +509,13 @@ def analyse(
                 ]
             )
             report["windows"]["expanded"] = len(wider)
-            more, heard = transcribe_windows(ctx, transcriber, audio, wider, duration, "Re-checking")
+            more, heard, (also, partly) = transcribe_windows(
+                ctx, strategy, audio, wider, duration, "Re-checking", stitch=False
+            )
             detections, words = dedupe(detections + more), words + heard
+            complete, partial = complete + also, partial + partly
+        report["windows"]["cached"] = complete
+        report["windows"]["partly_cached"] = partial
         lap("transcribe")
     confirmed, unconfirmed = split_confirmed(flags, detections, sync, pad)
     strong = len(confirmed) + len(unconfirmed)

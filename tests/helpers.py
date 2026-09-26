@@ -28,6 +28,7 @@ class Track:
     title: str | None = None
     default: bool = False
     delay: float = 0.0
+    noise_seed: int | None = None  # white noise instead of the tone: unlike a tone, it matches only itself
 
 
 def make_clip(
@@ -37,10 +38,12 @@ def make_clip(
     tracks: Sequence[Track] = (Track(default=True),),
     audio_codec: str = "aac",
     subtitles: str | None = None,
+    subtitle_tags: Sequence[str] = (),
     video: bool = True,
     sample_rate: int = SR,
 ) -> Path:
-    """A test-pattern video with one pure tone per audio track (tones stand in for speech)."""
+    """A test-pattern video with one pure tone per audio track (tones stand in for speech).
+    `subtitle_tags` are extra options for the subtitle stream, e.g. ["-metadata:s:s:0", "language=eng"]."""
     args: list[str] = []
     maps: list[str] = []
     index = 0
@@ -51,12 +54,12 @@ def make_clip(
     for track in tracks:
         if track.delay:
             args += ["-itsoffset", str(track.delay)]
-        args += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"sine=frequency={track.frequency}:sample_rate={sample_rate}:duration={duration}",
-        ]
+        source = (
+            f"anoisesrc=seed={track.noise_seed}:amplitude=0.2:sample_rate={sample_rate}:duration={duration}"
+            if track.noise_seed is not None
+            else f"sine=frequency={track.frequency}:sample_rate={sample_rate}:duration={duration}"
+        )
+        args += ["-f", "lavfi", "-i", source]
         maps += ["-map", f"{index}:a"]
         index += 1
     if subtitles is not None:
@@ -73,9 +76,18 @@ def make_clip(
         meta += [f"-disposition:a:{position}", "default" if track.default else "0"]
     codecs = ["-c:v", "libx264", "-preset", "ultrafast", "-c:a", audio_codec]
     if subtitles is not None:
-        codecs += ["-c:s", "mov_text" if path.suffix == ".mp4" else "srt"]
+        codecs += ["-c:s", "mov_text" if path.suffix == ".mp4" else "srt", *subtitle_tags]
     run_ffmpeg(*args, *maps, *codecs, *meta, str(path))
     return path
+
+
+def extract_subtitles(path: Path, stream: str = "0:s:0") -> str:
+    """A subtitle stream of `path` as SRT text."""
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", stream, "-f", "srt", "pipe:1"],
+        capture_output=True, check=True,
+    )  # fmt: skip
+    return result.stdout.decode("utf-8")
 
 
 def decode(path: Path, stream: str = "0:a:0") -> np.ndarray:

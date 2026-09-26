@@ -31,7 +31,7 @@ class LexiconConfig(_Model):
 
 class CensorConfig(_Model):
     pad_before_ms: int = Field(120, ge=0, le=2000)
-    pad_after_ms: int = Field(120, ge=0, le=2000)
+    pad_after_ms: int = Field(200, ge=0, le=2000)
     min_duration_ms: int = Field(250, ge=0, le=5000)
     merge_gap_ms: int = Field(250, ge=0, le=5000)
     fade_ms: int = Field(10, ge=1, le=100)
@@ -113,11 +113,13 @@ class OutputConfig(_Model):
     subtitle_mask: Literal["first_letter", "asterisks", "remove"] = "first_letter"
     report: bool = True
     edl: bool = False
+    review_srt: bool = False
 
 
 class CacheConfig(_Model):
     dir: str = "auto"
     max_size_gb: float = Field(5, ge=0)
+    transcripts: bool = True
 
 
 class ToolsConfig(_Model):

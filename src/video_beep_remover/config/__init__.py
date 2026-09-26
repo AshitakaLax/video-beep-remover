@@ -1,6 +1,7 @@
 from video_beep_remover.config.loader import (
     LoadedConfig,
     cache_root,
+    config_hash,
     defaults_text,
     load_config,
     redact,
@@ -14,6 +15,7 @@ __all__ = [
     "Config",
     "LoadedConfig",
     "cache_root",
+    "config_hash",
     "defaults_text",
     "load_config",
     "redact",
