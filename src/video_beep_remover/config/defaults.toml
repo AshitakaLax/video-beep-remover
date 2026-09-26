@@ -1,0 +1,156 @@
+# video-beep-remover — example configuration
+#
+# Location (first match wins):
+#   1. --config PATH on the command line
+#   2. $VBR_CONFIG
+#   3. ./vbr.toml in the current directory
+#   4. the per-user config dir, e.g. ~/.config/video-beep-remover/config.toml
+# Built-in defaults fill in anything not set here, except that word-list categories defined
+# here replace the built-in ones. Command-line flags override this file.
+# Any string value may reference an environment variable as ${NAME} (unset -> empty string),
+# which keeps secrets such as API keys out of the file.
+#
+# See docs/DESIGN.md §4 for the full schema.
+
+config_version = 1
+offline = false                     # true = no network: skip every online subtitle provider, never download models
+
+# ---------------------------------------------------------------------------
+# Word list: what gets censored
+# ---------------------------------------------------------------------------
+# Term syntax (case-insensitive, matched against whole words):
+#   damn              exact word
+#   bitch*            word starting with "bitch" (bitch, bitches, bitchy)
+#   *shit*            any word containing "shit" (bullshit, shitty, dipshit)
+#   son of a bitch    phrase: consecutive words, each may use wildcards
+#   oh my [god]       phrase that gives context, but only the [bracketed] words are censored
+#   re:^f+u+c+k+      regular expression (escape hatch; applied to one normalized word)
+[lexicon]
+language = "en"
+# Extra word-list files: one term per line, same syntax as `terms`, '#' starts a comment.
+files = []
+# Never censor these, even when a wildcard term matches them (e.g. "bastard*", "wank*").
+allow = ["bastardiz*", "wankel*"]
+# Treat masked words such as "f***", "sh*t" or "***" (in subtitles or in Whisper output)
+# as profanity.
+detect_masked = true
+masked_patterns = ["[*#]"]
+
+[lexicon.categories.strong]
+enabled = true
+terms = [
+  "*fuck*", "*shit*", "cunt*", "*cocksucker*", "bitch*", "son of a bitch", "sonofabitch",
+  "*asshole*", "bastard*", "dickhead*", "twat*", "wank*",
+]
+
+[lexicon.categories.mild]
+enabled = true
+terms = [
+  "damn", "damned", "dammit", "damnit", "damn it", "hell", "crap", "crappy",
+  "ass", "asses", "dumbass*", "jackass*", "smartass*", "badass*", "piss", "pissed", "pissing",
+]
+
+[lexicon.categories.religious]
+enabled = true
+terms = ["goddamn*", "god damn*", "god dammit", "jesus christ", "oh my [god]", "for christ's sake"]
+
+[lexicon.categories.slurs]
+enabled = true
+terms = []                          # add your own
+
+# Words that subtitles often use *instead of* profanity. A cue containing one of these is
+# checked against the audio, but the hint word itself is never censored.
+[lexicon.hints]
+terms = ["freak*", "frick*", "friggin*", "heck", "darn*", "shoot", "crud", "effin*", "eff", "bleep*"]
+
+# ---------------------------------------------------------------------------
+# How words are muted (mute is the only action; see DESIGN.md §16 for the replacement stretch goal)
+# ---------------------------------------------------------------------------
+[censor]
+pad_before_ms = 120                 # widen each detected word a little on both sides
+pad_after_ms = 120
+min_duration_ms = 250               # very short gaps sound like glitches
+merge_gap_ms = 250                  # join muted spans closer than this
+fade_ms = 10                        # smooth fade at each edge, inside the padding; avoids clicks
+
+# ---------------------------------------------------------------------------
+# How profanity is found
+# ---------------------------------------------------------------------------
+[analysis]
+# "hybrid"   = subtitle-flagged regions + speech that no subtitle covers (default)
+# "targeted" = only subtitle-flagged regions (fastest)
+# "full"     = transcribe the whole soundtrack (slowest, highest recall)
+strategy = "hybrid"
+fallback_to_full = true             # when subtitles are missing/unusable; false = fail instead
+audio_stream = "auto"               # "auto" or an ffprobe stream index, e.g. 1
+language = "en"                     # spoken language; skips Whisper language detection
+
+[analysis.targeted]
+window_padding_s = 1.5              # audio searched before/after each flagged subtitle cue
+min_window_s = 4.0
+max_window_s = 30.0                 # Whisper's native context; longer windows are split
+merge_gap_s = 1.0
+max_coverage = 0.35                 # if windows would cover more of the runtime, use "full"
+on_unconfirmed = "estimate"         # "estimate" | "cue" | "skip" (see DESIGN.md §6.9)
+expand_by_s = 3.0
+
+[analysis.sync]
+anchors = 6                         # subtitle cues used to verify/estimate sync and fidelity
+trusted_search_s = 3.0              # embedded, sidecar and hash-matched subtitles
+untrusted_search_s = 20.0           # everything else
+min_matched_ratio = 0.5
+max_error_s = 0.5
+min_fidelity = 0.6                  # 0-1; below this, subtitles are too paraphrased to guide the search
+ffsubsync = "fallback"              # "never" | "fallback" (needs the [sync] extra)
+
+[transcription]
+backend = "faster-whisper"          # "faster-whisper" | "whisperx"
+model = "auto"                      # e.g. "large-v3-turbo", "small.en"; auto picks by device and strategy
+anchor_model = "base.en"            # small, fast model used only for sync anchors
+device = "auto"                     # "auto" | "cuda" | "cpu"
+compute_type = "auto"               # "auto" | "float16" | "int8_float16" | "int8"
+beam_size = 5
+batch_size = 8
+vad_filter = true
+initial_prompt = "auto"             # "auto" | "" (off) | your own text
+
+# ---------------------------------------------------------------------------
+# Where subtitles come from
+# ---------------------------------------------------------------------------
+[subtitles]
+languages = ["en"]
+sources = ["embedded", "sidecar", "opensubtitles"]   # tried in this order
+prefer_hearing_impaired = true      # SDH/CC tracks are usually closer to verbatim
+max_candidates = 3
+
+[subtitles.opensubtitles]
+enabled = true
+# No key ships with vbr: create a free opensubtitles.com account and register your own API consumer.
+api_key = "${OPENSUBTITLES_API_KEY}"   # empty -> provider skipped with a notice
+username = "${OPENSUBTITLES_USERNAME}" # optional; logged-in users get a larger download quota
+password = "${OPENSUBTITLES_PASSWORD}"
+user_agent = "video-beep-remover v0.1"
+exclude_machine_translated = true
+
+# ---------------------------------------------------------------------------
+# What gets written
+# ---------------------------------------------------------------------------
+[output]
+path = "{stem}.clean{ext}"          # relative to the input's folder; {stem} {ext} {dir}
+overwrite = false
+when_clean = "copy"                 # no profanity found: "copy" (stream copy) | "skip"
+audio_codec = "auto"                # same codec as the source when FFmpeg can encode it
+audio_bitrate = "auto"
+other_audio_streams = "auto"        # "auto" | "censor" | "copy" | "drop" (see DESIGN.md §6.11)
+subtitle_streams = "censor"         # "censor" | "copy" | "drop"
+subtitle_mask = "first_letter"      # "first_letter" (f***) | "asterisks" (****) | "remove"
+report = true                       # <output stem>.vbr.json
+edl = false                         # <input stem>.edl next to the input: Kodi / MPlayer mute the original file
+
+[cache]
+dir = "auto"                        # per-user cache dir
+max_size_gb = 5
+
+[tools]
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
