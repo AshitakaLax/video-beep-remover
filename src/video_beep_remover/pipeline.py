@@ -387,6 +387,7 @@ class Pipeline:
                     "encoders": {str(index): encoder for index, encoder in rendered.encoders.items()},
                     "muted_spans": [interval_dict(i) for i in rendered.intervals],
                     "verified_spans": rendered.verified_spans,
+                    "timeline_shift": round(rendered.timeline_shift, 3),
                     "notes": list(plan.notes),
                 }
 

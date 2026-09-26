@@ -37,6 +37,7 @@ def make_clip(
     audio_codec: str = "aac",
     subtitles: str | None = None,
     video: bool = True,
+    sample_rate: int = SR,
 ) -> Path:
     """A test-pattern video with one pure tone per audio track (tones stand in for speech)."""
     args: list[str] = []
@@ -53,7 +54,7 @@ def make_clip(
             "-f",
             "lavfi",
             "-i",
-            f"sine=frequency={track.frequency}:sample_rate={SR}:duration={duration}",
+            f"sine=frequency={track.frequency}:sample_rate={sample_rate}:duration={duration}",
         ]
         maps += ["-map", f"{index}:a"]
         index += 1

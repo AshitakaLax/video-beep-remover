@@ -12,10 +12,10 @@ from typing import Literal
 import numpy as np
 
 from video_beep_remover.config.schema import OutputConfig
-from video_beep_remover.errors import DependencyError, RenderError
+from video_beep_remover.errors import DependencyError, RenderError, VbrError
 from video_beep_remover.languages import lang_matches
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
-from video_beep_remover.media.probe import MediaInfo, StreamInfo
+from video_beep_remover.media.probe import MediaInfo, StreamInfo, parse_probe
 from video_beep_remover.models import CensorInterval
 
 log = logging.getLogger(__name__)
@@ -273,6 +273,31 @@ def level_dbfs(samples: np.ndarray) -> float:
     return 20 * math.log10(rms + 1e-12)
 
 
+def timeline_shift(ff: FFmpeg, info: MediaInfo, plan: StreamPlan, rendered: Path) -> float:
+    """How much later the content sits on the rendered file's timeline than on the input's, in seconds.
+
+    Both timelines start at their file's earliest timestamp. Re-encoding can move that: an AAC
+    encoder's priming packet sits before the first sample, 21 ms at 48 kHz and 46 ms at 22.05 kHz,
+    and in Matroska it can make the new file start earlier than the old one did. FFmpeg shifts every
+    stream alike, so a stream-copied one (usually the video) shows the shift. Returns 0 when there is
+    no copied stream with a start time."""
+    try:
+        rendered_info = parse_probe(rendered, ff.probe(rendered))
+    except VbrError:
+        return 0.0
+    for position, action in enumerate(plan.actions):
+        stream = action.stream
+        if action.action != "copy" or stream.start_time is None or stream.is_attached_picture:
+            continue
+        if stream.kind not in ("video", "audio", "subtitle") or position >= len(rendered_info.streams):
+            continue
+        copied = rendered_info.streams[position]
+        if copied.start_time is None:
+            continue
+        return (copied.start_time - rendered_info.start_time) - (stream.start_time - info.start_time)
+    return 0.0
+
+
 def verify_muted(
     ff: FFmpeg,
     path: Path,
@@ -280,9 +305,11 @@ def verify_muted(
     intervals: Sequence[CensorInterval],
     fade: float,
     *,
+    shift: float = 0.0,
     workers: int = 4,
 ) -> tuple[int, list[str]]:
-    """Decode the core of every muted span (the span minus its fades) and require silence.
+    """Decode the core of every muted span (the span minus its fades) and require silence. `shift` is
+    how much later the content sits in `path` than in the input (see timeline_shift).
 
     FFmpeg ignores a filter command it rejects without an error, so this is what proves the mutes happened.
     Returns (spans checked, failures).
@@ -291,7 +318,7 @@ def verify_muted(
     for position in positions:
         for interval in intervals:
             f = fade_for(interval, fade)
-            start = interval.start + f + VERIFY_MARGIN_S
+            start = interval.start + shift + f + VERIFY_MARGIN_S
             length = interval.end - f - VERIFY_MARGIN_S - start
             if length >= 0.02:
                 jobs.append((position, interval, start, length))
@@ -320,6 +347,7 @@ class RenderResult:
     encoders: dict[int, str]
     intervals: tuple[CensorInterval, ...]
     verified_spans: int
+    timeline_shift: float = 0.0  # the muted spans sit this much later in the output (see timeline_shift)
 
 
 def render(
@@ -342,8 +370,9 @@ def render(
         (workdir / name).write_text(text, "utf-8")
     try:
         ff.run(command.args, cwd=workdir, on_progress=on_progress)
+        shift = timeline_shift(ff, info, plan, partial)
         checked, failures = verify_muted(
-            ff, partial, command.censored_positions, spans, fade, workers=os.cpu_count() or 4
+            ff, partial, command.censored_positions, spans, fade, shift=shift, workers=os.cpu_count() or 4
         )
         if failures:
             shown = "\n  ".join(failures[:10])
@@ -358,5 +387,9 @@ def render(
         raise
     log.debug("rendered %s, verified %d spans", output, checked)
     return RenderResult(
-        output=output, encoders=command.encoders, intervals=tuple(spans), verified_spans=checked
+        output=output,
+        encoders=command.encoders,
+        intervals=tuple(spans),
+        verified_spans=checked,
+        timeline_shift=shift,
     )
