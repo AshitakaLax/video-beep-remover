@@ -1,8 +1,9 @@
 """Helpers for building test media and measuring what the renderer did."""
 
+import contextlib
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,3 +153,35 @@ def srt(*cues: tuple[float, float, str]) -> str:
         return f"{ms // 3_600_000:02d}:{ms // 60_000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
 
     return "".join(f"{i}\n{stamp(s)} --> {stamp(e)}\n{text}\n\n" for i, (s, e, text) in enumerate(cues, 1))
+
+
+class StrictUI:
+    """A UI that fails the test when progress displays nest: Rich 13 raises LiveError for that."""
+
+    def __init__(self) -> None:
+        self.active: str | None = None
+
+    def info(self, message: str) -> None:
+        pass
+
+    def warn(self, message: str) -> None:
+        pass
+
+    @contextlib.contextmanager
+    def _live(self, label: str) -> Iterator[None]:
+        assert self.active is None, f"{label!r} started inside {self.active!r}"
+        self.active = label
+        try:
+            yield
+        finally:
+            self.active = None
+
+    @contextlib.contextmanager
+    def progress(self, label: str, total: float) -> Iterator[Callable[[float], None]]:
+        with self._live(label):
+            yield lambda done: None
+
+    @contextlib.contextmanager
+    def status(self, label: str) -> Iterator[None]:
+        with self._live(label):
+            yield

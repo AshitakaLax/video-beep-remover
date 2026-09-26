@@ -59,7 +59,7 @@ $ vbr clean "The Movie (2019).mkv"
 | `vbr subs INPUT` | Show subtitle candidates, their scores and the sync check. `--save PATH` writes the chosen subtitles, converted to the format PATH names. Exits with 1 if no candidate is usable. |
 | `vbr config init \| show \| check` | Write a starter config, print the effective merged config (secrets redacted), or validate it. |
 | `vbr doctor` | Check the FFmpeg version and encoders, CUDA, the model cache and the API credentials. |
-| `vbr cache info \| clear` | Inspect or clear cached subtitles, transcripts and decoded audio. |
+| `vbr cache info \| clear` | Inspect or clear the cache. It holds downloaded subtitles; transcripts and decoded audio join it in M4. |
 
 ### 3.3 Main options for `clean` and `scan`
 
@@ -232,7 +232,13 @@ src/video_beep_remover/
 │   ├── parse.py           # encoding detection, pysubs2 parsing, cue cleaning
 │   ├── sync.py            # anchors, tracked search, Theil–Sen fit, fidelity
 │   ├── save.py            # `vbr subs --save`
-│   └── later: opensubtitles.py + oshash.py (M3), censor.py (M4)
+│   ├── opensubtitles.py   # REST client: search, login, download, quota, retries
+│   ├── online.py          # OpenSubtitles as a source: cache first, hash search, then title search
+│   ├── oshash.py          # movie hash and fingerprint
+│   ├── names.py           # guessit: title, year, episode and release from file names; .nfo IMDb ids
+│   ├── cache.py           # downloaded subtitles, indexed by video fingerprint
+│   ├── ffsubsync.py       # optional re-sync with ffsubsync
+│   └── later: censor.py (M4)
 ├── asr/
 │   ├── base.py            # Transcriber protocol, Clip
 │   ├── faster_whisper.py  # default backend (sequential, or batched with packed windows)
@@ -333,7 +339,7 @@ Windows, words, intervals and synced cue times are all seconds on the **media ti
 
 ### 6.3 Finding subtitles
 
-Sources are tried in the configured order. Acquisition stops at the first candidate that passes the sync check (§6.6). Within a source, candidates are ranked. With `offline = true`, every provider that declares `network = True` is skipped, whatever its own `enabled` setting. That covers OpenSubtitles and every provider behind the subliminal adapter.
+Sources are tried in the configured order. Acquisition stops at the first candidate that passes the sync check (§6.6). A source is searched only when the ones before it produced nothing usable, so the network is used only when local subtitles fail. Within a source, candidates are ranked. With `offline = true`, every provider that declares `network = True` makes no request, whatever its own `enabled` setting. That covers OpenSubtitles and every provider behind the subliminal adapter. Subtitles OpenSubtitles downloaded earlier are still offered from the cache, since using them needs no network.
 
 | Source | How | Trust |
 |---|---|---|
@@ -347,17 +353,17 @@ Sources are tried in the configured order. Acquisition stops at the first candid
 
 - the wrong language
 - forced or foreign-parts-only tracks
-- machine-translated files (by default)
+- machine- and AI-translated files (by default)
 
 These add to a candidate's score:
 
 - SDH or hearing-impaired (configurable), because these tracks tend to be closer to verbatim
 - a hash match
-- a similar release name, compared on guessit fields (release group, source, resolution)
+- a similar release name, compared on guessit fields. Edition and release group weigh most, since a different cut or group usually means different timing; source and streaming service less; resolution and codec a little.
 - a subtitle `fps` equal to the video's frame rate
 - download count, used as a tie-breaker
 
-Candidates with an unknown language are kept, after the ones known to match. At most `max_candidates` candidates are sync-checked, in source order and then rank order.
+Candidates with an unknown language are kept, after the ones known to match. At most `max_candidates` candidates are tried from each source; each OpenSubtitles one costs a download unless it is cached.
 
 Image-based streams (PGS, VobSub, DVB) are ignored for analysis; OCR is out of scope.
 
@@ -382,11 +388,11 @@ This provider uses the REST API v1 at `https://api.opensubtitles.com/api/v1/`. E
        return f"{h:016x}"
    ```
 2. **Hash search.** `GET /subtitles?moviehash=<hash>&languages=en`. From each result it reads `attributes.moviehash_match`, `hearing_impaired`, `foreign_parts_only`, `machine_translated`, `fps`, `release`, `download_count` and `files[].file_id`. Hash-matched subtitles were timed against this exact file, so they are trusted.
-3. **Metadata search** runs when no result is hash-matched. `guessit(<filename>)` supplies the title, year, season and episode, and the search is `GET /subtitles?query=<title>&year=<year>&languages=en`. For episodes it adds `season_number` and `episode_number`. When an `imdb_id` is known, for example from an `.nfo` file, it uses `imdb_id` instead.
-4. **Download.** `POST /download {"file_id": N}` returns `{link, remaining, reset_time_utc}`. The tool fetches `link`, caps the file at 5 MB and detects the encoding with charset-normalizer. The file is cached under its `file_id` and indexed by the movie hash, so a cached copy never costs quota again.
+3. **Metadata search** runs only when no result is hash-matched. `guessit(<filename>)` supplies the title, year, season and episode, and the search is `GET /subtitles?query=<title>&year=<year>&languages=en`. For episodes it adds `season_number` and `episode_number`. For a movie with an IMDb id in a Kodi-style `.nfo` file next to it, it searches by `imdb_id` instead. Parameters are sent sorted and in lower case, as the API asks, which avoids redirects. Results split over several CDs are skipped.
+4. **Download.** `POST /download {"file_id": N}` returns `{link, remaining, reset_time_utc}`. The tool fetches `link`, caps the file at 5 MB and decodes it as in §6.5. The API key is sent only to the API, never to the host serving the file. The file is cached under its `file_id`, and an index records it under the video's fingerprint (hash and size). So a cached copy never costs quota again, and a later run offers it first, even offline or without a key.
 5. **Quota and rate limits.** Downloads are limited per 24 h: 5 per IP address without logging in, more for logged-in and VIP users. The tool downloads only the top candidate and tries the next one only if the sync check fails, up to `max_candidates`. When the quota runs out (`remaining` reaches 0 or a download is refused), the tool warns, records the reset time in the report and moves on to the fallback. HTTP 429 is retried with capped exponential backoff, honouring `Retry-After`.
 
-**API key.** No API key ships with the tool. Each user creates a free OpenSubtitles.com account, registers their own API consumer to get a key, and supplies it through `${OPENSUBTITLES_API_KEY}`. Without a key, the provider is skipped with a notice and the other subtitle sources are still tried. If none of them yields a usable candidate, the fallback rules in §7 apply: the run transcribes the whole soundtrack, or fails when `fallback_to_full = false`. `vbr doctor` reports whether a key is set and accepted. The legacy OpenSubtitles.org XML-RPC API is not used.
+**API key.** No API key ships with the tool. Each user creates a free OpenSubtitles.com account, registers their own API consumer to get a key, and supplies it through `${OPENSUBTITLES_API_KEY}`. Without a key, no online search is made, with a notice. Subtitles downloaded earlier are still used from the cache, and the other subtitle sources are still tried. If none of them yields a usable candidate, the fallback rules in §7 apply: the run transcribes the whole soundtrack, or fails when `fallback_to_full = false`. `vbr doctor` reports whether a key is set and accepted. It checks with a search, which costs no quota, because the `/infos` endpoints answer any key. With a bad key, a search returns 403 "You cannot consume this service" and a download returns 503. The legacy OpenSubtitles.org XML-RPC API is not used.
 
 ### 6.5 Parsing and cleaning cues
 
@@ -413,7 +419,7 @@ This check maps subtitle time to media time, `t_media = scale · t_sub + offset`
 5. **Fit.** With three or more pairs spanning at least 60 s, compute a Theil–Sen slope. If it is within 0.1 % of a standard ratio, snap it to that ratio: 1, 25/23.976, 25/24, 24/23.976, 30/29.97, or the inverse of any of them. The offset is the median residual. With fewer or closer pairs, fit an offset only. The error is the median absolute residual.
 6. **Fidelity.** Take the median `token_sort_ratio` between each anchor's text and the words heard, divided by 100. Fidelity is therefore a 0–1 fraction, on the same scale as `min_fidelity` and the report.
 7. **Decision.** The check passes if `matched ≥ min_matched_ratio`, `error ≤ max_error_s` and `fidelity ≥ min_fidelity`. `anchors = 0` skips the check and trusts the timing as it is. If it fails:
-   - Run [ffsubsync](https://github.com/smacke/ffsubsync), if installed. It uses speech-activity correlation, corrects frame-rate mismatches and handles offsets up to 60 s by default. Then check again.
+   - If the failure is about timing (anchors not heard where expected, or too large an error) and [ffsubsync](https://github.com/smacke/ffsubsync) is installed, run it. It uses speech-activity correlation, corrects frame-rate mismatches and handles offsets up to 60 s by default. Then check again with the trusted ±3 s search, since its output must be in sync. Subtitles that fail on fidelity are paraphrased, and ffsubsync cannot fix that. During implementation, subtitles 30 s late were re-timed in 0.6 s on a 44 s clip and then passed with a 0.08 s error.
    - Otherwise try the next candidate.
    - Otherwise use the fallback (§7).
 
@@ -648,7 +654,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 ### 8.3 Caching
 
 ```
-<cache>/subtitles/<provider>/<file_id>.<ext>       + index.json: oshash → file ids
+<cache>/subtitles/<provider>/<file_id>.<ext>       + index.json: fingerprint → downloaded files
 <cache>/asr/<fingerprint>/<stream>/<model>-<params-hash>.jsonl   # transcribed spans, with words
 <cache>/audio/<fingerprint>-<stream>.f32           # 16 kHz mono (~230 MB/h), LRU-evicted
 ```

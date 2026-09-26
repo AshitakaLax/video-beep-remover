@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from helpers import FakeTranscriber, decode, make_clip, tone_gain, words
+from helpers import FakeTranscriber, StrictUI, decode, make_clip, tone_gain, words
 from video_beep_remover.config import load_config
 from video_beep_remover.errors import UsageError, VbrError
 from video_beep_remover.media.ffmpeg import FFmpeg
@@ -23,7 +23,7 @@ def pipeline(tmp_path: Path, spoken: list[Any] = SPOKEN, config: str = "", **ove
     path.write_text(config, "utf-8")
     loaded = load_config(path, env={}, overrides={"transcription.device": "cpu", **overrides})
     fake = FakeTranscriber(spoken)
-    return Pipeline(loaded, transcriber_factory=lambda choice: fake)
+    return Pipeline(loaded, ui=StrictUI(), transcriber_factory=lambda choice: fake)
 
 
 def test_clean_mutes_detections_and_writes_report_and_edl(tmp_path: Path) -> None:
@@ -39,7 +39,9 @@ def test_clean_mutes_detections_and_writes_report_and_edl(tmp_path: Path) -> Non
     assert report["strategy"] == {
         "requested": "hybrid",
         "used": "full",
-        "fallback_reason": "no subtitles found (OpenSubtitles: online search is not implemented yet (milestone M3))",
+        "fallback_reason": (
+            "no subtitles found (OpenSubtitles: skipped, no API key (set OPENSUBTITLES_API_KEY to your own free key))"
+        ),
     }
     assert report["subtitle_candidates"] == []
     [detection] = report["detections"]

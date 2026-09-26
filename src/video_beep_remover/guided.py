@@ -36,9 +36,15 @@ from video_beep_remover.media.audio import Audio, AudioSource
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import MediaInfo
 from video_beep_remover.models import Cue, Detection, Window, Word
-from video_beep_remover.subtitles.acquire import SubtitleCandidate, SubtitleLoader, find_candidates
+from video_beep_remover.subtitles import ffsubsync
+from video_beep_remover.subtitles.acquire import (
+    OnlineSource,
+    SubtitleCandidate,
+    SubtitleLoader,
+    SubtitleSearch,
+)
 from video_beep_remover.subtitles.parse import parse_subtitles
-from video_beep_remover.subtitles.sync import SyncResult, check_sync
+from video_beep_remover.subtitles.sync import STANDARD_RATIOS, SyncResult, check_sync, snap
 from video_beep_remover.ui import UI
 
 MIN_FLAGS_TO_ESCALATE = 3  # below this many strong flags, a poor confirmation rate proves nothing
@@ -66,6 +72,7 @@ class Context:
     ff: FFmpeg
     transcriber: Callable[[str], tuple[ModelChoice, Transcriber]]  # by role: "targeted", "anchor", ...
     detect_speech: SpeechDetector
+    online: Callable[[MediaInfo], OnlineSource | None] = lambda info: None  # OpenSubtitles, if usable
 
 
 @dataclass(frozen=True)
@@ -104,7 +111,7 @@ def _sync_report(sync: SyncResult) -> dict[str, Any]:
 
 
 def _candidate_report(candidate: SubtitleCandidate) -> dict[str, Any]:
-    return {
+    report: dict[str, Any] = {
         "source": candidate.source,
         "label": candidate.label,
         "path": str(candidate.path) if candidate.path else None,
@@ -113,6 +120,31 @@ def _candidate_report(candidate: SubtitleCandidate) -> dict[str, Any]:
         "hearing_impaired": candidate.hearing_impaired,
         "trusted": candidate.trusted,
     }
+    if candidate.source == "opensubtitles":
+        report |= {
+            "file_id": candidate.file_id,
+            "release": candidate.release,
+            "fps": candidate.fps,
+            "cached": candidate.cached,
+        }
+    return report
+
+
+def frame_rate_ratio(candidate: SubtitleCandidate, text: str, video_fps: float | None) -> float:
+    """The scale to apply up front when the subtitles were timed for another frame rate, e.g. a
+    25 fps PAL release of a 23.976 fps film (DESIGN.md §6.6 step 2). Frame-based files (MicroDVD)
+    are already read at the video's frame rate, so they need none."""
+    if not candidate.fps or not video_fps:
+        return 1.0
+    try:
+        from pysubs2.formats import autodetect_format
+
+        if autodetect_format(text) == "microdvd":
+            return 1.0
+    except Exception:  # an undetectable format fails to parse later anyway
+        return 1.0
+    ratio = snap(candidate.fps / video_fps)
+    return ratio if ratio != 1.0 and ratio in STANDARD_RATIOS else 1.0
 
 
 def describe_sync(sync: SyncResult) -> str:
@@ -139,51 +171,102 @@ def anchor_transcriber(ctx: Context, audio: AudioSource) -> Callable[[float, flo
 
 
 def select_subtitles(
-    ctx: Context, info: MediaInfo, audio: AudioSource, workdir: Path, explicit: Path | None = None
+    ctx: Context,
+    info: MediaInfo,
+    audio: AudioSource,
+    stream_index: int,
+    workdir: Path,
+    search: SubtitleSearch,
 ) -> SubtitleSelection:
-    """Try candidates in order until one passes the sync check (DESIGN.md §6.3, §6.6)."""
+    """Try candidates, source by source, until one passes the sync check (DESIGN.md §6.3, §6.6).
+    A source is searched only when the ones before it had nothing usable, so the network is used
+    only when local subtitles fail."""
     config = ctx.config
-    search = find_candidates(info, config.subtitles, offline=config.offline, explicit=explicit)
-    selection = SubtitleSelection(None, [], search.notes)
-    embedded = [c for c in search.candidates if c.source == "embedded"]
-    loader = SubtitleLoader(ctx.ff, info.path, workdir, embedded)
+    selection = SubtitleSelection(None, [], ())
+    loader = SubtitleLoader(ctx.ff, info.path, workdir, online=search.online)
     transcribe: Callable[[float, float], Sequence[Word]] | None = None
-    for candidate in search.candidates:
-        entry = _candidate_report(candidate)
-        selection.tried.append(entry)
-        try:
-            if candidate.source == "embedded" and loader.pending:
-                with ctx.ui.progress("Reading subtitles", info.duration) as update:
-                    loader.on_progress = update
-                    text = loader.text(candidate)
-            else:
-                text = loader.text(candidate)
-            cues = parse_subtitles(text, fps=info.frame_rate)
-        except SubtitleError as exc:
-            entry["result"] = f"unusable: {exc}"
-            ctx.ui.info(f"subtitles {candidate.label}: {entry['result']}")
-            continue
-        entry["cues"] = len(cues)
-        if not cues:
-            entry["result"] = "no dialogue cues"
-            ctx.ui.info(f"subtitles {candidate.label}: {entry['result']}")
-            continue
-        if transcribe is None:
-            transcribe = anchor_transcriber(ctx, audio)
-        with ctx.ui.status(f"Checking the sync of {candidate.label}"):
-            sync = check_sync(
-                cues,
-                duration=info.duration,
-                transcribe=transcribe,
-                config=config.analysis.sync,
-                trusted=candidate.trusted,
-            )
-        entry["sync"] = _sync_report(sync)
-        entry["result"] = "used" if sync.passed else sync.reason
-        if sync.passed:
-            selection.chosen = SubtitleChoice(candidate, text, cues, sync)
-            return selection
-        ctx.ui.info(f"subtitles {candidate.label}: not usable: {sync.reason} ({describe_sync(sync)})")
+    notes: list[str] = []
+
+    def check(cues: list[Cue], *, trusted: bool, scale: float = 1.0) -> SyncResult:
+        assert transcribe is not None
+        return check_sync(
+            cues,
+            duration=info.duration,
+            transcribe=transcribe,
+            config=config.analysis.sync,
+            trusted=trusted,
+            default_scale=scale,
+        )
+
+    for source in search.sources:
+        with ctx.ui.status(f"Looking for subtitles: {source}"):
+            found = search.search(source)
+        notes += found.notes
+        if source == "embedded":
+            loader.embedded = [c for c in found.candidates if c.stream is not None]
+        for candidate in found.candidates:
+            entry = _candidate_report(candidate)
+            selection.tried.append(entry)
+            try:
+                if candidate.source == "embedded" and loader.pending:
+                    with ctx.ui.progress("Reading subtitles", info.duration) as update:
+                        loader.on_progress = update
+                        text = loader.text(candidate)
+                else:
+                    with ctx.ui.status(f"Loading {candidate.label}"):
+                        text = loader.text(candidate)
+                cues = parse_subtitles(text, fps=info.frame_rate)
+            except SubtitleError as exc:
+                entry["result"] = f"unusable: {exc}"
+                ctx.ui.info(f"subtitles {candidate.label}: {entry['result']}")
+                continue
+            entry["cues"] = len(cues)
+            if not cues:
+                entry["result"] = "no dialogue cues"
+                ctx.ui.info(f"subtitles {candidate.label}: {entry['result']}")
+                continue
+            scale = frame_rate_ratio(candidate, text, info.frame_rate)
+            if scale != 1.0:
+                entry["frame_rate_ratio"] = scale
+            if transcribe is None:
+                # Loading the model shows its own status line, so not inside the one below.
+                transcribe = anchor_transcriber(ctx, audio)
+            with ctx.ui.status(f"Checking the sync of {candidate.label}"):
+                sync = check(cues, trusted=candidate.trusted, scale=scale)
+            if (
+                not sync.passed
+                and sync.problem in ("unmatched", "error")
+                and config.analysis.sync.ffsubsync == "fallback"
+                and ffsubsync.ffsubsync_command() is not None
+            ):
+                entry["first_sync"] = _sync_report(sync) | {"reason": sync.reason}
+                try:
+                    with ctx.ui.status(f"Re-syncing {candidate.label} with ffsubsync"):
+                        resynced = ffsubsync.resync(
+                            info.path,
+                            stream_index,
+                            text,
+                            workdir,
+                            ffmpeg=ctx.ff.ffmpeg,
+                            fps=info.frame_rate,
+                            language=candidate.language,
+                        )
+                        resynced_cues = parse_subtitles(resynced)
+                        # ffsubsync's output must be in sync: search only the trusted few seconds.
+                        second = check(resynced_cues, trusted=True)
+                    entry["ffsubsync"] = "in sync" if second.passed else f"still out of sync: {second.reason}"
+                    if second.passed:
+                        text, cues, sync = resynced, resynced_cues, second
+                except SubtitleError as exc:
+                    entry["ffsubsync"] = f"failed: {exc}"
+            entry["sync"] = _sync_report(sync)
+            entry["result"] = "used" if sync.passed else sync.reason
+            if sync.passed:
+                selection.chosen = SubtitleChoice(candidate, text, cues, sync)
+                selection.notes = tuple(notes)
+                return selection
+            ctx.ui.info(f"subtitles {candidate.label}: not usable: {sync.reason} ({describe_sync(sync)})")
+    selection.notes = tuple(notes)
     return selection
 
 
@@ -238,6 +321,7 @@ def analyse(
     strategy: str,
     info: MediaInfo,
     audio: AudioSource,
+    stream_index: int,
     workdir: Path,
     *,
     explicit: Path | None = None,
@@ -248,12 +332,15 @@ def analyse(
     config = ctx.config
     settings = config.analysis.targeted
     duration = info.duration
-    selection = select_subtitles(ctx, info, audio, workdir, explicit)
+    search = SubtitleSearch(info, config.subtitles, explicit=explicit, online=ctx.online(info))
+    selection = select_subtitles(ctx, info, audio, stream_index, workdir, search)
     lap("subtitles")
     report: dict[str, Any] = {
         "subtitle_candidates": selection.tried,
         "subtitle_search": list(selection.notes),
     }
+    if search.online is not None and "opensubtitles" in search.searched:
+        report["opensubtitles"] = search.online.report
     if selection.chosen is None:
         raise Fallback(no_subtitles_reason(selection), report)
     choice = selection.chosen

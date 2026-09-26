@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from helpers import FakeTranscriber, decode, make_clip, say, srt, tone_gain
+from helpers import FakeTranscriber, StrictUI, decode, make_clip, say, srt, tone_gain
 from video_beep_remover.config import load_config
 from video_beep_remover.errors import VbrError
 from video_beep_remover.media.audio import SAMPLE_RATE
@@ -64,6 +64,7 @@ class Run:
 
         self.pipeline = Pipeline(
             loaded,
+            ui=StrictUI(),
             transcriber_factory=lambda choice: self.anchor if choice.name == "base.en" else self.main,
             speech_detector=detect,
         )

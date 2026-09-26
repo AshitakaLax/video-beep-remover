@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import combinations
+from typing import Literal
 
 from rapidfuzz import fuzz
 
@@ -50,6 +51,7 @@ class SyncResult:
     passed: bool
     reason: str | None = None  # why the check failed
     checked: bool = True  # False when `anchors = 0` turns the check off
+    problem: Literal["no-anchors", "unmatched", "error", "fidelity"] | None = None  # the kind of failure
 
     @property
     def matched(self) -> int:
@@ -161,7 +163,12 @@ def check_sync(
     anchors = choose_anchors(cues, config.anchors)
     if not anchors:
         return SyncResult(
-            SyncModel(scale=default_scale), (), None, False, "no cue is usable as a sync anchor"
+            SyncModel(scale=default_scale),
+            (),
+            None,
+            False,
+            "no cue is usable as a sync anchor",
+            problem="no-anchors",
         )
 
     radius = config.trusted_search_s if trusted else config.untrusted_search_s
@@ -188,13 +195,17 @@ def check_sync(
     fidelity = statistics.median(heard) if heard else None
     matched = len(pairs)
     reason = None
+    problem: Literal["unmatched", "error", "fidelity"] | None = None
     if matched / len(anchors) < config.min_matched_ratio:
+        problem = "unmatched"
         reason = f"only {matched} of {len(anchors)} anchor cues were heard where the subtitles place them"
     elif model.error > config.max_error_s:
+        problem = "error"
         reason = f"timing error {model.error:.2f} s is above max_error_s ({config.max_error_s} s)"
     elif fidelity is None or fidelity < config.min_fidelity:
+        problem = "fidelity"
         shown = "unknown" if fidelity is None else f"{fidelity:.2f}"
         reason = (
             f"fidelity {shown} is below min_fidelity ({config.min_fidelity}): the subtitles are not verbatim"
         )
-    return SyncResult(model, tuple(results), fidelity, passed=reason is None, reason=reason)
+    return SyncResult(model, tuple(results), fidelity, passed=reason is None, reason=reason, problem=problem)

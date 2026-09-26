@@ -17,12 +17,14 @@ from rich.table import Table
 from video_beep_remover import __version__
 from video_beep_remover.config.loader import (
     LoadedConfig,
+    cache_root,
     defaults_text,
     load_config,
     redact,
     to_toml,
     user_config_path,
 )
+from video_beep_remover.config.schema import Config
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.errors import (
     EXIT_DEPENDENCY,
@@ -47,6 +49,8 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Create, show and check configuration files.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
+cache_app = typer.Typer(help="Inspect or clear the cache of downloaded subtitles.", no_args_is_help=True)
+app.add_typer(cache_app, name="cache")
 
 console = Console(stderr=True, highlight=False)
 
@@ -351,7 +355,7 @@ def subs_command(
     from video_beep_remover import guided
     from video_beep_remover.media.audio import SeekingAudioSource
     from video_beep_remover.media.probe import probe, select_audio_stream
-    from video_beep_remover.subtitles.acquire import SubtitleLoader, find_candidates
+    from video_beep_remover.subtitles.acquire import SubtitleCandidate, SubtitleLoader, SubtitleSearch
     from video_beep_remover.subtitles.save import save_subtitles
 
     _setup_logging(verbose)
@@ -365,37 +369,54 @@ def subs_command(
             raise UsageError(f"subtitle file not found: {subtitles}")
         pipeline = Pipeline(loaded, ui=ConsoleUI(quiet=True))
         info = probe(pipeline.ff, video)
-        search = find_candidates(info, cfg.subtitles, offline=cfg.offline, explicit=subtitles)
+        online = pipeline.online_source(info) if subtitles is None else None
+        search = SubtitleSearch(info, cfg.subtitles, explicit=subtitles, online=online)
+        if online is not None:
+            asked = "; then ".join(
+                ", ".join(f"{key}={value}" for key, value in params.items())
+                for params in online.planned_searches()
+            )
+            verb = "sends" if online.client is not None else "would send"
+            console.print(
+                f"[dim]OpenSubtitles {verb}: {escape(asked or 'nothing')} "
+                f"(languages: {escape(', '.join(cfg.subtitles.languages))})[/]"
+            )
+        candidates: list[SubtitleCandidate] = []
+        with console.status("Looking for subtitles"):
+            for source in search.sources:
+                found = search.search(source)
+                candidates += found.candidates
+                for note in found.notes:
+                    console.print(f"[dim]{escape(note)}[/]")
+        if not candidates:
+            console.print("no subtitle candidates found")
+            raise typer.Exit(EXIT_PROCESSING)
         table = Table(show_header=True, header_style="bold")
-        for column in ("#", "source", "subtitles", "language", "SDH", "score"):
+        for column in ("#", "source", "subtitles", "language", "SDH", "timed for this file", "score"):
             table.add_column(column)
-        for number, candidate in enumerate(search.candidates, 1):
+        for number, candidate in enumerate(candidates, 1):
             table.add_row(
                 str(number),
-                candidate.source,
+                candidate.source + (" (cached)" if candidate.cached else ""),
                 escape(candidate.label),
                 candidate.language or "?",
                 "yes" if candidate.hearing_impaired else "",
+                "yes" if candidate.trusted else "no",
                 f"{candidate.score:.0f}" if candidate.source != "explicit" else "",
             )
-        for note in search.notes:
-            console.print(f"[dim]{escape(note)}[/]")
-        if not search.candidates:
-            console.print("no subtitle candidates found")
-            raise typer.Exit(EXIT_PROCESSING)
         console.print(table)
 
         with tempfile.TemporaryDirectory(prefix="vbr-") as tmp:
             workdir = Path(tmp)
             if no_sync:
-                top = search.candidates[0]
-                text = SubtitleLoader(pipeline.ff, video, workdir, [top]).text(top)
+                top = candidates[0]
+                text = SubtitleLoader(pipeline.ff, video, workdir, [top], online=online).text(top)
             else:
                 stream = select_audio_stream(info, cfg.analysis.language, cfg.analysis.audio_stream)
                 audio = SeekingAudioSource(pipeline.ff, video, stream.index)
                 with console.status("Checking the sync (transcribes a few seconds around six cues)"):
                     selection = guided.select_subtitles(
-                        pipeline.guided_context(), info, audio, workdir, subtitles
+                        pipeline.guided_context(), info, audio, stream.index, workdir, search
                     )
                 for entry in selection.tried:
                     used = entry.get("result") == "used"
@@ -405,8 +426,10 @@ def subs_command(
                         fidelity = "unknown" if sync["fidelity"] is None else f"{sync['fidelity']:.2f}"
                         detail = (
                             f" [{sync['matched']}/{sync['anchors']} anchors, offset {sync['offset']:+.2f} s, "
-                            f"error {sync['error']:.2f} s, fidelity {fidelity}]"
+                            f"scale {sync['scale']:.4f}, error {sync['error']:.2f} s, fidelity {fidelity}]"
                         )
+                    if entry.get("ffsubsync"):
+                        detail += f" [ffsubsync: {entry['ffsubsync']}]"
                     mark = "[green]✔[/]" if used else "[red]✘[/]"
                     console.print(
                         f"{mark} {escape(entry['label'])}: {escape(str(entry['result']))}{escape(detail)}"
@@ -474,6 +497,26 @@ def config_check(config: ConfigOpt = None) -> None:
     console.print("[green]✔[/] configuration is valid")
 
 
+@cache_app.command("info")
+def cache_info(config: ConfigOpt = None) -> None:
+    """Show where the cache is and what it holds."""
+    from video_beep_remover.subtitles.cache import SubtitleCache
+
+    root = cache_root(_load_or_exit(config).config)
+    count, size = SubtitleCache(root).usage()
+    console.print(f"cache: {escape(str(root))}")
+    console.print(f"downloaded subtitles: {count} files, {size / 1024:.0f} KiB")
+
+
+@cache_app.command("clear")
+def cache_clear(config: ConfigOpt = None) -> None:
+    """Delete the downloaded subtitles. Downloading them again counts against your quota."""
+    from video_beep_remover.subtitles.cache import SubtitleCache
+
+    removed = SubtitleCache(cache_root(_load_or_exit(config).config)).clear()
+    console.print(f"removed {removed} files")
+
+
 @app.command()
 def doctor(config: ConfigOpt = None) -> None:
     """Check FFmpeg, the mute filter, Whisper and credentials."""
@@ -536,10 +579,62 @@ def doctor(config: ConfigOpt = None) -> None:
     except ImportError:
         row("faster-whisper", False, "not installed: pip install faster-whisper")
 
-    key = cfg.subtitles.opensubtitles.api_key
-    row("OpenSubtitles key", None, "set" if key else "not set; online subtitle search will be skipped")
+    row(*_opensubtitles_status(cfg))
+    from video_beep_remover.subtitles.ffsubsync import ffsubsync_command
+
+    command = ffsubsync_command()
+    row(
+        "ffsubsync",
+        None,
+        f"installed ({command[0]})"
+        if command
+        else "not installed; optional: pip install 'video-beep-remover[sync]'",
+    )
     console.print(table)
     raise typer.Exit(EXIT_DEPENDENCY if failed else EXIT_OK)
+
+
+def _opensubtitles_status(cfg: Config) -> tuple[str, bool | None, str]:
+    """doctor's OpenSubtitles row: is the key set and accepted, and do the credentials log in?"""
+    from video_beep_remover.subtitles.opensubtitles import (
+        KeyRejected,
+        OpenSubtitlesClient,
+        OpenSubtitlesError,
+    )
+
+    settings = cfg.subtitles.opensubtitles
+    name = "OpenSubtitles"
+    if not settings.enabled or "opensubtitles" not in cfg.subtitles.sources:
+        return name, None, "disabled in the config"
+    if not settings.api_key:
+        return name, None, "no API key: online subtitle search is skipped (set OPENSUBTITLES_API_KEY)"
+    if cfg.offline:
+        return name, None, "API key set; not checked (offline)"
+    client = OpenSubtitlesClient(
+        settings.api_key,
+        user_agent=settings.user_agent,
+        username=settings.username,
+        password=settings.password,
+    )
+    try:
+        client.check_key()
+        details = "API key accepted"
+        if settings.username and settings.password:
+            try:
+                client.login()
+                allowed = (client.user or {}).get("allowed_downloads")
+                details += f"; logged in as {settings.username}" + (
+                    f" ({allowed} downloads a day)" if allowed else ""
+                )
+            except OpenSubtitlesError as exc:
+                return name, False, f"API key accepted, but {exc}"
+        return name, True, details
+    except KeyRejected as exc:
+        return name, False, str(exc)
+    except OpenSubtitlesError as exc:
+        return name, None, f"could not check the API key: {exc}"
+    finally:
+        client.close()
 
 
 def version_callback(value: bool) -> None:

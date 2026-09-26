@@ -20,6 +20,8 @@ classifiers = [
 dependencies = [
   "charset-normalizer>=3",
   "faster-whisper>=1.1",
+  "guessit>=3.4",
+  "httpx>=0.25",
   "numpy>=1.24",
   "platformdirs>=4",
   "pydantic>=2.6",
@@ -30,10 +32,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sync = ["ffsubsync>=0.4.25"]  # re-times subtitles that fail the sync check
 dev = [
   "hypothesis>=6",
   "mypy>=1.10",
   "pytest>=8",
+  "respx>=0.20",
   "ruff>=0.6",
 ]
 

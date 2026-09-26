@@ -101,7 +101,7 @@ untrusted_search_s = 20.0           # everything else
 min_matched_ratio = 0.5
 max_error_s = 0.5
 min_fidelity = 0.6                  # 0-1; below this, subtitles are too paraphrased to guide the search
-ffsubsync = "fallback"              # "never" | "fallback" (needs the [sync] extra; not implemented yet)
+ffsubsync = "fallback"              # "never" | "fallback": re-time subtitles that fail (needs the [sync] extra)
 
 [transcription]
 backend = "faster-whisper"          # "faster-whisper" | "whisperx"
@@ -119,18 +119,18 @@ initial_prompt = "auto"             # "auto" | "" (off) | your own text
 # ---------------------------------------------------------------------------
 [subtitles]
 languages = ["en"]
-sources = ["embedded", "sidecar", "opensubtitles"]   # tried in this order; opensubtitles comes in M3
+sources = ["embedded", "sidecar", "opensubtitles"]   # in this order; the network only if local ones fail
 prefer_hearing_impaired = true      # SDH/CC tracks are usually closer to verbatim
-max_candidates = 3                  # candidates sync-checked before falling back to "full"
+max_candidates = 3                  # tried per source; an OpenSubtitles one costs a download unless cached
 
 [subtitles.opensubtitles]
 enabled = true
 # No key ships with vbr: create a free opensubtitles.com account and register your own API consumer.
-api_key = "${OPENSUBTITLES_API_KEY}"   # empty -> provider skipped with a notice
+api_key = "${OPENSUBTITLES_API_KEY}"   # empty -> no online search; subtitles downloaded before still work
 username = "${OPENSUBTITLES_USERNAME}" # optional; logged-in users get a larger download quota
 password = "${OPENSUBTITLES_PASSWORD}"
 user_agent = "video-beep-remover v0.1"
-exclude_machine_translated = true
+exclude_machine_translated = true    # skip machine- and AI-translated subtitles
 
 # ---------------------------------------------------------------------------
 # What gets written

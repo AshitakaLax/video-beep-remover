@@ -4,7 +4,7 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Protocol
 
 from video_beep_remover.config.schema import SubtitlesConfig
 from video_beep_remover.errors import MediaError, SubtitleError
@@ -13,7 +13,7 @@ from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
 from video_beep_remover.media.probe import VIDEO_SUFFIXES, MediaInfo
 from video_beep_remover.subtitles.parse import read_subtitle_file
 
-CandidateSource = Literal["explicit", "embedded", "sidecar"]
+CandidateSource = Literal["explicit", "embedded", "sidecar", "opensubtitles"]
 
 # Text subtitle codecs FFmpeg can convert to SRT or ASS. Image-based ones (PGS, VobSub, DVB) would need OCR.
 TEXT_CODECS = frozenset({"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"})
@@ -40,12 +40,29 @@ class SubtitleCandidate:
     codec: str | None = None
     bonus: float = 0.0  # source-specific preference, e.g. the default flag on an embedded stream
     score: float = 0.0
+    file_id: int | None = None  # OpenSubtitles file
+    release: str | None = None  # the release the subtitles were made for, e.g. "Movie.2019.1080p.BluRay-GRP"
+    fps: float | None = None  # the frame rate they were made for, when known
+    cached: bool = False  # downloaded before: trying it costs no download quota
+
+
+class OnlineSource(Protocol):
+    """A subtitle service; see online.py."""
+
+    report: dict[str, Any]  # what was searched and downloaded, for the JSON report
+
+    def find(self) -> tuple[list[SubtitleCandidate], list[str]]:
+        """Candidates, and notes on what could not be searched."""
+        ...
+
+    def fetch(self, candidate: SubtitleCandidate) -> str: ...
 
 
 @dataclass(frozen=True)
-class SubtitleSearch:
-    candidates: tuple[SubtitleCandidate, ...]  # in the order they are tried
-    notes: tuple[str, ...]  # sources that were skipped, and why
+class SourceResult:
+    source: str
+    candidates: tuple[SubtitleCandidate, ...]  # ranked, at most `max_candidates`
+    notes: tuple[str, ...]  # what could not be searched, and why
 
 
 def embedded_candidates(info: MediaInfo) -> list[SubtitleCandidate]:
@@ -191,29 +208,58 @@ def rank(
     return sorted(scored, key=lambda c: -c.score)  # stable: ties keep discovery order
 
 
-def find_candidates(
-    info: MediaInfo, config: SubtitlesConfig, *, offline: bool, explicit: Path | None = None
-) -> SubtitleSearch:
-    """Candidates in the order to try them: an explicit file alone, else each configured source in
-    turn, ranked within the source. At most `max_candidates` are returned."""
-    if explicit is not None:
-        return SubtitleSearch((explicit_candidate(explicit),), ())
-    candidates: list[SubtitleCandidate] = []
-    notes: list[str] = []
-    for source in config.sources:
-        if source == "embedded":
-            found = embedded_candidates(info)
-        elif source == "sidecar":
-            found = sidecar_candidates(info.path)
-        else:  # opensubtitles
-            notes.append(
-                "OpenSubtitles: skipped (offline)"
-                if offline
-                else "OpenSubtitles: online search is not implemented yet (milestone M3)"
+class SubtitleSearch:
+    """The subtitle sources for one video, each searched only when it is reached: local sources come
+    first, and the network is used only if none of them is usable (DESIGN.md §8.2)."""
+
+    def __init__(
+        self,
+        info: MediaInfo,
+        config: SubtitlesConfig,
+        *,
+        explicit: Path | None = None,
+        online: OnlineSource | None = None,
+    ) -> None:
+        self.info = info
+        self.config = config
+        self.explicit = explicit
+        self.online = online
+        self._results: dict[str, SourceResult] = {}
+
+    @property
+    def searched(self) -> tuple[str, ...]:
+        """The sources searched so far."""
+        return tuple(self._results)
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        """An explicit file alone, else the configured sources in order."""
+        return ("explicit",) if self.explicit is not None else tuple(self.config.sources)
+
+    def search(self, source: str) -> SourceResult:
+        """Ranked candidates from one source; at most `max_candidates` are tried per source."""
+        if source not in self._results:
+            notes: list[str] = []
+            if source == "explicit":
+                assert self.explicit is not None
+                found = [explicit_candidate(self.explicit)]
+            elif source == "embedded":
+                found = embedded_candidates(self.info)
+            elif source == "sidecar":
+                found = sidecar_candidates(self.info.path)
+            elif self.online is None:
+                found, notes = [], [f"{source}: not available"]
+            else:
+                found, notes = self.online.find()
+            ranked = (
+                found
+                if source == "explicit"
+                else rank(found, self.config.languages, self.config.prefer_hearing_impaired)
             )
-            continue
-        candidates += rank(found, config.languages, config.prefer_hearing_impaired)
-    return SubtitleSearch(tuple(candidates[: config.max_candidates]), tuple(notes))
+            self._results[source] = SourceResult(
+                source, tuple(ranked[: self.config.max_candidates]), tuple(notes)
+            )
+        return self._results[source]
 
 
 class SubtitleLoader:
@@ -227,12 +273,14 @@ class SubtitleLoader:
         workdir: Path,
         embedded: Sequence[SubtitleCandidate] = (),
         on_progress: Callable[[float], None] | None = None,
+        online: OnlineSource | None = None,
     ) -> None:
         self.ff = ff
         self.media = media
         self.workdir = workdir
         self.embedded = [c for c in embedded if c.stream is not None]
         self.on_progress = on_progress
+        self.online = online
         self._extracted: dict[int, Path] | None = None
 
     @property
@@ -257,6 +305,10 @@ class SubtitleLoader:
         return outputs
 
     def text(self, candidate: SubtitleCandidate) -> str:
+        if candidate.source == "opensubtitles":
+            if self.online is None:
+                raise SubtitleError(f"{candidate.label}: OpenSubtitles is not available")
+            return self.online.fetch(candidate)
         if candidate.path is not None:
             return read_subtitle_file(candidate.path, candidate.language)
         if candidate.stream is None:

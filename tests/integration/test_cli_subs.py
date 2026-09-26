@@ -42,7 +42,7 @@ def test_subs_lists_candidates_without_checking(tmp_path: Path, heard: list[Word
     assert result.exit_code == 0, result.output
     assert "embedded" in result.output and "movie.en.sdh.srt" in result.output
     assert "movie.fr.srt" not in result.output
-    assert "not implemented yet" in result.output  # the OpenSubtitles note
+    assert "no API key" in result.output  # the OpenSubtitles note
 
 
 def test_subs_checks_sync_and_saves_the_chosen_file(tmp_path: Path, heard: list[Word]) -> None:

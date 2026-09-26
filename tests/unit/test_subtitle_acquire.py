@@ -7,8 +7,8 @@ from video_beep_remover.config.schema import SubtitlesConfig
 from video_beep_remover.media.probe import parse_probe
 from video_beep_remover.subtitles.acquire import (
     SubtitleCandidate,
+    SubtitleSearch,
     embedded_candidates,
-    find_candidates,
     name_flags,
     rank,
     sidecar_candidates,
@@ -124,25 +124,45 @@ def test_ranking_filters_and_orders() -> None:
     assert [c.label for c in plain_first] == ["plain", "sdh"]
 
 
-def test_sources_are_tried_in_configured_order(tmp_path: Path) -> None:
+class FakeOnline:
+    def __init__(self) -> None:
+        self.searched = 0
+        self.report: dict[str, Any] = {}
+
+    def find(self) -> tuple[list[SubtitleCandidate], list[str]]:
+        self.searched += 1
+        found = [SubtitleCandidate("opensubtitles", f"OpenSubtitles #{n}", "en", file_id=n) for n in range(5)]
+        return found, ["OpenSubtitles: a note"]
+
+    def fetch(self, candidate: SubtitleCandidate) -> str:
+        raise AssertionError("not used here")
+
+
+def test_sources_are_searched_in_order_and_only_when_reached(tmp_path: Path) -> None:
     video = tmp_path / "movie.mkv"
     touch(video, tmp_path / "movie.en.srt")
     info = media(video, {"codec_name": "subrip", "tags": {"language": "eng"}})
-    search = find_candidates(info, SubtitlesConfig(), offline=False)
-    assert [c.source for c in search.candidates] == ["embedded", "sidecar"]
-    assert "not implemented yet" in search.notes[0]
+    online = FakeOnline()
+    search = SubtitleSearch(info, SubtitlesConfig(), online=online)
+    assert search.sources == ("embedded", "sidecar", "opensubtitles")
+    assert [c.source for c in search.search("embedded").candidates] == ["embedded"]
+    assert search.searched == ("embedded",) and online.searched == 0  # the network is not touched yet
+    result = search.search("opensubtitles")
+    assert [c.file_id for c in result.candidates] == [0, 1, 2]  # max_candidates per source
+    assert result.notes == ("OpenSubtitles: a note",)
+    search.search("opensubtitles")
+    assert online.searched == 1  # searched once per video
 
-    config = SubtitlesConfig(sources=["sidecar", "embedded"], max_candidates=1)
-    assert [c.source for c in find_candidates(info, config, offline=True).candidates] == ["sidecar"]
-    assert find_candidates(info, SubtitlesConfig(), offline=True).notes == (
-        "OpenSubtitles: skipped (offline)",
-    )
+    capped = SubtitleSearch(info, SubtitlesConfig(sources=["sidecar", "embedded"], max_candidates=1))
+    assert capped.sources == ("sidecar", "embedded")
+    assert capped.search("opensubtitles").notes == ("opensubtitles: not available",)
 
 
 def test_explicit_file_skips_the_search(tmp_path: Path) -> None:
     video = tmp_path / "movie.mkv"
     touch(video, tmp_path / "movie.en.srt")
     info = media(video, {"codec_name": "subrip", "tags": {"language": "eng"}})
-    search = find_candidates(info, SubtitlesConfig(), offline=False, explicit=tmp_path / "mine.fr.srt")
-    [only] = search.candidates
+    search = SubtitleSearch(info, SubtitlesConfig(), explicit=tmp_path / "mine.fr.srt", online=FakeOnline())
+    assert search.sources == ("explicit",)
+    [only] = search.search("explicit").candidates
     assert (only.source, only.label, only.language, only.trusted) == ("explicit", "mine.fr.srt", "fr", True)

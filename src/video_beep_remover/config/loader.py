@@ -42,6 +42,15 @@ def user_config_path() -> Path:
     return platformdirs.user_config_path(APP_NAME, appauthor=False) / "config.toml"
 
 
+def user_cache_path() -> Path:
+    return platformdirs.user_cache_path(APP_NAME, appauthor=False)
+
+
+def cache_root(config: Config) -> Path:
+    """cache.dir, where "auto" means the per-user cache dir (e.g. ~/.cache/video-beep-remover)."""
+    return user_cache_path() if config.cache.dir == "auto" else Path(config.cache.dir).expanduser()
+
+
 def defaults_text() -> str:
     return resources.files("video_beep_remover.config").joinpath("defaults.toml").read_text("utf-8")
 

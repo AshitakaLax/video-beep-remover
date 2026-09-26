@@ -20,7 +20,7 @@ from video_beep_remover.asr.faster_whisper import (
     resolve_model,
 )
 from video_beep_remover.asr.vad import SpeechDetector, silero_speech
-from video_beep_remover.config.loader import LoadedConfig
+from video_beep_remover.config.loader import LoadedConfig, cache_root
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.detect.matcher import detect_in_words
@@ -45,6 +45,10 @@ from video_beep_remover.report import (
     write_json,
     write_text,
 )
+from video_beep_remover.subtitles.cache import SubtitleCache
+from video_beep_remover.subtitles.online import OnlineSubtitles
+from video_beep_remover.subtitles.opensubtitles import OpenSubtitlesClient
+from video_beep_remover.subtitles.oshash import opensubtitles_hash
 from video_beep_remover.ui import UI, NullUI, Progress
 
 __all__ = ["UI", "FileResult", "NullUI", "Pipeline", "Progress", "RunOptions", "resolve_output"]
@@ -150,6 +154,7 @@ class Pipeline:
         categories: list[str] | None = None,
         transcriber_factory: TranscriberFactory | None = None,
         speech_detector: SpeechDetector | None = None,
+        opensubtitles: OpenSubtitlesClient | None = None,
     ) -> None:
         self.config = loaded.config
         self.ui: UI = ui or NullUI()
@@ -163,6 +168,28 @@ class Pipeline:
         self._factory = transcriber_factory or self._load_faster_whisper
         self._transcribers: dict[ModelChoice, Transcriber] = {}
         self.detect_speech: SpeechDetector = speech_detector or silero_speech
+        self.subtitle_cache = SubtitleCache(cache_root(self.config))
+        self._opensubtitles = opensubtitles
+
+    def opensubtitles(self) -> OpenSubtitlesClient | None:
+        """The OpenSubtitles client, when there is a key and the network may be used. One client
+        serves a whole batch, so it logs in at most once."""
+        settings = self.config.subtitles.opensubtitles
+        if self.config.offline or not settings.enabled or not settings.api_key:
+            return None
+        if self._opensubtitles is None:
+            self._opensubtitles = OpenSubtitlesClient(
+                settings.api_key,
+                user_agent=settings.user_agent,
+                username=settings.username,
+                password=settings.password,
+            )
+        return self._opensubtitles
+
+    def online_source(self, info: MediaInfo) -> OnlineSubtitles | None:
+        if "opensubtitles" not in self.config.subtitles.sources:
+            return None
+        return OnlineSubtitles(self.config, info, client=self.opensubtitles(), cache=self.subtitle_cache)
 
     def _load_faster_whisper(self, choice: ModelChoice) -> Transcriber:
         settings = self.config.transcription
@@ -195,6 +222,7 @@ class Pipeline:
             ff=self.ff,
             transcriber=self.transcriber,
             detect_speech=self.detect_speech,
+            online=self.online_source,
         )
 
     @contextlib.contextmanager
@@ -256,6 +284,7 @@ class Pipeline:
                 requested,
                 info,
                 audio,
+                stream.index,
                 workdir,
                 explicit=subtitles,
                 track=track.audio,
@@ -329,7 +358,12 @@ class Pipeline:
                 "schema_version": SCHEMA_VERSION,
                 "tool_version": __version__,
                 "created": datetime.now(UTC).isoformat(timespec="seconds"),
-                "input": {"path": str(source), "size": info.size, "duration": round(info.duration, 3)},
+                "input": {
+                    "path": str(source),
+                    "size": info.size,
+                    "oshash": opensubtitles_hash(source),
+                    "duration": round(info.duration, 3),
+                },
                 "audio_stream": {
                     "index": stream.index,
                     "codec": stream.codec,
