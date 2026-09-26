@@ -43,7 +43,7 @@ The executable is `vbr`, also installed as `video-beep-remover`. It is built wit
 ```console
 $ pipx install video-beep-remover          # GPU users: pip install "video-beep-remover[gpu]"
 $ vbr config init                          # writes a commented config to the per-user config dir
-$ export OPENSUBTITLES_API_KEY=...         # optional: enables online subtitle search
+$ export OPENSUBTITLES_API_KEY=...         # optional: your own free key; enables online subtitle search
 $ vbr clean "The Movie (2019).mkv"
   → The Movie (2019).clean.mkv
   → The Movie (2019).clean.vbr.json
@@ -379,7 +379,7 @@ This provider uses the REST API v1 at `https://api.opensubtitles.com/api/v1/`. E
 4. **Download.** `POST /download {"file_id": N}` returns `{link, remaining, reset_time_utc}`. The tool fetches `link`, caps the file at 5 MB and detects the encoding with charset-normalizer. The file is cached under its `file_id` and indexed by the movie hash, so a cached copy never costs quota again.
 5. **Quota and rate limits.** Downloads are limited per 24 h: 5 per IP address without logging in, more for logged-in and VIP users. The tool downloads only the top candidate and tries the next one only if the sync check fails, up to `max_candidates`. When the quota runs out (`remaining` reaches 0 or a download is refused), the tool warns, records the reset time in the report and moves on to the fallback. HTTP 429 is retried with capped exponential backoff, honouring `Retry-After`.
 
-Each user registers for a free API key and supplies it through `${OPENSUBTITLES_API_KEY}` (see open question 4). The legacy OpenSubtitles.org XML-RPC API is not used.
+**API key.** No API key ships with the tool. Each user creates a free OpenSubtitles.com account, registers their own API consumer to get a key, and supplies it through `${OPENSUBTITLES_API_KEY}`. Without a key, the provider is skipped with a notice, and the run falls back to local subtitles or full transcription. `vbr doctor` reports whether a key is set and accepted. The legacy OpenSubtitles.org XML-RPC API is not used.
 
 ### 6.5 Parsing and cleaning cues
 
@@ -655,7 +655,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | Subtitles paraphrase or soften profanity | Hint words; low fidelity triggers the full fallback. `hybrid` does not re-check softened cues (see §7). |
 | Subtitle says "f\*\*\*" but the audio says "freaking" | Unconfirmed strong flag, then expand, then `estimate`. This may over-censor, and it is listed in the report. |
 | Whisper outputs "s\*\*\*" | Masked-token rule. |
-| Songs and lyrics | `hybrid` covers unsubtitled songs. Recognition of singing is weaker (open question 7). |
+| Songs and lyrics | `hybrid` covers unsubtitled songs. Recognition of singing is weaker (open question 5). |
 | Word at a window edge | Edge trimming and padding, then the confirmation path. |
 | Compound words ("bullshit") | Infix wildcards; the whole word is censored. |
 | Hundreds of detections | The coverage guard picks `full`. Render cost is flat (command files). |
@@ -756,17 +756,22 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 - **`enable=` timeline expressions.** They are the simplest option, but render time grew 75 % at 500 intervals and the expressions become huge. Replaced by `asendcmd` command files.
 - **YAML config.** Rejected because of implicit booleans in word lists and the extra dependency.
 
-## 15. Open questions
+## 15. Decisions and open questions
+
+**Decided**
+
+- **Default strategy:** `hybrid`. `targeted` remains available when speed matters more than recall (§7).
+- **OpenSubtitles API key:** each user registers their own free key. No key ships with the tool (§6.4).
+
+**Still open**
 
 1. Does the `initial_prompt = "auto"` priming reduce masked output without adding false positives? This is decided on the evaluation set, and so is the alternative of faster-whisper `hotwords`.
 2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present?
-3. Should the default strategy be `hybrid` or `targeted`? It depends on the measured VAD cost against the recall gained.
-4. OpenSubtitles consumer key: register a project key, as other open-source clients do, or require every user to register?
-5. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
-6. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
-7. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
-8. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
-9. An interactive review UI (`vbr review`, with ffplay previews)?
+3. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
+4. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
+5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
+6. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
+7. An interactive review UI (`vbr review`, with ffplay previews)?
 
 ## 16. Stretch goal: voice-matched word replacement
 

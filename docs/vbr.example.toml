@@ -125,6 +125,7 @@ max_candidates = 3
 
 [subtitles.opensubtitles]
 enabled = true
+# No key ships with vbr: create a free opensubtitles.com account and register your own API consumer.
 api_key = "${OPENSUBTITLES_API_KEY}"   # empty -> provider skipped with a notice
 username = "${OPENSUBTITLES_USERNAME}" # optional; logged-in users get a larger download quota
 password = "${OPENSUBTITLES_PASSWORD}"
