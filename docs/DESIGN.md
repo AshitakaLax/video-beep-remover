@@ -1,0 +1,805 @@
+# video-beep-remover: design
+
+**Status:** draft for review · **Last updated:** 2026-09-26 · **Example config:** [`vbr.example.toml`](vbr.example.toml)
+
+## 1. Overview
+
+`vbr` is a Python command-line tool that makes a "clean" copy of a video. Every word on a configurable list is beeped or muted in the soundtrack. The video stream and everything else in the file are copied untouched.
+
+Whisper speech recognition (via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)) finds each word and its timestamps. Running Whisper over a whole two-hour film is the slow part, so the tool first looks for subtitles: inside the file, next to it, or on OpenSubtitles.com. A subtitle cue that contains a listed word, or hints at one, shows where to listen. The tool then transcribes a few seconds of audio around each such cue to get exact word timings. For a typical film that is a few percent of the runtime instead of all of it. Without usable subtitles, it falls back to transcribing everything.
+
+```
+subtitles  →  cue 812 (01:13:02.0–01:13:05.0): "What the f*** was that?"
+audio      →  transcribe 01:13:00.5–01:13:06.5 only  →  "fucking" at 01:13:03.41–01:13:03.78
+ffmpeg     →  beep 01:13:03.29–01:13:03.90 · re-encode the audio track · copy video, subtitles, chapters
+```
+
+## 2. Goals and non-goals
+
+**Goals**
+
+1. Censor every occurrence of configured words and phrases in the dialogue track. Each occurrence is beeped or muted with roughly 0.1 s precision.
+2. Drive the word list and all behaviour from a TOML config file. The file supports categories, wildcards, phrases, an allowlist and per-category actions.
+3. Use subtitles (embedded, sidecar or online) to limit speech recognition to candidate regions. Fall back to full transcription automatically.
+4. Never re-encode video. Keep all other streams, chapters and metadata. Write output atomically.
+5. Be auditable: provide a dry run, a JSON report, an EDL mute list, and rendering from a hand-edited report.
+6. Run on Linux, macOS and Windows, on CPU only or with an NVIDIA GPU.
+
+**Non-goals for v1**
+
+- Visual content (on-screen text, gestures) and cutting scenes.
+- Filtering in real time during playback. The EDL export covers players that support mute lists.
+- DRM-protected or encrypted media.
+- Editing image-based subtitles (PGS, VobSub) or burned-in text.
+- Non-English word lists out of the box. The design allows them (§15).
+
+## 3. Command-line interface
+
+The executable is `vbr`, also installed as `video-beep-remover`. It is built with Typer, with Rich for progress output.
+
+### 3.1 Quick start
+
+```console
+$ pipx install video-beep-remover          # GPU users: pip install "video-beep-remover[gpu]"
+$ vbr config init                          # writes a commented config to the per-user config dir
+$ export OPENSUBTITLES_API_KEY=...         # optional: enables online subtitle search
+$ vbr clean "The Movie (2019).mkv"
+  → The Movie (2019).clean.mkv
+  → The Movie (2019).clean.vbr.json
+```
+
+### 3.2 Commands
+
+| Command | Purpose |
+|---|---|
+| `vbr clean INPUT...` | Detect and censor. Writes the cleaned file(s) and a report. Inputs can be files or folders (`--recursive`). |
+| `vbr scan INPUT...` | Detection only, the same as `clean --dry-run`. Writes the report and optional EDL, but no video. |
+| `vbr render INPUT --report FILE` | Render from a report, which may be hand-edited. Skips detection. |
+| `vbr subs INPUT` | Show subtitle candidates, their scores and the sync check. `--save` writes the chosen file. |
+| `vbr config init \| show \| check` | Write a starter config, print the effective merged config (secrets redacted), or validate it. |
+| `vbr doctor` | Check the FFmpeg version and encoders, CUDA, the model cache and the API credentials. |
+| `vbr cache info \| clear` | Inspect or clear cached subtitles, transcripts and decoded audio. |
+
+### 3.3 Main options for `clean` and `scan`
+
+| Option | Config key it overrides | Notes |
+|---|---|---|
+| `-c, --config PATH` | n/a | See §4.1 for discovery. |
+| `-o, --output PATH` | `output.path` | A file (single input) or a directory. |
+| `--action beep\|mute` | `censor.action` | |
+| `--strategy hybrid\|targeted\|full` | `analysis.strategy` | See §7. |
+| `--no-fallback` | `analysis.fallback_to_full = false` | Fail instead of transcribing everything. |
+| `--subtitles PATH` | n/a | Use this file and skip the search. It is treated as trusted. |
+| `--offline` | `offline = true` | No network access at all: every network-backed subtitle provider is skipped and models load only from the local cache (§10). |
+| `--categories strong,mild` | `lexicon.categories.*.enabled` | Enables exactly these categories. |
+| `--model NAME`, `--device cpu\|cuda` | `transcription.model`, `.device` | |
+| `--language CODE`, `--audio-stream N` | `analysis.language`, `.audio_stream` | |
+| `--dry-run` | n/a | The same as `vbr scan`. |
+| `--report PATH`, `--edl` | `output.report`, `output.edl` | |
+| `--overwrite`, `--skip-existing` | `output.overwrite` | `--skip-existing` is meant for batch runs. |
+| `--keep-temp`, `-v`, `-q` | n/a | Debugging and verbosity. |
+
+**Exit codes**
+
+- `0`: success, including "nothing to censor".
+- `1`: processing error.
+- `2`: usage or config error.
+- `3`: missing dependency (FFmpeg, a model or an encoder).
+- `4`: batch finished with some failures.
+
+### 3.4 Example session
+
+The numbers below illustrate the output format. They are not measurements.
+
+```console
+$ vbr clean "The Movie (2019).mkv"
+Probe       2:04:02 · video h264 (copy) · audio #1 eac3 5.1 eng [default], #2 aac 2.0 eng "Commentary" · subs #3, #4 subrip eng
+Subtitles   embedded #4 "English SDH" (trusted) · 1,412 cues
+Sync        6/6 anchors · offset +0.04 s · error 0.09 s · fidelity 0.91
+Plan        43 flagged cues (38 word, 3 masked, 2 hint) + 9 unsubtitled speech regions → 36 windows · 4m41s of audio (3.8 %)
+Transcribe  ━━━━━━━━━━━━━━━━━━━━ 36/36 windows · 0:52
+Detect      47 detections (45 confirmed, 2 estimated) → 44 intervals (39 beep, 5 mute)
+Render      ━━━━━━━━━━━━━━━━━━━━ 100 % · 1:12 · #1 censored → eac3 640k · #2 dropped (commentary) · subtitles censored
+Done        The Movie (2019).clean.mkv · The Movie (2019).clean.vbr.json
+```
+
+## 4. Configuration
+
+### 4.1 Format, discovery and precedence
+
+The config is TOML, parsed with the standard library's `tomllib` (Python 3.11+). TOML was chosen over YAML for two reasons. It needs no extra dependency. It also has no implicit typing: in YAML 1.1 (PyYAML), unquoted `no`, `off`, `on` and `yes` become booleans, which is a real hazard in a *word list*.
+
+The tool uses the first config file it finds:
+
+1. `--config PATH`
+2. `$VBR_CONFIG`
+3. `./vbr.toml`
+4. The per-user config dir via `platformdirs`: `~/.config/video-beep-remover/config.toml` on Linux, `~/Library/Application Support/video-beep-remover/config.toml` on macOS, `%APPDATA%\video-beep-remover\config.toml` on Windows.
+
+That file is deep-merged over the packaged defaults (`defaults.toml`, which is the same file as `docs/vbr.example.toml`). There is one exception: if the file defines any `[lexicon.categories.*]`, those categories replace the packaged ones instead of merging with them, so the word list is exactly what the user wrote. Command-line flags are applied last. In any string value, `${NAME}` expands from the environment, and unset variables expand to an empty string. This keeps API keys and passwords out of the file.
+
+### 4.2 Sections
+
+| Section | Controls |
+|---|---|
+| top level: `offline` | No network access at all (§10) |
+| `[lexicon]`, `[lexicon.categories.<name>]`, `[lexicon.hints]` | What to censor: terms, allowlist, masked-word detection, per-category `enabled`/`action`, subtitle hint words |
+| `[censor]`, `[censor.beep]` | How it sounds: beep or mute, padding, minimum length, merging, tone frequency, level and channels |
+| `[analysis]`, `.targeted`, `.sync` | Strategy and fallback, audio stream, spoken language, window planning, sync and fidelity thresholds |
+| `[transcription]` | ASR backend, model, device, precision, batching, VAD, prompt |
+| `[subtitles]`, `.opensubtitles` | Source order, languages, preference for hearing-impaired tracks, credentials |
+| `[output]` | Output path, overwrite, codecs, other audio and subtitle streams, report and EDL |
+| `[cache]`, `[tools]` | Cache location and size, FFmpeg and ffprobe paths |
+
+A minimal config needs only the word list:
+
+```toml
+config_version = 1
+
+[lexicon.categories.strong]
+terms = ["*fuck*", "*shit*", "bitch*", "son of a bitch"]
+
+[lexicon.categories.religious]
+action = "mute"
+terms = ["goddamn*", "oh my [god]"]
+```
+
+### 4.3 Word-list syntax and matching rules
+
+| Syntax | Example | Matches |
+|---|---|---|
+| word | `damn` | "damn", "Damn!" (whole word, any case) |
+| prefix wildcard | `bitch*` | bitch, bitches, bitchy |
+| infix/suffix wildcard | `*shit*` | shit, bullshit, shitty, dipshit |
+| phrase | `son of a bitch` | consecutive words; each word may use wildcards |
+| phrase with target | `oh my [god]` | censors only "god", and only after "oh my" |
+| regex | `re:^f+u+c+k+` | escape hatch, applied to one normalized word |
+| masked (built in) | `detect_masked = true` | "f\*\*\*", "sh\*t", "\*\*\*" (`masked_patterns`, default `[*#]`) |
+
+Terms can also live in plain-text files (`lexicon.files`), with one term per line and `#` for comments. This makes lists easy to share.
+
+The matcher runs on subtitle tokens and on Whisper words. The rules are:
+
+1. **Normalization.** Apply NFKC, casefold, and straighten curly quotes. Strip surrounding punctuation but keep inner apostrophes and asterisks. Collapse runs of three or more identical letters, so "fuuuck" becomes "fuck" and "shiiit" becomes "shit".
+2. **Whole words.** `*` matches zero or more letters, digits or apostrophes inside one word. It never spans a space.
+3. **Hyphenated forms.** Both the hyphenated and the joined form are tested, e.g. "mother-fucker" and "motherfucker".
+4. **Phrases.** A phrase matches consecutive words, ignoring punctuation between them.
+5. **Allowlist.** Allowlist entries (same syntax) veto single-word matches. Use them to fix wildcard collisions, e.g. `bastard*` matching "bastardize".
+6. **Masked tokens.** Masked tokens are flagged. Their category is inferred by aligning the visible letters with the terms (`f***ing` ↔ `*fuck*`). If nothing aligns, they get a built-in `masked` category that uses the default action.
+7. **Overlaps.** Where terms overlap, the longest match wins. Each word is censored at most once.
+
+Prefer prefix wildcards (`cunt*`) over infix ones (`*cunt*` would match "Scunthorpe"). `vbr config check` warns about wildcard terms with fewer than three literal letters.
+
+**Hint words** (`[lexicon.hints]`, e.g. "freaking", "heck") are words subtitles often use *instead of* profanity. A cue containing one is checked against the audio. The hint word itself is never censored.
+
+### 4.4 Validation
+
+The config schema uses pydantic v2 models with `extra="forbid"`. A misspelled key is therefore an error, and the error message shows its TOML path. Regex terms are compiled when the config loads. `vbr config check` warns about:
+
+- overly broad wildcards
+- unknown categories named in `--categories`
+- missing word files
+- literal secrets in a config file that other users can read
+
+## 5. Architecture
+
+### 5.1 Pipeline
+
+```mermaid
+flowchart TD
+    A["vbr clean movie.mkv"] --> B["Load config<br/>compile word list"]
+    B --> C["Probe with ffprobe<br/>pick dialogue audio stream"]
+    C --> D{"strategy = full?"}
+    D -- "no" --> E["Find subtitles<br/>explicit → embedded → sidecar → OpenSubtitles"]
+    E --> F["Parse and clean cues"]
+    F --> G["Sync and fidelity check<br/>anchor cues, small model"]
+    G -- "fails: next candidate" --> E
+    G -- "ok" --> H["Flag cues<br/>listed / masked / hint word"]
+    H --> I["Plan windows<br/>pad, merge, split at 30 s<br/>hybrid: add unsubtitled speech"]
+    I --> J["Transcribe windows<br/>word timestamps"]
+    D -- "yes" --> T["Transcribe full track<br/>VAD, word timestamps"]
+    E -- "nothing usable" --> T
+    I -- "coverage too high" --> T
+    J --> K["Match words<br/>confirm flagged cues"]
+    T --> K
+    K --> L["Build censor intervals<br/>pad, min length, merge"]
+    L --> M["Write report / EDL"]
+    M --> N{"dry run?"}
+    N -- "no" --> O["Render with FFmpeg<br/>re-encode censored audio, copy the rest"]
+```
+
+### 5.2 Package layout
+
+```
+src/video_beep_remover/
+├── cli.py                 # Typer app → PipelineOptions
+├── pipeline.py            # orchestrates stages, strategy fallbacks, timings
+├── models.py              # dataclasses shared by all stages (§5.3)
+├── config/
+│   ├── schema.py          # pydantic models
+│   ├── loader.py          # discovery, deep merge, ${ENV} expansion, CLI overrides
+│   └── defaults.toml      # packaged defaults (= docs/vbr.example.toml)
+├── media/
+│   ├── ffmpeg.py          # subprocess runner, version/encoder detection, -progress parsing
+│   ├── probe.py           # ffprobe JSON → MediaInfo, stream selection
+│   ├── audio.py           # AudioSource: SeekingAudioSource, CachedAudioSource
+│   └── render.py          # command files, filtergraph, stream mapping, codec choice
+├── subtitles/
+│   ├── acquire.py         # runs providers in order, ranks candidates
+│   ├── providers/         # embedded.py, sidecar.py, opensubtitles.py, subliminal_adapter.py
+│   ├── oshash.py          # OpenSubtitles movie hash
+│   ├── parse.py           # pysubs2 parsing, cue cleaning
+│   ├── sync.py            # anchor search, drift fit, fidelity score, ffsubsync fallback
+│   └── censor.py          # masks words in subtitle text for the output file
+├── asr/
+│   ├── base.py            # Transcriber protocol
+│   ├── faster_whisper.py  # default backend (sequential and batched)
+│   ├── whisperx.py        # optional backend with forced alignment
+│   └── cache.py           # span-based transcript cache
+├── detect/
+│   ├── normalize.py, lexicon.py, matcher.py
+│   ├── planner.py         # flagging, windows, hybrid VAD regions, coverage guard
+│   └── intervals.py       # padding, min length, merge
+└── report/                # json_report.py, edl.py, review_srt.py
+```
+
+### 5.3 Core data types
+
+All times are seconds on the media timeline (§6.2). The exception is `Cue`, which stays in subtitle time until the sync model (§6.6) maps it.
+
+```python
+@dataclass(frozen=True)
+class Word:              # one recognized word
+    text: str; start: float; end: float; probability: float
+
+@dataclass(frozen=True)
+class Cue:               # one cleaned subtitle cue, in subtitle time
+    index: int; start: float; end: float; text: str; lyrics: bool
+
+@dataclass(frozen=True)
+class SyncModel:         # subtitle time → media time
+    scale: float = 1.0; offset: float = 0.0; error: float = 0.0
+    def to_media(self, t: float) -> float: return self.scale * t + self.offset
+
+@dataclass(frozen=True)
+class Window:            # audio to transcribe
+    start: float; end: float; reasons: frozenset[str]; cues: tuple[int, ...]
+
+@dataclass(frozen=True)
+class Detection:         # a listed word heard (or estimated) in the audio
+    start: float; end: float; heard: str; term: str; category: str
+    action: Literal["beep", "mute"]; confidence: float
+    source: Literal["asr", "estimate", "cue"]; cue: int | None
+
+@dataclass(frozen=True)
+class CensorInterval:    # what the renderer applies; always disjoint
+    start: float; end: float; action: Literal["beep", "mute"]
+```
+
+### 5.4 Extension points
+
+Each stage depends on a small `Protocol`, so backends can be swapped and tests can inject fakes.
+
+```python
+class SubtitleProvider(Protocol):
+    name: str
+    network: bool                     # True for online providers; all of them are skipped when offline
+    def find(self, media: MediaInfo, languages: Sequence[str]) -> list[SubtitleCandidate]: ...
+    def fetch(self, candidate: SubtitleCandidate) -> SubtitleDocument: ...
+
+class AudioSource(Protocol):          # float32 mono 16 kHz; sample 0 == `start` on the media timeline
+    def read(self, start: float, end: float) -> np.ndarray: ...
+
+class Transcriber(Protocol):          # AudioWindow = Window + its samples; returns words in media time
+    def transcribe(self, windows: Sequence[AudioWindow], *, language: str,
+                   prompt: str | None) -> list[list[Word]]: ...
+
+class Renderer(Protocol):
+    def render(self, plan: RenderPlan, progress: Callable[[float], None]) -> Path: ...
+```
+
+## 6. Pipeline stages
+
+### 6.1 Probe and stream selection
+
+The probe runs `ffprobe -v error -show_format -show_streams -show_chapters -of json file:<input>` and records:
+
+- duration and the container `start_time`
+- for each stream: codec, channels, `channel_layout`, `sample_rate` and `bit_rate`
+- `tags.language` and `tags.title`
+- dispositions: `default`, `forced`, `hearing_impaired`, `comment`, `visual_impaired`
+
+With `audio_stream = "auto"`, the dialogue stream is chosen like this:
+
+1. Exclude commentary (`comment` disposition, or a title matching /commentary/i) and audio description (`visual_impaired`, /description/i).
+2. Prefer the configured language, then the `default` disposition, then the most channels, then the lowest index.
+
+Encrypted streams are rejected with a clear error.
+
+### 6.2 One timeline for everything
+
+Windows, words, intervals and synced cue times are all seconds on the **media timeline**. On this timeline 0 is the container's start. This matches what FFmpeg does by default (without `-copyts`), both for the `-ss` input option and for the `t` seen by filters. Appendix A verifies this with an MPEG-TS file whose timestamps start at 31.4 s. Three rules follow:
+
+- **Window extraction** decodes only what is needed and pins sample 0 to the requested time, even when the audio track starts late:
+  ```
+  ffmpeg -nostdin -ss S -t D -i file:<input> -map 0:<audio index> \
+         -af aresample=async=1:first_pts=0 -ac 1 -ar 16000 -f f32le pipe:1
+  ```
+- **Full-track extraction** uses the same `aresample=async=1:first_pts=0`. Without it, sample 0 is the first decoded audio sample. In the prototype, an MKV whose audio started 0.479 s after the video decoded with that 0.479 s shift, which would have moved every detection (Appendix A).
+- **Rendering** never uses `-copyts`. Subtitle cue times are assumed to be on the same timeline. The sync check (§6.6) absorbs any constant offset left over.
+
+### 6.3 Finding subtitles
+
+Sources are tried in the configured order. Acquisition stops at the first candidate that passes the sync check (§6.6). Within a source, candidates are ranked. With `offline = true`, every provider that declares `network = True` is skipped, whatever its own `enabled` setting. That covers OpenSubtitles and every provider behind the subliminal adapter.
+
+| Source | How | Trust |
+|---|---|---|
+| `--subtitles PATH` | As given. | trusted |
+| embedded | Text subtitle streams (`subrip`, `ass`, `ssa`, `webvtt`, `mov_text`, `text`) are extracted with `ffmpeg -i file:<input> -map 0:<index> -f srt pipe:1`. ASS is also kept as ASS so it can be re-muxed after censoring. | trusted |
+| sidecar | `<stem>*.{srt,ass,ssa,vtt}` in the video's folder and in `Subs/` or `Subtitles/`. Language, SDH and forced are read from name tokens (`.en.`, `.eng.`, `.sdh.`, `.forced.`). | trusted |
+| OpenSubtitles.com | Hash search first, then a metadata search (§6.4). | trusted if `moviehash_match`, otherwise untrusted |
+| more providers (optional `subliminal` adapter) | Podnapisi, Addic7ed, Gestdown, and others. | untrusted |
+
+**Ranking.** These filter candidates out:
+
+- the wrong language
+- forced or foreign-parts-only tracks
+- machine-translated files (by default)
+
+These add to a candidate's score:
+
+- SDH or hearing-impaired (configurable), because these tracks tend to be closer to verbatim
+- a hash match
+- a similar release name, compared on guessit fields (release group, source, resolution)
+- a subtitle `fps` equal to the video's frame rate
+- download count, used as a tie-breaker
+
+Image-based streams (PGS, VobSub, DVB) are ignored for analysis; OCR is out of scope.
+
+### 6.4 OpenSubtitles.com provider
+
+This provider uses the REST API v1 at `https://api.opensubtitles.com/api/v1/`. Every request sends `Api-Key`, a descriptive `User-Agent` (app name and version) and `Content-Type: application/json`. `Authorization: Bearer <token>` from `POST /login` is optional and raises the download quota.
+
+1. **Hash.** The hash is read from 64 KiB at each end of the file, so it is cheap even for 50 GB files:
+   ```python
+   def opensubtitles_hash(path: Path) -> str:
+       """File size + the first and last 64 KiB summed as little-endian uint64, mod 2**64."""
+       chunk = 64 * 1024
+       size = path.stat().st_size
+       if size < 2 * chunk:
+           raise ValueError("file too small for the OpenSubtitles hash")
+       h = size
+       with path.open("rb") as f:
+           for offset in (0, size - chunk):
+               f.seek(offset)
+               for (value,) in struct.iter_unpack("<Q", f.read(chunk)):
+                   h = (h + value) & 0xFFFF_FFFF_FFFF_FFFF
+       return f"{h:016x}"
+   ```
+2. **Hash search.** `GET /subtitles?moviehash=<hash>&languages=en`. From each result it reads `attributes.moviehash_match`, `hearing_impaired`, `foreign_parts_only`, `machine_translated`, `fps`, `release`, `download_count` and `files[].file_id`. Hash-matched subtitles were timed against this exact file, so they are trusted.
+3. **Metadata search** runs when no result is hash-matched. `guessit(<filename>)` supplies the title, year, season and episode, and the search is `GET /subtitles?query=<title>&year=<year>&languages=en`. For episodes it adds `season_number` and `episode_number`. When an `imdb_id` is known, for example from an `.nfo` file, it uses `imdb_id` instead.
+4. **Download.** `POST /download {"file_id": N}` returns `{link, remaining, reset_time_utc}`. The tool fetches `link`, caps the file at 5 MB and detects the encoding with charset-normalizer. The file is cached under its `file_id` and indexed by the movie hash, so a cached copy never costs quota again.
+5. **Quota and rate limits.** Downloads are limited per 24 h: 5 per IP address without logging in, more for logged-in and VIP users. The tool downloads only the top candidate and tries the next one only if the sync check fails, up to `max_candidates`. When the quota runs out (`remaining` reaches 0 or a download is refused), the tool warns, records the reset time in the report and moves on to the fallback. HTTP 429 is retried with capped exponential backoff, honouring `Retry-After`.
+
+Each user registers for a free API key and supplies it through `${OPENSUBTITLES_API_KEY}` (see open question 4). The legacy OpenSubtitles.org XML-RPC API is not used.
+
+### 6.5 Parsing and cleaning cues
+
+pysubs2 parses SRT, ASS/SSA, WebVTT and MicroDVD. Frame-based MicroDVD needs the video frame rate, which comes from the probe. Cleaning then:
+
+- removes markup (`<i>`, `{\an8}`, ASS override tags), speaker labels (`JOHN:`), SDH descriptions (`[door slams]`, `(laughs)`) and leading dialogue dashes
+- keeps lines with ♪ but marks the cue `lyrics=True`
+- joins multi-line cues
+- sorts cues and fixes overlaps
+- drops empty cues
+
+A character-offset map from the cleaned text back to the original is kept. §6.9 uses it to estimate word timing, and output censoring (§6.11) uses it to mask words in the original text.
+
+### 6.6 Sync and fidelity check
+
+This check maps subtitle time to media time, `t_media = scale · t_sub + offset`. It also measures how verbatim the subtitles are ("fidelity").
+
+1. **Anchors.** Choose `anchors` cues (default 6) spread across the runtime. Each must have four or more words, last 1–7 s and not be lyrics. Cues with less common words are preferred.
+2. **Search windows.** Search ±`trusted_search_s` (3 s) or ±`untrusted_search_s` (20 s) around each anchor's predicted position.
+   - Anchors are processed in time order, and the prediction is refitted after every match. This tracking keeps a frame-rate drift inside the window: 25 vs 23.976 fps is 4.3 %, or about 2.5 minutes per hour.
+   - If the candidate's `fps` differs from the video's frame rate by a standard ratio, that ratio is applied up front.
+3. **Transcription.** Transcribe the anchor windows with the small `anchor_model` (`base.en`), with word timestamps.
+4. **Matching.** Find the cue text in the recognized words with rapidfuzz: slide a token window and require a ratio of at least 75 (rapidfuzz scores run from 0 to 100). Each match yields a pair (cue start, word start).
+5. **Fit.** With three or more pairs, compute a Theil–Sen slope. If it is within 0.1 % of a standard ratio, snap it to that ratio: 1, 25/23.976, 25/24, 24/23.976, 30/29.97, or the inverse of any of them. The offset is the median residual. With two pairs, fit an offset only. The error is the median absolute residual.
+6. **Fidelity.** Take the median `token_sort_ratio` between each anchor's text and the words heard, divided by 100. Fidelity is therefore a 0–1 fraction, on the same scale as `min_fidelity` and the report.
+7. **Decision.** The check passes if `matched ≥ min_matched_ratio`, `error ≤ max_error_s` and `fidelity ≥ min_fidelity`. If it fails:
+   - Run [ffsubsync](https://github.com/smacke/ffsubsync), if installed. It uses speech-activity correlation, corrects frame-rate mismatches and handles offsets up to 60 s by default. Then check again.
+   - Otherwise try the next candidate.
+   - Otherwise use the fallback (§7).
+
+**Cost.** Trusted subtitles need about 6 × 9 s ≈ 1 minute of audio through a small model. Untrusted subtitles need about 6 × 43 s ≈ 4.3 minutes.
+
+### 6.7 Flagging cues and planning windows
+
+Each cue gets zero or more **flag reasons**:
+
+- `lexicon` (strong): the cue contains a listed term.
+- `masked` (strong): the cue contains a masked token.
+- `hint` (weak): the cue contains a hint word.
+
+Windows are planned from the flagged cues:
+
+1. **Window.** `[T(start) − p, T(end) + p]`, where `T` is the sync model and `p = window_padding_s + 3 × sync error`.
+2. **Minimum length.** Extend each window to `min_window_s` (4 s), because Whisper does poorly on very short clips. Clamp to `[0, duration]`.
+3. **Merge and split.**
+   - Merge windows less than `merge_gap_s` apart.
+   - Split windows longer than `max_window_s` (30 s) into pieces that overlap by 2 s. faster-whisper's batched pipeline transcribes only the first 30 s of each clip.
+4. **Hybrid mode.** Decode the full track once (16 kHz mono, cached) and run Silero VAD over it. From the speech regions, subtract every cue's span ±0.5 s, not just flagged cues. Remaining speech of 0.5 s or more becomes a window with reason `uncovered`. These are typically songs, background voices and lines the subtitles skipped.
+5. **Coverage guard.** If the windows add up to more than `max_coverage` (35 %) of the runtime, switch to full mode. At that point full mode is cheaper, because it has no duplicated context and batches better.
+
+### 6.8 Transcription
+
+The default backend is faster-whisper.
+
+- **Model `auto`.**
+  - GPU: `large-v3-turbo` in float16.
+  - CPU: `large-v3-turbo` in int8 for targeted and hybrid windows, which are only minutes of audio, and `small.en` in int8 for full mode.
+  - Anchors always use `base.en`.
+  - The benchmark (§11) confirms or changes these defaults.
+- **Decoding options.**
+  - `language` is always fixed, because language detection is unreliable on short windows.
+  - `word_timestamps=True`.
+  - `condition_on_previous_text=False`, which limits hallucination loops.
+  - `vad_filter=True` in full mode.
+- **Batching.** On GPU, windows are packed into one buffer and sent to `BatchedInferencePipeline.transcribe(buffer, clip_timestamps=[{"start": s, "end": e}, ...], word_timestamps=True)`. The clip times are in seconds and relative to the buffer. Times map back with `t_media = window.start + (t_buffer − window.buffer_offset)`. On CPU, windows are transcribed one after another.
+- **Profanity spelling.** Whisper sometimes writes profanity masked, e.g. "s\*\*\*" ([openai/whisper#1534](https://github.com/openai/whisper/discussions/1534)). The masked-token rule catches that. In addition, `initial_prompt = "auto"` primes the decoder with a short uncensored sentence built from enabled terms, which pushes it toward verbatim spelling. The benchmark must show this does not add false positives before the default ships (open question 1).
+- **Window edges.** Words within 0.3 s of a window edge are dropped as unreliable, unless the edge is the start or end of the file. Windows are padded so flagged cues sit well inside them.
+- **Model files.** Models are downloaded from Hugging Face on first use and cached. With `offline = true` they load with `local_files_only=True`. A model missing from the cache is then an error (exit code 3), not a download.
+- **Optional alignment.** The `whisperx` backend adds wav2vec2 forced alignment for tighter word boundaries. Default alignment models cover English, French, German, Spanish and Italian.
+
+### 6.9 Matching and confirmation
+
+The matcher runs over each window's words and produces detections: heard text, term, category, action and probability.
+
+**Confirmation.** A strong-flagged cue is **confirmed** when a detection overlaps `T(cue) ± p`. For an unconfirmed strong cue, the window is widened once by `expand_by_s` and transcribed again. If it is still unconfirmed, `on_unconfirmed` decides:
+
+- `estimate` (default): estimate the word's time from its character position in the cue, since speech is roughly uniform within a cue. Censor that span ±0.3 s and give it low confidence. This handles subtitles that are right but that Whisper mishears.
+- `cue`: censor the whole cue. This is heavy-handed.
+- `skip`: censor nothing, and list the cue in the report.
+
+**Other cases.**
+
+- Unconfirmed weak (hint) flags are dropped, because the audio showed no listed word.
+- Detections outside flagged cues are kept: the audio is the source of truth. A softened subtitle next to a flagged one is a common case.
+- If ASR confirms fewer than half of the strong flags, the subtitles evidently don't match this audio. The run escalates to full mode, if fallback is allowed.
+
+### 6.10 Building censor intervals
+
+Each detection `[start, end]` becomes an interval as follows:
+
+1. Widen it by `pad_before_ms` and `pad_after_ms`, because Whisper's word timestamps are approximate.
+2. Extend it symmetrically to `min_duration_ms`.
+3. Clamp it to `[0, duration]`.
+4. Sort the intervals and merge any that are less than `merge_gap_ms` apart. A merged interval beeps if any of its detections beeps.
+
+The result is **disjoint by construction**, which the renderer requires (§6.11).
+
+An optional refinement moves each edge *outward only* to the nearest 10 ms RMS energy minimum within 80 ms. This avoids clipping half a syllable.
+
+### 6.11 Rendering with FFmpeg
+
+**Principles.**
+
+- Video, subtitle, attachment and data streams are stream-copied.
+- Only censored audio streams are re-encoded.
+- Output goes to `<name>.partial<ext>` and is renamed on success. A failed run leaves nothing half-written.
+
+For each censored stream, the renderer writes two **command files** into a job temp dir.
+
+`mute0.cmd` lists every interval:
+
+```
+4383.290-4383.900 [enter] volume@mute0 volume 0, [leave] volume@mute0 volume 1;
+```
+
+`beep0.cmd` lists beep intervals only:
+
+```
+4383.290-4383.900 [enter] volume@beep0 volume 1.0, [leave] volume@beep0 volume 0;
+```
+
+The filtergraph for that stream (shown for 48 kHz 5.1 with a centre-channel beep) was verified in the prototype (Appendix A):
+
+```
+[0:a:0]asetnsamples=n=240:p=0,asendcmd=f=mute0.cmd,volume@mute0=volume=1[main0];
+sine=frequency=1000:sample_rate=48000,asetnsamples=n=240:p=0,asendcmd=f=beep0.cmd,volume@beep0=volume=0,pan=5.1(side)|FC=c0[tone0];
+[main0][tone0]amix=inputs=2:duration=first:normalize=0[out0]
+```
+
+**Why this graph.**
+
+- **5 ms frames.** Commands take effect per audio frame. Codec frames would limit precision to 21 ms (AAC, 1024 samples), 32 ms (AC-3, 1536) or more (FLAC). `asetnsamples=n=<rate/200>` re-frames the audio to 5 ms. Measured for a requested 2.000–2.500 s:
+  - without it: 2.005–2.518 s
+  - with it, using `enable` expressions: 2.000–2.505 s
+  - with it, using the command-file graph above: 2.000–2.500 s
+- **`asendcmd` command files instead of `enable='between(t,…)+…'`.** Expression cost grows with the number of intervals: +75 % render time at 500 intervals, against +10 % for command files (Appendix A). Command files also avoid command-line length limits and escaping long expressions.
+- **Separate command files per chain.** Each chain has its own `asendcmd`, so commands fire on that chain's own frame timestamps.
+- **Disjoint intervals.** Intervals must not overlap. An interval's `[leave]` would otherwise un-mute an overlapping one early; §6.10 guarantees this.
+- **Beep level.** At volume 1 the `sine` source's peak is 1/8 of full scale (−18.06 dBFS). `level_dbfs` becomes the gain `10^((level_dbfs + 18.06) / 20)` in the enter command.
+- **Beep channels.** `pan=<source layout>|FC=c0` puts the beep in the centre channel only, when the track has one (`channels = "dialogue"`). Otherwise it goes to `FL=c0|FR=c0` or mono. The probe supplies the source's exact layout and sample rate.
+- **No level change.** `amix … normalize=0` keeps the original level; by default amix scales its inputs down.
+- **Mute action.** `action = "mute"` needs only the first chain, with no tone and no `amix`.
+- **Paths.** The job temp dir is FFmpeg's working directory, so command files are referenced by relative name. That avoids escaping paths inside the filtergraph, such as Windows drive colons. Input and output are absolute paths with the `file:` prefix, which is safe for names that start with `-` or contain `:`.
+- **Loading the graph.** Use `-/filter_complex graph.txt` on FFmpeg 7 and later, where `-filter_complex_script` is deprecated. Use `-filter_complex_script graph.txt` on 5.x and 6.x.
+
+**Invocation (sketch).** Streams are mapped in their original order:
+
+```
+ffmpeg -hide_banner -nostdin -y -i file:/abs/in.mkv -filter_complex_script graph.txt \
+  -map 0:v:0 -map "[out0]" -map 0:s? -map 0:t? \
+  -c copy -c:a:0 eac3 -b:a:0 640k \
+  -metadata:s:a:0 language=eng -metadata:s:a:0 title="English 5.1" -disposition:a:0 default \
+  -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 \
+  -progress pipe:1 -nostats file:/abs/out.partial.mkv
+```
+
+Filtered streams lose their per-stream tags, so language, title and disposition are re-applied from the probe. MP4 and MOV outputs also get `-movflags +faststart`. Progress comes from `out_time_us` on the `-progress` pipe.
+
+**Audio codec (`audio_codec = "auto"`)**
+
+| Source | Re-encoded as |
+|---|---|
+| AAC, AC-3, E-AC-3 | the same codec at the source bitrate |
+| MP3, Opus, Vorbis | `libmp3lame`, `libopus`, `libvorbis` if FFmpeg has them, otherwise AAC |
+| FLAC, ALAC, PCM | the same codec (lossless) |
+| DTS, DTS-HD, TrueHD, others | FLAC in MKV, AAC in MP4/MOV (FFmpeg has no production-quality encoders for these) |
+
+Re-encoding a lossy track at its source bitrate costs a generation of quality, which is generally inaudible. With MKV, `audio_codec = "flac"` avoids that loss entirely. `vbr doctor` checks `ffmpeg -encoders` up front.
+
+**Other audio streams (`other_audio_streams`)**
+
+- `auto` (default): streams with the analyzed stream's language get the same intervals, which covers e.g. a stereo downmix next to the 5.1 mix. Other languages, commentary and audio description are dropped with a warning, since keeping them would leave uncensored speech in the file. A cheap guard checks that the streams really carry the same dialogue before applying the intervals: it cross-correlates their 16 kHz mono downmixes around a few detections. The threshold is tuned by the benchmark.
+- `censor`, `copy` or `drop` apply one rule to all of them.
+
+**Subtitle streams in the output (`subtitle_streams`)**
+
+- `censor` (default): text streams are extracted, listed words are masked per `subtitle_mask` (`f***`, `****` or removed) with the same matcher, and the streams are muxed back in place. Image-based streams are copied with a warning. A sidecar file used for analysis gets a censored copy next to the output.
+- `copy` or `drop`.
+
+**Nothing to censor.** `when_clean = "copy"` does a plain stream copy (`-map 0 -c copy`), which takes seconds. `"skip"` writes nothing. Every output is tagged `VBR_CENSORED=<version>;<config hash>`, so later runs can skip processed files.
+
+### 6.12 Reports and other outputs
+
+**JSON report.** Written by default as `<output stem>.vbr.json`. It records every decision so a run can be audited or re-rendered:
+
+```json
+{
+  "schema_version": 1,
+  "input": {"path": "The Movie (2019).mkv", "size": 4368124121, "oshash": "3f1c9a0b7d2e4c55", "duration": 7442.3},
+  "audio_stream": {"index": 1, "codec": "eac3", "channels": 6, "language": "eng"},
+  "strategy": {"requested": "hybrid", "used": "hybrid", "fallback_reason": null},
+  "subtitle": {"source": "embedded", "stream": 4, "trusted": true,
+               "sync": {"scale": 1.0, "offset": 0.04, "error": 0.09, "anchors": 6, "matched": 6}, "fidelity": 0.91},
+  "windows": {"count": 36, "audio_seconds": 281.0, "coverage": 0.038},
+  "detections": [{"start": 4383.41, "end": 4383.78, "heard": "fucking", "term": "*fuck*", "category": "strong",
+                  "action": "beep", "confidence": 0.94, "source": "asr", "cue": 812}],
+  "unconfirmed": [{"cue": 1033, "text": "Get the f*** out!", "resolution": "estimate"}],
+  "intervals": [{"start": 4383.29, "end": 4383.90, "action": "beep"}],
+  "timings": {"probe": 0.3, "subtitles": 0.4, "sync": 6.8, "transcribe": 52.0, "render": 72.5}
+}
+```
+
+`vbr render --report` reads only `intervals`, so users can add, delete or adjust spans by hand.
+
+**EDL** (`--edl`). A mute list in the Kodi and MPlayer format, `start end 1` where action 1 means mute:
+
+```
+4383.29	4383.90	1
+```
+
+Players that support EDL can mute the *original* file at playback time, with no rendering at all.
+
+**Review SRT** (optional). One cue per interval showing the detected word. Load it in a player next to the cleaned file to spot-check the result.
+
+## 7. Strategy selection and fallbacks
+
+| Strategy | Audio transcribed | Misses | Relative cost |
+|---|---|---|---|
+| `full` | all speech (VAD) | only what Whisper misses | highest |
+| `hybrid` (default) | flagged-cue windows plus speech no cue covers | profanity the subtitles softened that no hint word caught | full decode + VAD + a small fraction |
+| `targeted` | flagged-cue windows only | the above, plus unsubtitled speech (songs, background voices) | a few percent of `full` |
+
+With `fallback_to_full = true`, `hybrid` and `targeted` switch to `full` in any of these cases:
+
+- no usable subtitle candidate
+- every candidate fails the sync check
+- fidelity below `min_fidelity`
+- the coverage guard (§6.7)
+- ASR confirms fewer than half of the strong flags (§6.9)
+
+The report records the reason. With `fallback_to_full = false` the file fails instead (exit code 1, or 4 in a batch), which suits quick batch runs over a library.
+
+## 8. Performance
+
+### 8.1 Cost model
+
+The table estimates speech-recognition time for a two-hour film. It extrapolates faster-whisper's published benchmark for 13 minutes of audio: large-v2 on an RTX 3070 Ti takes 63 s sequential and 17 s batched; small int8 on an i7-12700K takes 102 s. Times scale roughly with the amount of audio transcribed.
+
+| Scenario | Audio through Whisper | GPU (large-v2 class) | CPU (small, int8) |
+|---|---|---|---|
+| `full` | 120 min (before VAD savings) | ≈ 9.7 min sequential, ≈ 2.6 min batched | ≈ 15.7 min |
+| `targeted`, 40 flagged cues | ≈ 3.5 min (about 30 windows × 7 s) | ≈ 17 s | ≈ 27 s |
+| sync anchors, trusted subtitles | ≈ 1 min through `base.en` | a few seconds | a few seconds |
+
+**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127–140 s for two hours of stereo AAC on a 4-vCPU container (Appendix A). The cost scales with channel count and encoder. With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
+
+### 8.2 Techniques
+
+1. **Subtitle-guided windows.** This is the main saving. Local sources (embedded, sidecar) are checked before the network. The OpenSubtitles hash reads only 128 KiB.
+2. **Input seeking** (`-ss` before `-i`). Only a few seconds are decoded per window. A thread pool extracts windows while the model runs.
+3. **Fixed language, VAD, and no conditioning on previous text.** Batched inference on GPU, int8 on CPU.
+4. **Model sizing.** A small model handles sync anchors. The large model runs only on the windows that matter, which makes it affordable even on CPU.
+5. **Coverage guard.** When windows would pile up, the run switches to full mode instead of transcribing overlapping context.
+6. **Cheap rendering.** Video is stream-copied. Censoring uses command files, whose cost does not grow with the number of intervals.
+7. **Caching and batching.** Caches are described in §8.3. In batch mode the model stays loaded, and the render of one file overlaps with analysis of the next.
+8. **EDL output.** No rendering at all for players that support mute lists.
+
+### 8.3 Caching
+
+```
+<cache>/subtitles/<provider>/<file_id>.<ext>       + index.json: oshash → file ids
+<cache>/asr/<fingerprint>/<stream>/<model>-<params-hash>.jsonl   # transcribed spans, with words
+<cache>/audio/<fingerprint>-<stream>.f32           # 16 kHz mono (~230 MB/h), LRU-evicted
+```
+
+- **Fingerprint.** The fingerprint is the OpenSubtitles hash plus the file size, which is cheap to compute.
+- **Transcripts.** The transcript cache is span-based. The planner subtracts spans that are already transcribed (minus their unreliable edges), and a cached full transcript serves any strategy. Re-running with an edited word list usually needs **no new speech recognition**, only matching and rendering.
+- **Eviction.** Least-recently-used entries are evicted when the cache exceeds `cache.max_size_gb`.
+
+## 9. Failure modes and edge cases
+
+| Situation | Behaviour |
+|---|---|
+| FFmpeg or ffprobe missing or older than 5.1 | Exit code 3 with an install hint (`vbr doctor`). |
+| No audio stream, or an encrypted stream | Error for that file. |
+| Commentary or audio-description tracks | Never auto-selected; dropped by `other_audio_streams = "auto"`. |
+| Audio starts before or after the video; MPEG-TS offsets | Media-timeline rules (§6.2). |
+| Subtitles offset, drifting or at the wrong fps | Anchor tracking and fps snapping, then ffsubsync, the next candidate and finally the fallback. |
+| Subtitles paraphrase or soften profanity | Hint words; low fidelity triggers the full fallback. `hybrid` does not re-check softened cues (see §7). |
+| Subtitle says "f\*\*\*" but the audio says "freaking" | Unconfirmed strong flag, then expand, then `estimate`. This may over-censor, and it is listed in the report. |
+| Whisper outputs "s\*\*\*" | Masked-token rule. |
+| Songs and lyrics | `hybrid` covers unsubtitled songs. Recognition of singing is weaker (open question 7). |
+| Word at a window edge | Edge trimming and padding, then the confirmation path. |
+| Compound words ("bullshit") | Infix wildcards; the whole word is censored. |
+| Hundreds of detections | The coverage guard picks `full`. Render cost is flat (command files). |
+| DTS or TrueHD source | Codec table: FLAC in MKV. |
+| Output already exists | Error unless `--overwrite`; `--skip-existing` for batches. |
+| Run interrupted (Ctrl-C) | Partial output deleted. Caches keep the finished work. |
+| File smaller than 128 KiB | No OpenSubtitles hash; metadata search only. |
+| Network error or quota exhausted | Warning, then the next source, and eventually the fallback. |
+
+## 10. Security and privacy
+
+- **Network use.** Online lookups send the movie hash and file size, or title, year and episode derived from the file name, to the subtitle provider. Models are downloaded on first use. `offline = true` (`--offline`) turns off all network access:
+  - every network-backed subtitle provider, including those behind the subliminal adapter
+  - model downloads
+
+  A provider's own `enabled` switch turns off only that provider. `vbr subs` shows what would be sent.
+- **Secrets** come only from `${ENV}` expansion. They are never logged, and `config show` redacts them. `config check` warns if a readable config file contains a literal password.
+- **Subprocesses** run with argument lists and never through a shell. Paths get the `file:` prefix.
+- **Downloaded subtitles** are untrusted input. The tool caps their size, detects the encoding and parses them as text only. Archives from other providers are read in memory with size limits and never extracted to arbitrary paths.
+- **TLS** verification is always on, and the tool honours system proxy and CA settings.
+- **File access.** The tool writes only to the output location, its temp dir and its cache.
+
+## 11. Testing and evaluation
+
+- **Unit tests.**
+  - normalization and matching: wildcards, phrases, bracketed targets, masked tokens, allowlist, longest-match
+  - interval padding and merging (property tests with Hypothesis, e.g. "output is disjoint and covers every detection")
+  - sync fitting on synthetic pairs with noise, outliers and fps ratios
+  - window planning: minimum and maximum length, merging, coverage guard
+  - subtitle cleaning and ranking
+  - the OpenSubtitles hash (reference-implementation vectors)
+  - config precedence and `${ENV}` expansion
+  - command-file and filtergraph generation (golden files)
+  - the OpenSubtitles client, against mocked HTTP (respx): search, download, quota exhausted, 429
+- **Pipeline tests with fakes.** A `FakeTranscriber` returns scripted words per window, and a `FakeAudioSource` is used alongside it. Together they exercise strategy selection, confirmation, escalation and reports without models or FFmpeg.
+- **Media integration tests** (need FFmpeg). These reuse the prototype's method: render a synthetic clip, decode the result and measure tone energy in 2.5 ms blocks to verify mute and beep boundaries. They cover:
+  - timeline cases (MPEG-TS offset, late audio)
+  - 5.1 centre-channel beeps
+  - codec choice
+  - stream order, tags, dispositions and chapters preserved (checked with ffprobe on the output)
+- **ASR integration tests** (opt-in). A short speech fixture with known profanity timestamps, run with `tiny.en`. Detections must fall within ±300 ms.
+- **Evaluation set.** 20–30 annotated clips across genres, accents, music-heavy scenes and TV and film subtitles. Each clip has ground-truth profanity timestamps. The metrics are:
+  - recall (primary)
+  - precision
+  - boundary error
+  - seconds of audio transcribed
+  - wall time
+  
+  They are reported per strategy, model and prompt setting. This set decides the defaults marked "to be tuned" and gates releases.
+- **CI.** GitHub Actions runs ruff, mypy and pytest on Linux, macOS and Windows with Python 3.11–3.13. Linux also runs against FFmpeg 5.1, 6.1 and 7.x.
+
+## 12. Dependencies and packaging
+
+| Package | Purpose |
+|---|---|
+| faster-whisper | Speech recognition with word timestamps, Silero VAD, batched inference |
+| numpy | Audio buffers |
+| pysubs2, charset-normalizer | Subtitle parsing and encoding detection |
+| httpx | HTTP client for OpenSubtitles (timeouts, retries) |
+| guessit | Title, year, season and episode from file names |
+| rapidfuzz | Fuzzy text matching for sync and fidelity |
+| pydantic, platformdirs | Config schema, config and cache locations |
+| typer, rich | CLI and progress display |
+
+**Extras:**
+
+- `[gpu]`: CUDA 12 cuBLAS and cuDNN 9 wheels, as faster-whisper documents
+- `[sync]`: ffsubsync
+- `[align]`: whisperx
+- `[providers]`: subliminal
+- `[dev]`: pytest, hypothesis, respx, ruff, mypy
+
+**External:** FFmpeg and ffprobe 5.1 or later. The prototype ran on 6.1.1.
+
+**Packaging:** `pyproject.toml` (hatchling) with a `src/` layout and entry points `vbr` and `video-beep-remover`, distributed on PyPI. Installing with pipx is recommended. A container image with FFmpeg and CUDA may come later.
+
+## 13. Delivery plan
+
+| Milestone | Scope | Done when |
+|---|---|---|
+| M0 Skeleton | pyproject, CLI scaffold, config schema and loader, `config init/show/check`, `doctor` | The CLI installs, and config errors show TOML key paths. |
+| M1 Full-mode MVP | Probe, full-track audio, faster-whisper, matcher, intervals, renderer (beep and mute), JSON report, `--dry-run` | A test clip is censored correctly end to end, and media integration tests pass. |
+| M2 Local subtitles | Embedded and sidecar sources, parsing and cleaning, flagging, window planner, trusted sync check, confirmation and `on_unconfirmed`, strategy fallbacks | Targeted mode matches full-mode recall on the evaluation clips that have verbatim subtitles. |
+| M3 Online subtitles | OpenSubtitles client, hash, ranking, subtitle cache, untrusted sync with tracking and fps snapping, optional ffsubsync | Out-of-sync and wrong-fps fixtures are corrected, and quota errors fall back cleanly. |
+| M4 Complete v1 | `hybrid` (VAD), output subtitle censoring, EDL and review SRT, `render --report`, `other_audio_streams`, folder batch mode, span-based transcript cache | The v1 feature set is complete, and defaults are tuned on the evaluation set. |
+| M5 Polish | WhisperX backend, edge refinement, packaging and release, docs | Published to PyPI. |
+
+## 14. Alternatives considered
+
+- **Subtitle timing only, with no speech recognition.** Cues are 1–6 s long, so this would mute whole sentences. It survives only as the `cue` fallback.
+- **Forced alignment of subtitle text** (wav2vec2/CTC) instead of ASR inside windows. It is faster and very precise when subtitles are verbatim, but it fails on masked or paraphrased text. It may come back later as an optimization on the WhisperX backend.
+- **A dedicated keyword-spotting model.** It would need training for every word list. Whisper handles arbitrary lists.
+- **Censoring in Python** (piping decoded PCM through numpy). This is sample-accurate and allows smooth fades or custom sounds, but it pushes the entire decoded track through Python. The FFmpeg graph is already accurate to within 5 ms. This remains a possible future backend for sound effects.
+- **`enable=` timeline expressions** for mute and beep. They are the simplest option, but render time grew 75 % at 500 intervals and the expressions become huge. Replaced by `asendcmd` command files.
+- **YAML config.** Rejected because of implicit booleans in word lists and the extra dependency.
+
+## 15. Open questions
+
+1. Does the `initial_prompt = "auto"` priming reduce masked output without adding false positives? This is decided on the evaluation set, and so is the alternative of faster-whisper `hotwords`.
+2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present?
+3. Should the default strategy be `hybrid` or `targeted`? It depends on the measured VAD cost against the recall gained.
+4. OpenSubtitles consumer key: register a project key, as other open-source clients do, or require every user to register?
+5. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
+6. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
+7. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
+8. Custom sound effects (`action = "sound"`) and smooth edges, e.g. a staircase of 5 ms volume commands.
+9. An interactive review UI (`vbr review`, with ffplay previews)?
+
+## Appendix A. Prototype measurements
+
+Before writing this design, the FFmpeg parts were prototyped to check the key assumptions.
+
+**Setup.** FFmpeg 6.1.1 on a 4-vCPU Linux container. The test clip was a 10 s `testsrc2` video with a 440 Hz tone standing in for speech; the long test was 2 h of pink noise. The rendered audio was decoded to PCM, and 440 Hz and 1 kHz energy were measured in 2.5 ms blocks to find where the original sound stops and the beep starts. The requested spans were 2.000–2.500 s and 5.100–5.400 s.
+
+| Experiment | Result |
+|---|---|
+| `volume` + `enable` expression, codec-sized frames (AAC, 1024 samples) | Censored 2.005–2.518 s: boundaries snap to the 21 ms codec frames |
+| Same, with `asetnsamples=n=240` (5 ms frames) | 2.000–2.505 s |
+| `asendcmd` command file + `asetnsamples=n=240` | 2.000–2.500 s and 5.100–5.400 s: exact at 2.5 ms resolution |
+| Beep level at `volume 1` | Peak 0.125 (1/8 of full scale, −18 dBFS); `volume 0.25` measured 0.031 |
+| MPEG-TS input with `start_time` 31.38 s | Filter `t` and input `-ss` both measured from the container start; the censor landed at the requested media time |
+| MKV whose audio starts 0.479 s after the video | Plain full decode: sample 0 = 0.479 s (shift). With `aresample=async=1:first_pts=0`: sample 0 = 0 s. `-ss` window extraction was correct either way |
+| 5.1 AC-3, beep through `pan=5.1(side)\|FC=c0` | Original muted on all channels; tone present only in FC |
+| Re-encode 2 h stereo AAC, no censoring (baseline) | 127 s |
+| … + 50 intervals via `enable` expressions | 144 s (+13 %) |
+| … + 500 intervals via `enable` expressions | 222 s (+75 %) |
+| … + 500 intervals via `asendcmd` command files | 140 s (+10 %) |
+
+## Appendix B. References
+
+- faster-whisper: API, benchmarks, `BatchedInferencePipeline`, model names: <https://github.com/SYSTRAN/faster-whisper>
+- WhisperX (forced alignment): <https://github.com/m-bain/whisperX>
+- Whisper sometimes masks profanity: <https://github.com/openai/whisper/discussions/1534>
+- OpenSubtitles REST API: <https://opensubtitles.stoplight.io/docs/opensubtitles-api/>, and the reference client in subliminal: <https://github.com/Diaoul/subliminal/blob/main/src/subliminal/providers/opensubtitlescom.py>
+- subliminal (multi-provider subtitle search): <https://github.com/Diaoul/subliminal>
+- ffsubsync (subtitle synchronization): <https://github.com/smacke/ffsubsync>
+- FFmpeg filters (`asendcmd`, `volume`, `asetnsamples`, `amix`, `sine`, `pan`, timeline editing): <https://ffmpeg.org/ffmpeg-filters.html>
+- FFmpeg 7 deprecation of `-filter_complex_script` in favour of `-/filter_complex`: <https://patchwork.ffmpeg.org/project/ffmpeg/patch/20240117092233.8503-5-anton@khirnov.net/>
+- Kodi EDL format (action 1 = mute): <https://kodi.wiki/view/Edit_decision_list>
