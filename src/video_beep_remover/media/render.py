@@ -61,8 +61,12 @@ class StreamPlan:
         return [a.stream for a in self.actions if a.action == "censor"]
 
     def drop(self, index: int, note: str) -> "StreamPlan":
-        """The same plan without input stream `index`, and a note saying why."""
-        return StreamPlan(tuple(a for a in self.actions if a.stream.index != index), (*self.notes, note))
+        """The same plan without input stream `index`, and a note saying why, which replaces any
+        earlier note about that stream."""
+        dropped = [a.stream for a in self.actions if a.stream.index == index]
+        about = [f"stream {stream.describe()}" for stream in dropped]
+        notes = tuple(n for n in self.notes if not any(text in n for text in about))
+        return StreamPlan(tuple(a for a in self.actions if a.stream.index != index), (*notes, note))
 
 
 def plan_streams(

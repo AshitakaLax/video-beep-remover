@@ -28,6 +28,7 @@ class Track:
     title: str | None = None
     default: bool = False
     delay: float = 0.0
+    noise_seed: int | None = None  # white noise instead of the tone: unlike a tone, it matches only itself
 
 
 def make_clip(
@@ -53,12 +54,12 @@ def make_clip(
     for track in tracks:
         if track.delay:
             args += ["-itsoffset", str(track.delay)]
-        args += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"sine=frequency={track.frequency}:sample_rate={sample_rate}:duration={duration}",
-        ]
+        source = (
+            f"anoisesrc=seed={track.noise_seed}:amplitude=0.2:sample_rate={sample_rate}:duration={duration}"
+            if track.noise_seed is not None
+            else f"sine=frequency={track.frequency}:sample_rate={sample_rate}:duration={duration}"
+        )
+        args += ["-f", "lavfi", "-i", source]
         maps += ["-map", f"{index}:a"]
         index += 1
     if subtitles is not None:

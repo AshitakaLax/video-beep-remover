@@ -6,7 +6,8 @@ import respx
 from typer.testing import CliRunner
 
 from video_beep_remover import __version__
-from video_beep_remover.cli import app, collect_inputs
+from video_beep_remover.batch import collect_inputs
+from video_beep_remover.cli import app
 from video_beep_remover.config.schema import Config
 from video_beep_remover.errors import UsageError
 
@@ -61,8 +62,13 @@ def test_collect_inputs_finds_videos_in_folders(tmp_path: Path) -> None:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
-    assert [p.name for p in collect_inputs([tmp_path], recursive=False)] == ["a.MP4", "b.mkv"]
-    assert [p.name for p in collect_inputs([tmp_path], recursive=True)] == ["a.MP4", "b.mkv", "d.mkv"]
+    assert [i.path.name for i in collect_inputs([tmp_path], recursive=False)] == ["a.MP4", "b.mkv"]
+    found = collect_inputs([tmp_path, tmp_path / "b.mkv"], recursive=True)
+    assert [(i.path.name, i.from_folder) for i in found] == [
+        ("a.MP4", True),
+        ("b.mkv", False),
+        ("d.mkv", True),
+    ]
     try:
         collect_inputs([tmp_path / "sub" / "none"], recursive=False)
     except UsageError as exc:

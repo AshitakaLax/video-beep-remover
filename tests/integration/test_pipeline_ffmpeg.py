@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
-from helpers import FakeTranscriber, StrictUI, decode, make_clip, tone_gain, words
+from helpers import FakeTranscriber, StrictUI, Track, decode, make_clip, tone_gain, words
 from video_beep_remover.config import load_config
 from video_beep_remover.errors import UsageError, VbrError
 from video_beep_remover.media.ffmpeg import FFmpeg
@@ -162,3 +163,29 @@ def test_render_rejects_unusable_intervals(tmp_path: Path, intervals: Any, messa
     report.write_text(json.dumps({"intervals": intervals} if intervals is not None else {}), "utf-8")
     with pytest.raises(UsageError, match=message):
         pipeline(tmp_path).render_report(source, report, RunOptions())
+
+
+def test_same_language_audio_is_muted_only_if_it_carries_the_same_dialogue(tmp_path: Path) -> None:
+    tracks = [
+        Track(noise_seed=1, default=True),  # analysed
+        Track(noise_seed=1, title="Stereo"),  # the same audio: a downmix
+        Track(noise_seed=2, title="Mislabelled dub"),  # other dialogue, also tagged English
+        Track(noise_seed=1, language="fra"),  # another language: dropped whatever it carries
+    ]
+    source = make_clip(tmp_path / "movie.mkv", tracks=tracks)
+    result = pipeline(tmp_path).process(source, RunOptions())
+    report = json.loads((tmp_path / "movie.clean.vbr.json").read_text("utf-8"))
+    checks = {c["stream"]: c for c in report["output"]["audio_checks"]}
+    assert checks[2]["same_dialogue"] and checks[2]["correlation"] > 0.9
+    assert not checks[3]["same_dialogue"] and checks[3]["correlation"] < 0.2
+    assert 4 not in checks
+    assert result.output is not None
+    kept = probe(FFmpeg(), result.output).audio_streams
+    assert [s.title for s in kept] == [None, "Stereo"]
+    assert any(
+        "dropped audio stream #3" in note and "does not carry the dialogue" in note for note in result.notes
+    )
+    assert not any("#3" in note and "gets the same mutes" in note for note in result.notes)
+    for stream in ("0:a:0", "0:a:1"):
+        samples = decode(result.output, stream)
+        assert float(np.sqrt(np.mean(samples[int(2.0 * 48_000) : int(2.4 * 48_000)] ** 2))) < 1e-3

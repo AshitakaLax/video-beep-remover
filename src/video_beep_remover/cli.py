@@ -15,6 +15,7 @@ from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, T
 from rich.table import Table
 
 from video_beep_remover import __version__
+from video_beep_remover.batch import Outcome, collect_inputs, run_batch, skip_outputs
 from video_beep_remover.config.loader import (
     LoadedConfig,
     cache_root,
@@ -36,7 +37,6 @@ from video_beep_remover.errors import (
     UsageError,
     VbrError,
 )
-from video_beep_remover.media.probe import VIDEO_SUFFIXES
 from video_beep_remover.pipeline import FileResult, Pipeline, RunOptions
 from video_beep_remover.pipeline import Progress as ProgressFn
 
@@ -115,26 +115,6 @@ def _fail(error: VbrError) -> typer.Exit:
     return typer.Exit(error.exit_code)
 
 
-def collect_inputs(paths: list[Path], recursive: bool) -> list[Path]:
-    files: list[Path] = []
-    for path in paths:
-        if path.is_dir():
-            found = path.rglob("*") if recursive else path.iterdir()
-            files += sorted(
-                p
-                for p in found
-                if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES and ".partial." not in p.name
-            )
-        elif path.is_file():
-            files.append(path)
-        else:
-            raise UsageError(f"not found: {path}")
-    unique = list(dict.fromkeys(p.resolve() for p in files))
-    if not unique:
-        raise UsageError("no video files found")
-    return unique
-
-
 def _overrides(**flags: Any) -> dict[str, Any]:
     keys = {
         "strategy": "analysis.strategy",
@@ -196,7 +176,9 @@ def _run(
     ui = ConsoleUI(quiet=quiet)
     try:
         loaded = load_config(config, overrides=_overrides(**flags))
-        files = collect_inputs(inputs, flags.get("recursive", False))
+        files, skipped = skip_outputs(
+            collect_inputs(inputs, flags.get("recursive", False)), loaded.config.output.path, options.output
+        )
         many = len(files) > 1
         if many and options.output is not None and options.output.exists() and not options.output.is_dir():
             raise UsageError("with several inputs, --output must be a directory")
@@ -207,19 +189,26 @@ def _run(
     except VbrError as exc:
         raise _fail(exc) from exc
 
-    failures = 0
-    for path in files:
-        try:
-            result = pipeline.process(path, options, many=many)
-        except DependencyError as exc:
-            raise _fail(exc) from exc  # would fail for every file: stop the batch
-        except VbrError as exc:
-            if not many:
-                raise _fail(exc) from exc
-            failures += 1
-            ui.error(f"{path.name}: {exc}")
-            continue
+    for result in skipped:
         _print_result(ui, result)
+    failures = 0
+
+    def report(outcome: Outcome) -> None:
+        nonlocal failures
+        for kind, message in outcome.messages:
+            (ui.warn if kind == "warn" else ui.info)(f"{outcome.path.name}: {message}")
+        if outcome.error is not None:
+            if not many:
+                raise _fail(outcome.error)
+            failures += 1
+            ui.error(f"{outcome.path.name}: {outcome.error}")
+        elif outcome.result is not None:
+            _print_result(ui, outcome.result)
+
+    try:
+        run_batch(pipeline, files, options, report)
+    except DependencyError as exc:
+        raise _fail(exc) from exc  # would fail for every file: the batch stops
     if failures:
         ui.error(f"{failures} of {len(files)} files failed")
         raise typer.Exit(EXIT_PARTIAL)

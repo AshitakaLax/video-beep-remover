@@ -31,10 +31,12 @@ from video_beep_remover.media.audio import (
     AudioSource,
     SeekingAudioSource,
     decode_track,
+    read_window,
 )
+from video_beep_remover.media.dialogue import same_dialogue
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import MediaInfo, StreamInfo, probe, select_audio_stream
-from video_beep_remover.media.render import CENSORED_TAG, RenderResult, plan_streams, render
+from video_beep_remover.media.render import CENSORED_TAG, RenderResult, StreamPlan, plan_streams, render
 from video_beep_remover.models import CensorInterval, Detection
 from video_beep_remover.report import (
     SCHEMA_VERSION,
@@ -481,6 +483,10 @@ class Pipeline:
         cfg = self.config
         assert job.output is not None
         plan = plan_streams(job.info, job.stream, cfg.output, cfg.analysis.language, cfg.lexicon.language)
+        audio_checks: list[dict[str, Any]] = []
+        if cfg.output.other_audio_streams == "auto" and job.intervals:
+            with ui.status("Comparing the other audio streams"):
+                plan, audio_checks = self._check_other_audio(job, plan)
         subtitles = censor_streams(
             self.ff, job.info, plan, job.workdir, self.lexicon, cfg.output.subtitle_mask, ui
         )
@@ -514,6 +520,7 @@ class Pipeline:
             "muted_spans": [interval_dict(i) for i in rendered.intervals],
             "verified_spans": rendered.verified_spans,
             "timeline_shift": round(rendered.timeline_shift, 3),
+            "audio_checks": audio_checks,
             "subtitles": subtitles.report,
             "subtitle_copy": None,
             "notes": list(plan.notes),
@@ -538,6 +545,36 @@ class Pipeline:
                 ui.warn(f"no censored copy of the subtitles {path.name}: {exc}")
         if job.report is not None:
             job.report["output"] = output
+
+    def _check_other_audio(self, job: Job, plan: StreamPlan) -> tuple[StreamPlan, list[dict[str, Any]]]:
+        """other_audio_streams = "auto" gives a stream in the analysed language the same mutes; drop it
+        instead if it does not carry the same dialogue (DESIGN.md §6.11)."""
+
+        def read(index: int, start: float, end: float) -> Audio:
+            return read_window(self.ff, job.source, index, start, end - start)
+
+        checks: list[dict[str, Any]] = []
+        for action in plan.actions:
+            stream = action.stream
+            if stream.kind != "audio" or stream.index == job.stream.index or action.action != "censor":
+                continue
+            check = same_dialogue(read, job.stream.index, stream.index, job.intervals, job.info.duration)
+            checks.append(
+                {
+                    "stream": stream.index,
+                    "same_dialogue": check.same,
+                    "correlation": None if check.correlation is None else round(check.correlation, 3),
+                    "lag": None if check.lag is None else round(check.lag, 3),
+                    "compared_spans": check.compared,
+                }
+            )
+            if not check.same:
+                plan = plan.drop(
+                    stream.index,
+                    f"dropped audio stream {stream.describe()}: it does not carry the dialogue of the "
+                    f"analysed stream ({check.describe()}), so the mutes would miss its words",
+                )
+        return plan, checks
 
     def _write_outputs(self, job: Job, ui: UI) -> None:
         cfg, options, result = self.config, job.options, job.result
@@ -564,6 +601,10 @@ class Pipeline:
                 shift = rendered.timeline_shift if rendered else 0.0
                 write_text(review, review_srt(spans, job.detections, shift=shift))
                 result.review = review
+
+    def discard(self, job: Job) -> None:
+        """Delete a prepared job's temporary files without rendering it."""
+        self._cleanup(job, self.ui)
 
     def _cleanup(self, job: Job, ui: UI) -> None:
         if job.options.keep_temp:
