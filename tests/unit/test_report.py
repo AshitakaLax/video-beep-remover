@@ -61,5 +61,5 @@ def test_config_hash_ignores_secrets_but_not_settings(tmp_path) -> None:  # type
 
     base = hashed(**{"subtitles.opensubtitles.api_key": "one"})
     assert base == hashed(**{"subtitles.opensubtitles.api_key": "two"})
-    assert base != hashed(**{"subtitles.opensubtitles.api_key": "one", "censor.pad_after_ms": 200})
+    assert base != hashed(**{"subtitles.opensubtitles.api_key": "one", "censor.pad_after_ms": 250})
     assert len(base) == 12

@@ -11,7 +11,7 @@ Whisper speech recognition (via [faster-whisper](https://github.com/SYSTRAN/fast
 ```
 subtitles  →  cue 812 (01:13:02.0–01:13:05.0): "What the hell was that?"
 audio      →  transcribe 01:13:00.5–01:13:06.5 only  →  "hell" at 01:13:03.41–01:13:03.78
-ffmpeg     →  mute 01:13:03.29–01:13:03.90 · re-encode the audio track · copy video, subtitles, chapters
+ffmpeg     →  mute 01:13:03.29–01:13:03.98 · re-encode the audio track · copy video, subtitles, chapters
 ```
 
 ## 2. Goals and non-goals
@@ -488,7 +488,7 @@ The matcher runs over each window's words and produces detections: heard text, t
 
 Each detection `[start, end]` becomes an interval as follows:
 
-1. Widen it by `pad_before_ms` and `pad_after_ms`, because Whisper's word timestamps are approximate.
+1. Widen it by `pad_before_ms` (120 ms) and `pad_after_ms` (200 ms), because Whisper's word timestamps are approximate. Its word ends come early: 90–120 ms in the median on the evaluation set, up to 230 ms (Appendix C).
 2. Extend it symmetrically to `min_duration_ms`.
 3. Clamp it to `[0, duration]`.
 4. Sort the intervals and merge any that are less than `merge_gap_ms` apart.
@@ -509,7 +509,7 @@ For each censored stream, the renderer writes one **command file** into a job te
 
 ```
 4371.050-4383.290 [enter] afade@mute0 t out, [enter] afade@mute0 st 4383.290, [enter] afade@mute0 d 0.010;
-4383.300-4383.890 [enter] afade@mute0 t in, [enter] afade@mute0 st 4383.890, [enter] afade@mute0 d 0.010;
+4383.300-4383.970 [enter] afade@mute0 t in, [enter] afade@mute0 st 4383.970, [enter] afade@mute0 d 0.010;
 ```
 
 Each line fires once, when the first audio frame that starts inside its time range arrives. The ranges are the stable stretches where the old and new settings give the same gain: full volume between intervals, silence inside one. So it doesn't matter which frame delivers a command.
@@ -602,8 +602,8 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
   "detections": [{"start": 4383.41, "end": 4383.78, "heard": "hell", "term": "hell", "category": "mild",
                   "confidence": 0.94, "source": "asr", "cue": 812}],
   "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
-  "intervals": [{"start": 4383.29, "end": 4383.90}],
-  "output": {"path": "The Movie (2019).clean.mkv", "muted_spans": [{"start": 4383.29, "end": 4383.90}],
+  "intervals": [{"start": 4383.29, "end": 4383.98}],
+  "output": {"path": "The Movie (2019).clean.mkv", "muted_spans": [{"start": 4383.29, "end": 4383.98}],
              "verified_spans": 44, "timeline_shift": 0.0,
              "audio_checks": [{"stream": 2, "same_dialogue": true, "correlation": 0.97, "lag": 0.0}],
              "subtitles": [{"stream": 4, "codec": "subrip", "language": "eng", "masked": 45}],
@@ -617,7 +617,7 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
 **EDL** (`--edl`). A mute list in the Kodi and MPlayer format, written next to the input as `<input stem>.edl`. Each line is `start end 1`, where action 1 means mute:
 
 ```
-4383.29	4383.90	1
+4383.29	4383.98	1
 ```
 
 Players that support EDL can mute the *original* file at playback time, with no rendering at all. Because the tool only mutes, the EDL describes the same edits as the cleaned file, apart from the fades.
@@ -799,6 +799,8 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | M4 Complete v1 | Output subtitle censoring, review SRT, `render --report`, `other_audio_streams`, folder batch mode, span-based transcript cache | The v1 feature set is complete, and defaults are tuned on the evaluation set. |
 | M5 Polish | WhisperX backend, edge refinement, packaging and release, docs | Published to PyPI. |
 
+M0 to M4 are implemented. M4's defaults were checked on a synthetic evaluation set, which changed `pad_after_ms` and fixed the sync fit (Appendix C); tuning them on real film clips is still to do.
+
 ## 14. Alternatives considered
 
 - **Subtitle timing only, with no speech recognition.** Cues are 1–6 s long, so this would mute whole sentences. It survives only as the `cue` fallback.
@@ -820,7 +822,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 **Still open**
 
 1. Does the `initial_prompt = "auto"` priming reduce masked output without adding false positives? This is decided on the evaluation set, and so is the alternative of faster-whisper `hotwords`.
-2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present?
+2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present? On the synthetic set, word ends came 90–120 ms early in the median and up to 230 ms early, so `pad_after_ms` went from 120 to 200 ms; starts came early too (Appendix C). Real speech should confirm both values.
 3. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
 4. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
 5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
@@ -898,4 +900,39 @@ Before writing this design, the FFmpeg parts were prototyped to check the key as
 
 ## Appendix C. Evaluation on the synthetic set
 
-`scripts/evaluate.py` over the set that `scripts/make_synthetic_set.py` builds (§11): eight clips, 35 minutes, 48 annotated listed words, on a 4-vCPU container without a GPU. The results are being measured and will be added here.
+**Setup.** `scripts/evaluate.py` over the set that `scripts/make_synthetic_set.py` builds (§11): eight clips, 35 minutes, 48 annotated listed words. Each clip is about 4.4 minutes, with a flagged line every 20 s or so, far denser than a film. The machine was a 4-vCPU container without a GPU, so Whisper ran int8 on the CPU with the default models: small.en for `full`, large-v3-turbo for windows, and base.en for anchors.
+
+**Metrics.** Recall counts a listed word muted over at least 95 % of its length; partial recall, at least half. Precision is the share of detections that overlap a listed word. Errors are detected minus annotated. Extra, audio and time are per minute of video.
+
+**With the tuned defaults** (`pad_after_ms = 200`):
+
+| Strategy | Recall | Partial | Precision | Start error, median / worst | End error, median / worst | Extra | Audio transcribed | Time |
+|---|---|---|---|---|---|---|---|---|
+| `full` | 95.8 % | 95.8 % | 100 % | −77 / −217 ms | −117 / −226 ms | 0.4 s | 60 s | 8.8 s |
+| `targeted` | 87.5 % | 87.5 % | 100 % | −90 / −249 ms | −88 / −226 ms | 0.4 s | 16 s | 7.5 s |
+| `hybrid` | 91.7 % | 91.7 % | 100 % | −90 / −249 ms | −88 / −226 ms | 0.4 s | 16 s | see below |
+
+`hybrid` ran with its windows already cached by `targeted`, so its time is not comparable (1.3 s per minute). Before the sync fixes, when it still fell back to `full` on one clip, it took 10.4 s per minute without the cache.
+
+**Padding after the word.** `pad_after_ms` swept with the transcripts cached. At 200 ms every word that was detected at all is fully muted; more changes nothing here:
+
+| `pad_after_ms` | `full` | `targeted` | `hybrid` | Extra per minute |
+|---|---|---|---|---|
+| 120 (the earlier default) | 75.0 % | 66.7 % | 68.8 % | 0.3 s |
+| 160 | 93.8 % | 83.3 % | 87.5 % | 0.4 s |
+| 200 (the new default) | 95.8 % | 87.5 % | 91.7 % | 0.4 s |
+| 250 | 95.8 % | 87.5 % | 91.7 % | 0.5 s |
+| 300 | 95.8 % | 87.5 % | 91.7 % | 0.5 s |
+
+**Findings.**
+
+1. **Word ends come early.** Whisper places the end of a word 90–120 ms early in the median and up to 230 ms early. With 120 ms of padding after, a quarter of the words kept an audible tail, hence the new default of 200 ms. Starts come early too, by 80–90 ms, so the 120 ms before a word leaves plenty of margin. On real speech the next word may start right away, and 200 ms can clip its onset; the real evaluation set should confirm the value (open question 2).
+2. **No false positives.** Hint words ("freaking", "heck") and near-misses ("hello", "shell", "assess", "class") were never muted.
+3. **What each strategy misses is what §7 says it misses.** All misses left are whole words:
+   - `targeted` and `hybrid` cannot find a word the subtitles soften into an ordinary word ("nonsense", "creep", "fool" in the `softened` clip); a hint word ("heck", "frick") is caught.
+   - `targeted` also misses lines the subtitles leave out, which `hybrid` catches.
+   - small.en, used by `full` on the CPU, did not recognize "damn" in two of the voices; large-v3-turbo in the windows did.
+4. **Speed on a CPU.** The windows cover a quarter of this dense set, and running large-v3-turbo on them costs about as much as small.en on everything. On a film, where flagged lines are minutes apart, the windows cover a few percent (§8.1). On a GPU both use large-v3-turbo.
+5. **The sync check, fixed on the way (§6.6).** The first run rejected subtitles 1.7 s late under `hybrid` (timing error 0.53 s) and accepted them under `targeted` with a scale of 1.0026, when the truth was a plain offset. Anchor words that follow a pause were placed up to 2 s early, and the fit followed them to a scale no real mismatch produces. With both fixed, the same clip passes with errors of 0.05 and 0.09 s.
+
+**Not measured here.** Real soundtracks, accents and subtitles; the prompt setting (open question 1); `fade_ms` on real speech (open question 6); the dialogue check's threshold (§6.11); and GPU timings. These need a set of real annotated clips.

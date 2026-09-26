@@ -136,7 +136,7 @@ $ python scripts/evaluate.py /tmp/vbr-eval --set transcription.device=cpu
 $ python scripts/evaluate.py /tmp/vbr-eval --set censor.pad_after_ms=200 --cache /tmp/vbr-eval-cache
 ```
 
-Synthetic speech is far cleaner than a film's soundtrack, so this set catches regressions and systematic effects but can't tune the defaults for real films. Results are in [Appendix C of the design](docs/DESIGN.md#appendix-c-evaluation-on-the-synthetic-set).
+Synthetic speech is far cleaner than a film's soundtrack, so this set catches regressions and systematic effects but can't tune the defaults for real films. On it, every strategy mutes every word it detects, with no false positives; `hybrid` fully mutes 92 % of the listed words, and what it misses are words the subtitles softened into ordinary words. It also showed that Whisper places word ends up to 230 ms early, which is why `censor.pad_after_ms` is 200. Details are in [Appendix C of the design](docs/DESIGN.md#appendix-c-evaluation-on-the-synthetic-set).
 
 ## License
 

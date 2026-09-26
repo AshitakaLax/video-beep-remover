@@ -50,7 +50,7 @@ def write(tmp_path: Path, text: str) -> Path:
 def test_user_file_is_merged_over_defaults(tmp_path: Path) -> None:
     cfg = load_config(write(tmp_path, "[censor]\npad_before_ms = 50\n"), env={}).config
     assert cfg.censor.pad_before_ms == 50
-    assert cfg.censor.pad_after_ms == 120
+    assert cfg.censor.pad_after_ms == 200
     assert "strong" in cfg.lexicon.categories
 
 

@@ -47,9 +47,9 @@ def test_clean_mutes_detections_and_writes_report_and_edl(tmp_path: Path) -> Non
     assert report["subtitle_candidates"] == []
     [detection] = report["detections"]
     assert (detection["heard"], detection["category"]) == ("damn", "mild")
-    assert report["intervals"] == [{"start": 1.88, "end": 2.52}]
+    assert report["intervals"] == [{"start": 1.88, "end": 2.6}]  # 120 ms before the word, 200 ms after
     assert report["output"]["verified_spans"] == 1
-    assert (tmp_path / "movie.edl").read_text("utf-8") == "1.880\t2.520\t1\n"
+    assert (tmp_path / "movie.edl").read_text("utf-8") == "1.880\t2.600\t1\n"
 
 
 def test_scan_writes_only_a_report(tmp_path: Path) -> None:
@@ -121,12 +121,12 @@ def test_review_subtitles_name_each_muted_span(tmp_path: Path) -> None:
     run = pipeline(tmp_path)
     scanned = run.process(source, RunOptions(dry_run=True, review_srt=True))
     assert scanned.review == tmp_path / "movie.review.srt"
-    assert scanned.review.read_text("utf-8") == "1\n00:00:01,880 --> 00:00:02,520\n[muted] damn\n"
+    assert scanned.review.read_text("utf-8") == "1\n00:00:01,880 --> 00:00:02,600\n[muted] damn\n"
 
     cleaned = run.process(source, RunOptions(review_srt=True))
     assert cleaned.review == tmp_path / "movie.clean.review.srt"
     shift = json.loads((tmp_path / "movie.clean.vbr.json").read_text("utf-8"))["output"]["timeline_shift"]
-    start, end = (f"00:00:0{t + shift:.3f}".replace(".", ",") for t in (1.88, 2.52))
+    start, end = (f"00:00:0{t + shift:.3f}".replace(".", ",") for t in (1.88, 2.6))
     assert cleaned.review.read_text("utf-8") == f"1\n{start} --> {end}\n[muted] damn\n"
 
 

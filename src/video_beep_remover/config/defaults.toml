@@ -68,7 +68,7 @@ terms = ["freak*", "frick*", "friggin*", "heck", "darn*", "shoot", "crud", "effi
 # ---------------------------------------------------------------------------
 [censor]
 pad_before_ms = 120                 # widen each detected word a little on both sides
-pad_after_ms = 120
+pad_after_ms = 200                  # more after: Whisper places word ends early (DESIGN.md Appendix C)
 min_duration_ms = 250               # very short gaps sound like glitches
 merge_gap_ms = 250                  # join muted spans closer than this
 fade_ms = 10                        # smooth fade at each edge, inside the padding; avoids clicks
