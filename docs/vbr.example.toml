@@ -13,6 +13,7 @@
 # See docs/DESIGN.md §4 for the full schema.
 
 config_version = 1
+offline = false                     # true = no network: skip every online subtitle provider, never download models
 
 # ---------------------------------------------------------------------------
 # Word list: what gets censored
@@ -106,7 +107,7 @@ trusted_search_s = 3.0              # embedded, sidecar and hash-matched subtitl
 untrusted_search_s = 20.0           # everything else
 min_matched_ratio = 0.5
 max_error_s = 0.5
-min_fidelity = 0.6                  # below this, subtitles are too paraphrased to guide the search
+min_fidelity = 0.6                  # 0-1; below this, subtitles are too paraphrased to guide the search
 ffsubsync = "fallback"              # "never" | "fallback" (needs the [sync] extra)
 
 [transcription]

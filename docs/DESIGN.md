@@ -70,7 +70,7 @@ $ vbr clean "The Movie (2019).mkv"
 | `--strategy hybrid\|targeted\|full` | `analysis.strategy` | See §7. |
 | `--no-fallback` | `analysis.fallback_to_full = false` | Fail instead of transcribing everything. |
 | `--subtitles PATH` | n/a | Use this file and skip the search. It is treated as trusted. |
-| `--offline` | `subtitles.opensubtitles.enabled = false` | No network access at all. |
+| `--offline` | `offline = true` | No network access at all: every network-backed subtitle provider is skipped and models load only from the local cache (§10). |
 | `--categories strong,mild` | `lexicon.categories.*.enabled` | Enables exactly these categories. |
 | `--model NAME`, `--device cpu\|cuda` | `transcription.model`, `.device` | |
 | `--language CODE`, `--audio-stream N` | `analysis.language`, `.audio_stream` | |
@@ -122,6 +122,7 @@ That file is deep-merged over the packaged defaults (`defaults.toml`, which is t
 
 | Section | Controls |
 |---|---|
+| top level: `offline` | No network access at all (§10) |
 | `[lexicon]`, `[lexicon.categories.<name>]`, `[lexicon.hints]` | What to censor: terms, allowlist, masked-word detection, per-category `enabled`/`action`, subtitle hint words |
 | `[censor]`, `[censor.beep]` | How it sounds: beep or mute, padding, minimum length, merging, tone frequency, level and channels |
 | `[analysis]`, `.targeted`, `.sync` | Strategy and fallback, audio stream, spoken language, window planning, sync and fidelity thresholds |
@@ -282,6 +283,7 @@ Each stage depends on a small `Protocol`, so backends can be swapped and tests c
 ```python
 class SubtitleProvider(Protocol):
     name: str
+    network: bool                     # True for online providers; all of them are skipped when offline
     def find(self, media: MediaInfo, languages: Sequence[str]) -> list[SubtitleCandidate]: ...
     def fetch(self, candidate: SubtitleCandidate) -> SubtitleDocument: ...
 
@@ -328,7 +330,7 @@ Windows, words, intervals and synced cue times are all seconds on the **media ti
 
 ### 6.3 Finding subtitles
 
-Sources are tried in the configured order. Acquisition stops at the first candidate that passes the sync check (§6.6). Within a source, candidates are ranked.
+Sources are tried in the configured order. Acquisition stops at the first candidate that passes the sync check (§6.6). Within a source, candidates are ranked. With `offline = true`, every provider that declares `network = True` is skipped, whatever its own `enabled` setting. That covers OpenSubtitles and every provider behind the subliminal adapter.
 
 | Source | How | Trust |
 |---|---|---|
@@ -402,9 +404,9 @@ This check maps subtitle time to media time, `t_media = scale · t_sub + offset`
    - Anchors are processed in time order, and the prediction is refitted after every match. This tracking keeps a frame-rate drift inside the window: 25 vs 23.976 fps is 4.3 %, or about 2.5 minutes per hour.
    - If the candidate's `fps` differs from the video's frame rate by a standard ratio, that ratio is applied up front.
 3. **Transcription.** Transcribe the anchor windows with the small `anchor_model` (`base.en`), with word timestamps.
-4. **Matching.** Find the cue text in the recognized words with rapidfuzz: slide a token window and require a ratio of at least 75. Each match yields a pair (cue start, word start).
+4. **Matching.** Find the cue text in the recognized words with rapidfuzz: slide a token window and require a ratio of at least 75 (rapidfuzz scores run from 0 to 100). Each match yields a pair (cue start, word start).
 5. **Fit.** With three or more pairs, compute a Theil–Sen slope. If it is within 0.1 % of a standard ratio, snap it to that ratio: 1, 25/23.976, 25/24, 24/23.976, 30/29.97, or the inverse of any of them. The offset is the median residual. With two pairs, fit an offset only. The error is the median absolute residual.
-6. **Fidelity.** Take the median `token_sort_ratio` between each anchor's text and the words heard.
+6. **Fidelity.** Take the median `token_sort_ratio` between each anchor's text and the words heard, divided by 100. Fidelity is therefore a 0–1 fraction, on the same scale as `min_fidelity` and the report.
 7. **Decision.** The check passes if `matched ≥ min_matched_ratio`, `error ≤ max_error_s` and `fidelity ≥ min_fidelity`. If it fails:
    - Run [ffsubsync](https://github.com/smacke/ffsubsync), if installed. It uses speech-activity correlation, corrects frame-rate mismatches and handles offsets up to 60 s by default. Then check again.
    - Otherwise try the next candidate.
@@ -447,6 +449,7 @@ The default backend is faster-whisper.
 - **Batching.** On GPU, windows are packed into one buffer and sent to `BatchedInferencePipeline.transcribe(buffer, clip_timestamps=[{"start": s, "end": e}, ...], word_timestamps=True)`. The clip times are in seconds and relative to the buffer. Times map back with `t_media = window.start + (t_buffer − window.buffer_offset)`. On CPU, windows are transcribed one after another.
 - **Profanity spelling.** Whisper sometimes writes profanity masked, e.g. "s\*\*\*" ([openai/whisper#1534](https://github.com/openai/whisper/discussions/1534)). The masked-token rule catches that. In addition, `initial_prompt = "auto"` primes the decoder with a short uncensored sentence built from enabled terms, which pushes it toward verbatim spelling. The benchmark must show this does not add false positives before the default ships (open question 1).
 - **Window edges.** Words within 0.3 s of a window edge are dropped as unreliable, unless the edge is the start or end of the file. Windows are padded so flagged cues sit well inside them.
+- **Model files.** Models are downloaded from Hugging Face on first use and cached. With `offline = true` they load with `local_files_only=True`. A model missing from the cache is then an error (exit code 3), not a download.
 - **Optional alignment.** The `whisperx` backend adds wav2vec2 forced alignment for tighter word boundaries. Default alignment models cover English, French, German, Spanish and Italian.
 
 ### 6.9 Matching and confirmation
@@ -672,7 +675,11 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 
 ## 10. Security and privacy
 
-- **Network use.** Online lookups send the movie hash and file size, or title, year and episode derived from the file name, to the subtitle provider. `--offline` and each provider's `enabled` switch turn this off, and `vbr subs` shows what would be sent.
+- **Network use.** Online lookups send the movie hash and file size, or title, year and episode derived from the file name, to the subtitle provider. Models are downloaded on first use. `offline = true` (`--offline`) turns off all network access:
+  - every network-backed subtitle provider, including those behind the subliminal adapter
+  - model downloads
+
+  A provider's own `enabled` switch turns off only that provider. `vbr subs` shows what would be sent.
 - **Secrets** come only from `${ENV}` expansion. They are never logged, and `config show` redacts them. `config check` warns if a readable config file contains a literal password.
 - **Subprocesses** run with argument lists and never through a shell. Paths get the `file:` prefix.
 - **Downloaded subtitles** are untrusted input. The tool caps their size, detects the encoding and parses them as text only. Archives from other providers are read in memory with size limits and never extracted to arbitrary paths.
