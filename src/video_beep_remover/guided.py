@@ -13,7 +13,7 @@ from typing import Any
 from video_beep_remover.asr.base import Clip, Transcriber
 from video_beep_remover.asr.cache import Transcript, TranscriptStore
 from video_beep_remover.asr.faster_whisper import ModelChoice
-from video_beep_remover.asr.vad import Regions, SpeechDetector, trim_to_speech
+from video_beep_remover.asr.vad import Regions, SpeechDetector, snap_to_speech, trim_to_speech
 from video_beep_remover.config.schema import Config
 from video_beep_remover.detect.confirm import (
     attribute,
@@ -177,16 +177,19 @@ def anchor_transcriber(ctx: Context, audio: AudioSource) -> Callable[[float, flo
             return list(cached.words)
         if model is None:
             _, model = ctx.transcriber("anchor")
-        clip, clean_start, clean_end = trim_to_speech(Clip(start, audio.read(start, end)), ctx.detect_speech)
-        words = (
-            model.transcribe([clip], language=language, prompt=None)[0] if clip.duration >= MIN_CLIP_S else []
-        )
-        if store:
-            store.add_window(
-                start,
-                end,
-                Transcript(clip.start, clip.start + clip.duration, tuple(words), clean_start, clean_end),
+        trimmed = trim_to_speech(Clip(start, audio.read(start, end)), ctx.detect_speech)
+        clip = trimmed.clip
+        words: list[Word] = []
+        if clip.duration >= MIN_CLIP_S:
+            # An anchor's first word decides its time, and an anchor window holds several lines.
+            words = snap_to_speech(
+                model.transcribe([clip], language=language, prompt=None)[0], trimmed.speech
             )
+        if store:
+            transcript = Transcript(
+                clip.start, clip.start + clip.duration, tuple(words), trimmed.clean_start, trimmed.clean_end
+            )
+            store.add_window(start, end, transcript)
         return words
 
     return transcribe
@@ -366,7 +369,7 @@ def transcribe_windows(
                 trim_to_speech(Clip(start, a), ctx.detect_speech)
                 for (_, start, _), a in zip(todo, samples, strict=True)
             ]
-        clips = [clip for clip, _, _ in trimmed if clip.duration >= MIN_CLIP_S]
+        clips = [t.clip for t in trimmed if t.clip.duration >= MIN_CLIP_S]
         heard: list[list[Word]] = []
         if clips:
             _, transcriber = ctx.transcriber(role)
@@ -379,9 +382,12 @@ def transcribe_windows(
                     on_progress=update,
                 )
         results = iter(heard)
-        for (window, start, end), (clip, clean_start, clean_end) in zip(todo, trimmed, strict=True):
+        for (window, start, end), cut in zip(todo, trimmed, strict=True):
+            clip = cut.clip
             words = tuple(next(results)) if clip.duration >= MIN_CLIP_S else ()
-            transcript = Transcript(clip.start, clip.start + clip.duration, words, clean_start, clean_end)
+            transcript = Transcript(
+                clip.start, clip.start + clip.duration, words, cut.clean_start, cut.clean_end
+            )
             if store:  # even an empty one, so the next run does not read it again
                 store.add_window(start, end, transcript)
             if clip.duration >= MIN_CLIP_S:

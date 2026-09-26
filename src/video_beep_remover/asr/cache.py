@@ -25,7 +25,7 @@ from video_beep_remover.models import Word
 
 log = logging.getLogger(__name__)
 
-VERSION = 1
+VERSION = 2  # 2: anchor words that start in a pause are moved to where speech resumes
 EDGE_S = 0.3  # words this close to a transcribed clip's edge are unreliable (as in detect/confirm.py)
 TOLERANCE_S = 0.001
 SPEECH = "speech.json"
