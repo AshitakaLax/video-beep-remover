@@ -910,11 +910,11 @@ Before writing this design, the FFmpeg parts were prototyped to check the key as
 |---|---|---|---|---|---|---|---|---|
 | `full` | 95.8 % | 95.8 % | 100 % | −77 / −217 ms | −117 / −226 ms | 0.4 s | 60 s | 8.8 s |
 | `targeted` | 87.5 % | 87.5 % | 100 % | −90 / −249 ms | −88 / −226 ms | 0.4 s | 16 s | 7.5 s |
-| `hybrid` | 91.7 % | 91.7 % | 100 % | −90 / −249 ms | −88 / −226 ms | 0.4 s | 16 s | see below |
+| `hybrid` | 93.8 % | 93.8 % | 100 % | −95 / −248 ms | −88 / −226 ms | 0.4 s | 17 s | 8.9 s |
 
-`hybrid` ran with its windows already cached by `targeted`, so its time is not comparable (1.3 s per minute). Before the sync fixes, when it still fell back to `full` on one clip, it took 10.4 s per minute without the cache.
+Each row ran without the transcript cache.
 
-**Padding after the word.** `pad_after_ms` swept with the transcripts cached. At 200 ms every word that was detected at all is fully muted; more changes nothing here:
+**Padding after the word.** `pad_after_ms` swept with the transcripts cached. At 200 ms every word that was detected at all is fully muted; more changes nothing here. In the sweep, `hybrid` reused the windows `targeted` had transcribed; on its own (above) it heard one more word, the softened clip's "damn".
 
 | `pad_after_ms` | `full` | `targeted` | `hybrid` | Extra per minute |
 |---|---|---|---|---|
