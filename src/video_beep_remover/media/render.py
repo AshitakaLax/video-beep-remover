@@ -13,8 +13,9 @@ import numpy as np
 
 from video_beep_remover.config.schema import OutputConfig
 from video_beep_remover.errors import DependencyError, RenderError
+from video_beep_remover.languages import lang_matches
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
-from video_beep_remover.media.probe import MediaInfo, StreamInfo, lang_matches
+from video_beep_remover.media.probe import MediaInfo, StreamInfo
 from video_beep_remover.models import CensorInterval
 
 log = logging.getLogger(__name__)

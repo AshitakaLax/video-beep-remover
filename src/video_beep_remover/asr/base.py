@@ -1,16 +1,27 @@
 """Speech-recognition interface (DESIGN.md §5.4)."""
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
-import numpy as np
-import numpy.typing as npt
-
 from video_beep_remover.detect.lexicon import Lexicon
+from video_beep_remover.media.audio import SAMPLE_RATE, Audio
 from video_beep_remover.models import Word
 
 ProgressCallback = Callable[[float], None]
 PROMPT_WORDS = 8
+
+
+@dataclass(frozen=True)
+class Clip:
+    """Audio to transcribe: 16 kHz mono float32 whose sample 0 is `start` on the media timeline."""
+
+    start: float
+    audio: Audio
+
+    @property
+    def duration(self) -> float:
+        return len(self.audio) / SAMPLE_RATE
 
 
 class Transcriber(Protocol):
@@ -18,16 +29,17 @@ class Transcriber(Protocol):
 
     def transcribe(
         self,
-        audio: npt.NDArray[np.float32],
+        clips: Sequence[Clip],
         *,
-        offset: float,
         language: str,
         prompt: str | None,
+        vad: bool = False,
         on_progress: ProgressCallback | None = None,
-    ) -> Sequence[Word]:
-        """Words with times in media seconds (`offset` is the media time of sample 0).
+    ) -> list[list[Word]]:
+        """The words heard in each clip, with times in media seconds.
 
-        `on_progress` receives how many seconds of `audio` have been transcribed.
+        `vad` skips non-speech inside long clips (full mode). `on_progress` receives how many
+        seconds of audio have been transcribed so far, over all clips.
         """
         ...
 

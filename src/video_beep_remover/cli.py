@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+import tempfile
 from collections.abc import Iterator
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -27,17 +28,15 @@ from video_beep_remover.errors import (
     EXIT_DEPENDENCY,
     EXIT_OK,
     EXIT_PARTIAL,
+    EXIT_PROCESSING,
     EXIT_USAGE,
     DependencyError,
     UsageError,
     VbrError,
 )
+from video_beep_remover.media.probe import VIDEO_SUFFIXES
 from video_beep_remover.pipeline import FileResult, Pipeline, RunOptions
 from video_beep_remover.pipeline import Progress as ProgressFn
-
-VIDEO_SUFFIXES = frozenset(
-    {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".mts", ".mpg", ".mpeg", ".wmv", ".flv"}
-)
 
 app = typer.Typer(
     name="vbr",
@@ -157,11 +156,14 @@ def _summarize(result: FileResult) -> str:
     if result.status == "skipped":
         return f"{name}: skipped ({'; '.join(result.notes)})"
     if result.status == "scanned":
-        return f"{name}: {result.detections} listed words, {result.intervals} spans to mute"
+        return (
+            f"{name}: {result.detections} listed words, {result.intervals} spans to mute ({result.strategy})"
+        )
     if result.status == "clean":
         return f"{name}: nothing to mute, no output written"
-    action = "muted" if result.status == "cleaned" else "nothing to mute, copied"
-    return f"{name}: {action} {result.intervals} spans → {result.output}"
+    if result.status == "copied":
+        return f"{name}: nothing to mute, copied → {result.output} ({result.strategy})"
+    return f"{name}: muted {result.intervals} spans → {result.output} ({result.strategy})"
 
 
 def _run(
@@ -181,6 +183,8 @@ def _run(
         many = len(files) > 1
         if many and options.output is not None and options.output.exists() and not options.output.is_dir():
             raise UsageError("with several inputs, --output must be a directory")
+        if many and options.subtitles is not None:
+            raise UsageError("--subtitles works with a single input")
         cats = categories.split(",") if categories else None
         pipeline = Pipeline(loaded, ui=ui, categories=cats)
     except VbrError as exc:
@@ -211,6 +215,9 @@ def _run(
 InputsArg = Annotated[list[Path], typer.Argument(help="Video files, or folders of them.", show_default=False)]
 ConfigOpt = Annotated[Path | None, typer.Option("--config", "-c", help="Config file (see `vbr config`).")]
 StrategyOpt = Annotated[StrategyChoice | None, typer.Option(help="How to find listed words.")]
+SubtitlesOpt = Annotated[
+    Path | None, typer.Option("--subtitles", help="Use this subtitle file instead of searching for one.")
+]
 NoFallbackOpt = Annotated[
     bool, typer.Option("--no-fallback", help="Fail instead of transcribing everything.")
 ]
@@ -233,6 +240,7 @@ def clean(
     config: ConfigOpt = None,
     output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")] = None,
     strategy: StrategyOpt = None,
+    subtitles: SubtitlesOpt = None,
     no_fallback: NoFallbackOpt = False,
     offline: OfflineOpt = False,
     categories: CategoriesOpt = None,
@@ -263,6 +271,7 @@ def clean(
         overwrite=overwrite,
         skip_existing=skip_existing,
         keep_temp=keep_temp,
+        subtitles=subtitles,
     )
     _run(
         inputs,
@@ -287,6 +296,7 @@ def scan(
     inputs: InputsArg,
     config: ConfigOpt = None,
     strategy: StrategyOpt = None,
+    subtitles: SubtitlesOpt = None,
     no_fallback: NoFallbackOpt = False,
     offline: OfflineOpt = False,
     categories: CategoriesOpt = None,
@@ -302,7 +312,7 @@ def scan(
     quiet: QuietOpt = False,
 ) -> None:
     """Find the listed words and write a report (and optional EDL), without writing video."""
-    options = RunOptions(dry_run=True, report=report, edl=edl, overwrite=overwrite)
+    options = RunOptions(dry_run=True, report=report, edl=edl, overwrite=overwrite, subtitles=subtitles)
     _run(
         inputs,
         config,
@@ -319,6 +329,96 @@ def scan(
         audio_stream=audio_stream,
         recursive=recursive,
     )
+
+
+@app.command("subs")
+def subs_command(
+    video: Annotated[Path, typer.Argument(help="Video file.", show_default=False)],
+    config: ConfigOpt = None,
+    subtitles: SubtitlesOpt = None,
+    offline: OfflineOpt = False,
+    language: LanguageOpt = None,
+    audio_stream: AudioStreamOpt = None,
+    device: DeviceOpt = None,
+    no_sync: Annotated[bool, typer.Option("--no-sync", help="Only list the candidates.")] = False,
+    save: Annotated[
+        Path | None,
+        typer.Option("--save", help="Write the chosen subtitles here; the extension sets the format."),
+    ] = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Show subtitle candidates, their ranking and the sync check. Exits with 1 if none is usable."""
+    from video_beep_remover import guided
+    from video_beep_remover.media.audio import SeekingAudioSource
+    from video_beep_remover.media.probe import probe, select_audio_stream
+    from video_beep_remover.subtitles.acquire import SubtitleLoader, find_candidates
+    from video_beep_remover.subtitles.save import save_subtitles
+
+    _setup_logging(verbose)
+    overrides = _overrides(offline=offline, language=language, audio_stream=audio_stream, device=device)
+    try:
+        loaded = load_config(config, overrides=overrides)
+        cfg = loaded.config
+        if not video.is_file():
+            raise UsageError(f"not found: {video}")
+        if subtitles is not None and not subtitles.is_file():
+            raise UsageError(f"subtitle file not found: {subtitles}")
+        pipeline = Pipeline(loaded, ui=ConsoleUI(quiet=True))
+        info = probe(pipeline.ff, video)
+        search = find_candidates(info, cfg.subtitles, offline=cfg.offline, explicit=subtitles)
+        table = Table(show_header=True, header_style="bold")
+        for column in ("#", "source", "subtitles", "language", "SDH", "score"):
+            table.add_column(column)
+        for number, candidate in enumerate(search.candidates, 1):
+            table.add_row(
+                str(number),
+                candidate.source,
+                escape(candidate.label),
+                candidate.language or "?",
+                "yes" if candidate.hearing_impaired else "",
+                f"{candidate.score:.0f}" if candidate.source != "explicit" else "",
+            )
+        for note in search.notes:
+            console.print(f"[dim]{escape(note)}[/]")
+        if not search.candidates:
+            console.print("no subtitle candidates found")
+            raise typer.Exit(EXIT_PROCESSING)
+        console.print(table)
+
+        with tempfile.TemporaryDirectory(prefix="vbr-") as tmp:
+            workdir = Path(tmp)
+            if no_sync:
+                top = search.candidates[0]
+                text = SubtitleLoader(pipeline.ff, video, workdir, [top]).text(top)
+            else:
+                stream = select_audio_stream(info, cfg.analysis.language, cfg.analysis.audio_stream)
+                audio = SeekingAudioSource(pipeline.ff, video, stream.index)
+                with console.status("Checking the sync (transcribes a few seconds around six cues)"):
+                    selection = guided.select_subtitles(
+                        pipeline.guided_context(), info, audio, workdir, subtitles
+                    )
+                for entry in selection.tried:
+                    used = entry.get("result") == "used"
+                    sync = entry.get("sync")
+                    detail = ""
+                    if sync:
+                        fidelity = "unknown" if sync["fidelity"] is None else f"{sync['fidelity']:.2f}"
+                        detail = (
+                            f" [{sync['matched']}/{sync['anchors']} anchors, offset {sync['offset']:+.2f} s, "
+                            f"error {sync['error']:.2f} s, fidelity {fidelity}]"
+                        )
+                    mark = "[green]✔[/]" if used else "[red]✘[/]"
+                    console.print(
+                        f"{mark} {escape(entry['label'])}: {escape(str(entry['result']))}{escape(detail)}"
+                    )
+                if selection.chosen is None:
+                    raise typer.Exit(EXIT_PROCESSING)
+                text = selection.chosen.text
+            if save is not None:
+                save_subtitles(text, save, fps=info.frame_rate)
+                console.print(f"Wrote {escape(str(save))}")
+    except VbrError as exc:
+        raise _fail(exc) from exc
 
 
 @config_app.command("init")

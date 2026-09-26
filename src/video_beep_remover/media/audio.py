@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -46,3 +47,32 @@ def decode_track(
     if dest.stat().st_size == 0:
         return np.zeros(0, dtype=np.float32)
     return np.memmap(dest, dtype=np.float32, mode="r")
+
+
+class AudioSource(Protocol):
+    def read(self, start: float, end: float) -> Audio:
+        """Samples from `start` to `end` (media seconds); sample 0 is `start`."""
+        ...
+
+
+class SeekingAudioSource:
+    """Decodes each window straight from the file with input seeking (targeted mode)."""
+
+    def __init__(self, ff: FFmpeg, path: Path, stream_index: int) -> None:
+        self.ff = ff
+        self.path = path
+        self.stream_index = stream_index
+
+    def read(self, start: float, end: float) -> Audio:
+        return read_window(self.ff, self.path, self.stream_index, start, max(0.0, end - start))
+
+
+class ArrayAudioSource:
+    """Slices an already decoded track (hybrid mode decodes the whole track anyway)."""
+
+    def __init__(self, audio: Audio) -> None:
+        self.audio = audio
+
+    def read(self, start: float, end: float) -> Audio:
+        first = max(0, round(start * SAMPLE_RATE))
+        return np.array(self.audio[first : max(first, round(end * SAMPLE_RATE))], dtype=np.float32)

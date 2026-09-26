@@ -7,32 +7,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from video_beep_remover.errors import MediaError, UsageError
+from video_beep_remover.languages import lang_matches
 from video_beep_remover.media.ffmpeg import FFmpeg
 
-# ISO 639-1 codes (as used in the config) and the ISO 639-2 tags containers use.
-_ISO639: dict[str, tuple[str, ...]] = {
-    "ar": ("ara",), "cs": ("ces", "cze"), "da": ("dan",), "de": ("deu", "ger"), "el": ("ell", "gre"),
-    "en": ("eng",), "es": ("spa",), "fi": ("fin",), "fr": ("fra", "fre"), "he": ("heb",),
-    "hi": ("hin",), "hu": ("hun",), "id": ("ind",), "it": ("ita",), "ja": ("jpn",), "ko": ("kor",),
-    "nl": ("nld", "dut"), "no": ("nor", "nob", "nno"), "pl": ("pol",), "pt": ("por",),
-    "ro": ("ron", "rum"), "ru": ("rus",), "sv": ("swe",), "th": ("tha",), "tr": ("tur",),
-    "uk": ("ukr",), "vi": ("vie",), "zh": ("zho", "chi"),
-}  # fmt: skip
+# File suffixes treated as videos when searching folders.
+VIDEO_SUFFIXES = frozenset(
+    {".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts", ".mts", ".mpg", ".mpeg", ".wmv", ".flv"}
+)
 _COMMENTARY = re.compile(r"comment", re.IGNORECASE)
 _DESCRIPTION = re.compile(r"descri", re.IGNORECASE)
 
 StreamKind = Literal["video", "audio", "subtitle", "data", "attachment", "unknown"]
-
-
-def lang_matches(tag: str | None, code: str) -> bool:
-    """Compare a container language tag ("eng") with a config language code ("en")."""
-    if not tag:
-        return False
-    tag_base = tag.lower().split("-")[0]
-    code_base = code.lower().split("-")[0]
-    if tag_base == code_base:
-        return True
-    return tag_base in _ISO639.get(code_base, ()) or code_base in _ISO639.get(tag_base, ())
 
 
 def _float(value: Any) -> float | None:
@@ -49,6 +34,15 @@ def _int(value: Any) -> int | None:
         return None
 
 
+def _rate(value: Any) -> float | None:
+    """A frame rate from ffprobe's "24000/1001" notation; None when unknown ("0/0")."""
+    numerator, _, denominator = str(value or "").partition("/")
+    top, bottom = _float(numerator), _float(denominator or "1")
+    if not top or not bottom or top <= 0 or bottom <= 0:
+        return None
+    return top / bottom
+
+
 @dataclass(frozen=True)
 class StreamInfo:
     index: int
@@ -61,6 +55,7 @@ class StreamInfo:
     sample_rate: int | None = None
     bit_rate: int | None = None
     start_time: float | None = None
+    frame_rate: float | None = None
     disposition: Mapping[str, int] = field(default_factory=dict)
 
     @property
@@ -105,6 +100,18 @@ class MediaInfo:
     def audio_streams(self) -> list[StreamInfo]:
         return [s for s in self.streams if s.kind == "audio"]
 
+    @property
+    def subtitle_streams(self) -> list[StreamInfo]:
+        return [s for s in self.streams if s.kind == "subtitle"]
+
+    @property
+    def frame_rate(self) -> float | None:
+        """The main video stream's frame rate (cover art and other still images are ignored)."""
+        for stream in self.streams:
+            if stream.kind == "video" and not stream.is_attached_picture and stream.frame_rate:
+                return stream.frame_rate
+        return None
+
     def stream(self, index: int) -> StreamInfo:
         for stream in self.streams:
             if stream.index == index:
@@ -131,6 +138,9 @@ def parse_probe(path: Path, data: Mapping[str, Any]) -> MediaInfo:
                 sample_rate=_int(raw.get("sample_rate")),
                 bit_rate=_int(raw.get("bit_rate")),
                 start_time=_float(raw.get("start_time")),
+                frame_rate=_rate(raw.get("avg_frame_rate")) or _rate(raw.get("r_frame_rate"))
+                if kind == "video"
+                else None,
                 disposition={str(k): int(v) for k, v in (raw.get("disposition") or {}).items()},
             )
         )

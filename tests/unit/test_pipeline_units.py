@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 
 from video_beep_remover.asr.base import build_prompt
-from video_beep_remover.asr.faster_whisper import resolve_model
-from video_beep_remover.config.schema import AnalysisConfig, Category, LexiconConfig, TranscriptionConfig
+from video_beep_remover.asr.faster_whisper import resolve_anchor_model, resolve_model
+from video_beep_remover.config.schema import Category, LexiconConfig, TranscriptionConfig
 from video_beep_remover.detect.lexicon import compile_lexicon
-from video_beep_remover.errors import ConfigError, VbrError
-from video_beep_remover.pipeline import choose_strategy, resolve_output
+from video_beep_remover.errors import ConfigError
+from video_beep_remover.pipeline import resolve_output
 
 MOVIE = Path("/videos/The Movie (2019).mkv")
 
@@ -39,14 +39,6 @@ def test_absolute_templates_and_bad_placeholders() -> None:
     assert resolve_output(MOVIE, "/out/{stem}{ext}", None, many=False) == Path("/out/The Movie (2019).mkv")
     with pytest.raises(ConfigError, match="placeholder"):
         resolve_output(MOVIE, "{name}{ext}", None, many=False)
-
-
-def test_strategy_falls_back_to_full_until_subtitles_exist() -> None:
-    assert choose_strategy(AnalysisConfig(strategy="full")) == ("full", None)
-    used, reason = choose_strategy(AnalysisConfig(strategy="hybrid"))
-    assert used == "full" and reason and "subtitle" in reason
-    with pytest.raises(VbrError, match="fallback_to_full is false"):
-        choose_strategy(AnalysisConfig(strategy="targeted", fallback_to_full=False))
 
 
 def test_prompt_settings() -> None:
@@ -82,3 +74,10 @@ def test_auto_model_depends_on_device_strategy_and_language(monkeypatch: pytest.
 
     explicit = TranscriptionConfig(device="cpu", model="medium", compute_type="float32")
     assert resolve_model(explicit, strategy="full", language="en").describe() == "medium (cpu, float32)"
+
+
+def test_anchor_model_is_small_and_matches_the_language() -> None:
+    cpu = TranscriptionConfig(device="cpu")
+    assert resolve_anchor_model(cpu, language="en").describe() == "base.en (cpu, int8)"
+    assert resolve_anchor_model(cpu, language="de").name == "base"
+    assert not resolve_anchor_model(TranscriptionConfig(device="cuda"), language="en").batched

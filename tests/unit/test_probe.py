@@ -4,8 +4,9 @@ from typing import Any
 import pytest
 
 from video_beep_remover.errors import MediaError, UsageError
+from video_beep_remover.languages import lang_matches
 from video_beep_remover.media.ffmpeg import FFmpegVersion
-from video_beep_remover.media.probe import lang_matches, parse_probe, select_audio_stream
+from video_beep_remover.media.probe import parse_probe, select_audio_stream
 
 
 def audio(index: int, language: str | None = "eng", channels: int = 2, **extra: Any) -> dict[str, Any]:

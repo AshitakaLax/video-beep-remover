@@ -1,29 +1,42 @@
-"""Run the stages for one file (DESIGN.md §5.1). Subtitle-guided strategies arrive in milestone M2."""
+"""Run the stages for one file (DESIGN.md §5.1) and choose between strategies (§7)."""
 
 import contextlib
 import shutil
 import tempfile
 import time
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 from video_beep_remover import __version__
-from video_beep_remover.asr.base import Transcriber, build_prompt
-from video_beep_remover.asr.faster_whisper import FasterWhisperTranscriber, ModelChoice, resolve_model
+from video_beep_remover import guided as guided_analysis
+from video_beep_remover.asr.base import Clip, Transcriber, build_prompt
+from video_beep_remover.asr.faster_whisper import (
+    FasterWhisperTranscriber,
+    ModelChoice,
+    resolve_anchor_model,
+    resolve_model,
+)
+from video_beep_remover.asr.vad import SpeechDetector, silero_speech
 from video_beep_remover.config.loader import LoadedConfig
-from video_beep_remover.config.schema import AnalysisConfig
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.detect.matcher import detect_in_words
 from video_beep_remover.errors import ConfigError, UsageError, VbrError
-from video_beep_remover.media.audio import SAMPLE_RATE, decode_track
+from video_beep_remover.media.audio import (
+    SAMPLE_RATE,
+    ArrayAudioSource,
+    Audio,
+    AudioSource,
+    SeekingAudioSource,
+    decode_track,
+)
 from video_beep_remover.media.ffmpeg import FFmpeg
-from video_beep_remover.media.probe import probe, select_audio_stream
+from video_beep_remover.media.probe import MediaInfo, StreamInfo, probe, select_audio_stream
 from video_beep_remover.media.render import plan_streams, render
+from video_beep_remover.models import Detection
 from video_beep_remover.report import (
     SCHEMA_VERSION,
     detection_dict,
@@ -32,33 +45,12 @@ from video_beep_remover.report import (
     write_json,
     write_text,
 )
+from video_beep_remover.ui import UI, NullUI, Progress
+
+__all__ = ["UI", "FileResult", "NullUI", "Pipeline", "Progress", "RunOptions", "resolve_output"]
 
 Status = Literal["cleaned", "copied", "clean", "scanned", "skipped"]
-Progress = Callable[[float], None]
 TranscriberFactory = Callable[[ModelChoice], Transcriber]
-
-
-class UI(Protocol):
-    def info(self, message: str) -> None: ...
-    def warn(self, message: str) -> None: ...
-    def progress(self, label: str, total: float) -> AbstractContextManager[Progress]: ...
-    def status(self, label: str) -> AbstractContextManager[None]: ...
-
-
-class NullUI:
-    def info(self, message: str) -> None:
-        pass
-
-    def warn(self, message: str) -> None:
-        pass
-
-    @contextlib.contextmanager
-    def progress(self, label: str, total: float) -> Iterator[Progress]:
-        yield lambda done: None
-
-    @contextlib.contextmanager
-    def status(self, label: str) -> Iterator[None]:
-        yield
 
 
 @dataclass(frozen=True)
@@ -70,6 +62,7 @@ class RunOptions:
     overwrite: bool = False
     skip_existing: bool = False
     keep_temp: bool = False
+    subtitles: Path | None = None  # --subtitles: use this file, skip the search
 
 
 @dataclass
@@ -81,7 +74,18 @@ class FileResult:
     edl: Path | None = None
     detections: int = 0
     intervals: int = 0
+    strategy: str = ""  # the strategy that ran
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Analysis:
+    strategy: str  # the one that ran
+    fallback_reason: str | None
+    detections: list[Detection]
+    words: int
+    model: ModelChoice | None
+    report: dict[str, Any]  # strategy-specific report sections
 
 
 def resolve_output(source: Path, template: str, explicit: Path | None, *, many: bool) -> Path:
@@ -102,18 +106,6 @@ def resolve_output(source: Path, template: str, explicit: Path | None, *, many: 
     return candidate if candidate.is_absolute() else source.parent / candidate
 
 
-def choose_strategy(analysis: AnalysisConfig) -> tuple[str, str | None]:
-    """The strategy that actually runs, and why it differs from the requested one (DESIGN.md §7)."""
-    if analysis.strategy == "full":
-        return "full", None
-    reason = "subtitle-guided analysis is not implemented yet, so no subtitles were searched"
-    if not analysis.fallback_to_full:
-        raise VbrError(
-            f"strategy {analysis.strategy!r} needs subtitles: {reason}, and fallback_to_full is false"
-        )
-    return "full", reason
-
-
 def _report_path(options: RunOptions, source: Path, output: Path | None, many: bool) -> Path:
     if options.report is not None:
         if many or options.report.is_dir():
@@ -121,6 +113,31 @@ def _report_path(options: RunOptions, source: Path, output: Path | None, many: b
         return options.report
     base = output or source
     return base.with_name(f"{base.stem}.vbr.json")
+
+
+class _Track:
+    """The decoded soundtrack, decoded at most once per file and shared by every stage that needs it."""
+
+    def __init__(
+        self, pipeline: "Pipeline", source: Path, info: MediaInfo, stream: StreamInfo, workdir: Path
+    ):
+        self.pipeline = pipeline
+        self.source = source
+        self.info = info
+        self.stream = stream
+        self.path = workdir / "audio.f32"
+        self.audio: Audio | None = None
+
+    def get(self) -> Audio:
+        if self.audio is None:
+            with self.pipeline.ui.progress("Decoding audio", self.info.duration) as update:
+                self.audio = decode_track(
+                    self.pipeline.ff, self.source, self.stream.index, self.path, on_progress=update
+                )
+        return self.audio
+
+    def release(self) -> None:
+        self.audio = None  # closes the memory map, so the temp dir can be deleted (Windows)
 
 
 class Pipeline:
@@ -132,6 +149,7 @@ class Pipeline:
         ff: FFmpeg | None = None,
         categories: list[str] | None = None,
         transcriber_factory: TranscriberFactory | None = None,
+        speech_detector: SpeechDetector | None = None,
     ) -> None:
         self.config = loaded.config
         self.ui: UI = ui or NullUI()
@@ -144,6 +162,7 @@ class Pipeline:
         self.prompt = build_prompt(self.config.transcription.initial_prompt, self.lexicon)
         self._factory = transcriber_factory or self._load_faster_whisper
         self._transcribers: dict[ModelChoice, Transcriber] = {}
+        self.detect_speech: SpeechDetector = speech_detector or silero_speech
 
     def _load_faster_whisper(self, choice: ModelChoice) -> Transcriber:
         settings = self.config.transcription
@@ -155,14 +174,28 @@ class Pipeline:
             offline=self.config.offline,
         )
 
-    def transcriber(self, strategy: str) -> tuple[ModelChoice, Transcriber]:
-        choice = resolve_model(
-            self.config.transcription, strategy=strategy, language=self.config.analysis.language
-        )
+    def transcriber(self, role: str) -> tuple[ModelChoice, Transcriber]:
+        """The model for a role: "full", "targeted" or "hybrid" (by strategy), or "anchor"."""
+        settings, language = self.config.transcription, self.config.analysis.language
+        if role == "anchor":
+            choice = resolve_anchor_model(settings, language=language)
+        else:
+            choice = resolve_model(settings, strategy=role, language=language)
         if choice not in self._transcribers:
             with self.ui.status(f"Loading Whisper model {choice.describe()}"):
                 self._transcribers[choice] = self._factory(choice)
         return choice, self._transcribers[choice]
+
+    def guided_context(self) -> guided_analysis.Context:
+        return guided_analysis.Context(
+            config=self.config,
+            lexicon=self.lexicon,
+            prompt=self.prompt,
+            ui=self.ui,
+            ff=self.ff,
+            transcriber=self.transcriber,
+            detect_speech=self.detect_speech,
+        )
 
     @contextlib.contextmanager
     def _workdir(self, keep: bool) -> Iterator[Path]:
@@ -175,6 +208,68 @@ class Pipeline:
             else:
                 shutil.rmtree(path, ignore_errors=True)
 
+    def _full(
+        self, track: _Track, lap: Callable[[str], None], fallback_reason: str | None, report: dict[str, Any]
+    ) -> Analysis:
+        audio = track.get()
+        lap("decode")
+        choice, transcriber = self.transcriber("full")
+        with self.ui.progress("Transcribing", len(audio) / SAMPLE_RATE) as update:
+            [words] = transcriber.transcribe(
+                [Clip(0.0, audio)],
+                language=self.config.analysis.language,
+                prompt=self.prompt,
+                vad=self.config.transcription.vad_filter,
+                on_progress=update,
+            )
+        lap("transcribe")
+        return Analysis(
+            "full", fallback_reason, detect_in_words(self.lexicon, words), len(words), choice, report
+        )
+
+    def _analyse(
+        self,
+        source: Path,
+        info: MediaInfo,
+        stream: StreamInfo,
+        workdir: Path,
+        track: _Track,
+        lap: Callable[[str], None],
+        subtitles: Path | None = None,
+    ) -> Analysis:
+        """Run the configured strategy, falling back to `full` where §7 says so."""
+        analysis = self.config.analysis
+        requested = analysis.strategy
+        if requested == "full":
+            if subtitles is not None:
+                self.ui.warn("--subtitles is not used with the full strategy")
+            return self._full(track, lap, None, {})
+        audio: AudioSource
+        if requested == "hybrid":
+            audio = ArrayAudioSource(track.get())  # hybrid needs the whole track for VAD anyway
+            lap("decode")
+        else:
+            audio = SeekingAudioSource(self.ff, source, stream.index)
+        try:
+            found = guided_analysis.analyse(
+                self.guided_context(),
+                requested,
+                info,
+                audio,
+                workdir,
+                explicit=subtitles,
+                track=track.audio,
+                lap=lap,
+            )
+        except guided_analysis.Fallback as fallback:
+            if not analysis.fallback_to_full:
+                raise VbrError(
+                    f"strategy {requested!r} could not run: {fallback.reason}; fallback_to_full is false"
+                ) from fallback
+            self.ui.info(f"using the full strategy instead of {requested!r}: {fallback.reason}")
+            return self._full(track, lap, fallback.reason, fallback.report)
+        return Analysis(requested, None, found.detections, found.words, found.model, found.report)
+
     def process(self, source: Path, options: RunOptions, *, many: bool = False) -> FileResult:
         cfg = self.config
         timings: dict[str, float] = {}
@@ -183,9 +278,11 @@ class Pipeline:
         def lap(name: str) -> None:
             nonlocal clock
             now = time.monotonic()
-            timings[name] = round(now - clock, 3)
+            timings[name] = round(timings.get(name, 0.0) + now - clock, 3)
             clock = now
 
+        if options.subtitles is not None and not options.subtitles.is_file():
+            raise UsageError(f"subtitle file not found: {options.subtitles}")
         output = None
         if not options.dry_run:
             output = resolve_output(source, cfg.output.path, options.output, many=many)
@@ -198,26 +295,17 @@ class Pipeline:
 
         info = probe(self.ff, source)
         stream = select_audio_stream(info, cfg.analysis.language, cfg.analysis.audio_stream)
-        strategy, fallback_reason = choose_strategy(cfg.analysis)
         self.ui.info(f"{source.name}: {info.duration / 60:.1f} min, analysing audio {stream.describe()}")
-        if fallback_reason:
-            self.ui.info(f"using the full strategy instead of {cfg.analysis.strategy!r}: {fallback_reason}")
         lap("probe")
 
         result = FileResult(source, "scanned")
         with self._workdir(options.keep_temp) as workdir:
-            with self.ui.progress("Decoding audio", info.duration) as update:
-                audio = decode_track(self.ff, source, stream.index, workdir / "audio.f32", on_progress=update)
-            lap("decode")
-            choice, transcriber = self.transcriber(strategy)
-            with self.ui.progress("Transcribing", len(audio) / SAMPLE_RATE) as update:
-                words = transcriber.transcribe(
-                    audio, offset=0.0, language=cfg.analysis.language, prompt=self.prompt, on_progress=update
-                )
-            del audio
-            lap("transcribe")
-
-            detections = detect_in_words(self.lexicon, words)
+            track = _Track(self, source, info, stream, workdir)
+            try:
+                analysis = self._analyse(source, info, stream, workdir, track, lap, options.subtitles)
+            finally:
+                track.release()
+            detections = analysis.detections
             intervals = build_intervals(
                 detections,
                 duration=info.duration,
@@ -227,8 +315,16 @@ class Pipeline:
                 merge_gap=cfg.censor.merge_gap_ms / 1000,
             )
             result.detections, result.intervals = len(detections), len(intervals)
-            self.ui.info(f"{len(detections)} listed words found → {len(intervals)} spans to mute")
+            result.strategy = analysis.strategy
+            heard = sum(d.source == "asr" for d in detections)
+            estimated = len(detections) - heard
+            self.ui.info(
+                f"{len(detections)} listed words found"
+                + (f" ({heard} heard, {estimated} from subtitles only)" if estimated else "")
+                + f" → {len(intervals)} spans to mute"
+            )
 
+            model = analysis.model
             report: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
                 "tool_version": __version__,
@@ -242,15 +338,16 @@ class Pipeline:
                 },
                 "strategy": {
                     "requested": cfg.analysis.strategy,
-                    "used": strategy,
-                    "fallback_reason": fallback_reason,
+                    "used": analysis.strategy,
+                    "fallback_reason": analysis.fallback_reason,
                 },
+                **analysis.report,
                 "transcription": {
-                    "model": choice.name,
-                    "device": choice.device,
-                    "compute_type": choice.compute_type,
+                    "model": model.name if model else None,
+                    "device": model.device if model else None,
+                    "compute_type": model.compute_type if model else None,
                     "prompt": self.prompt,
-                    "words": len(words),
+                    "words": analysis.words,
                 },
                 "categories": list(self.lexicon.categories),
                 "detections": [detection_dict(d) for d in detections],

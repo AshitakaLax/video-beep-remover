@@ -33,3 +33,7 @@ class MediaError(VbrError):
 
 class RenderError(VbrError):
     """The cleaned file could not be produced or failed verification."""
+
+
+class SubtitleError(VbrError):
+    """A subtitle file could not be read or parsed."""

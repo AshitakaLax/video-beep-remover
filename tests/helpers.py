@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from video_beep_remover.asr.base import Clip
 from video_beep_remover.models import Word
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -95,7 +96,8 @@ def tone_gain(samples: np.ndarray, at: float, frequency: int = 440, window: floa
 
 
 class FakeTranscriber:
-    """Returns scripted words instead of running Whisper."""
+    """Returns scripted words instead of running Whisper. Words are in media time; each clip gets the
+    words that lie inside it."""
 
     name = "fake"
 
@@ -105,18 +107,47 @@ class FakeTranscriber:
 
     def transcribe(
         self,
-        audio: np.ndarray,
+        clips: Sequence[Clip],
         *,
-        offset: float,
         language: str,
         prompt: str | None,
+        vad: bool = False,
         on_progress: Callable[[float], None] | None = None,
-    ) -> list[Word]:
-        self.calls.append({"seconds": len(audio) / 16_000, "language": language, "prompt": prompt})
-        if on_progress:
-            on_progress(len(audio) / 16_000)
-        return [Word(w.text, w.start + offset, w.end + offset, w.probability) for w in self.words]
+    ) -> list[list[Word]]:
+        results = []
+        done = 0.0
+        for clip in clips:
+            seconds = len(clip.audio) / 16_000
+            end = clip.start + seconds
+            self.calls.append(
+                {"start": clip.start, "seconds": seconds, "language": language, "prompt": prompt, "vad": vad}
+            )
+            results.append([w for w in self.words if clip.start - 1e-6 <= w.start and w.end <= end + 1e-6])
+            done += seconds
+            if on_progress:
+                on_progress(done)
+        return results
 
 
 def words(*items: tuple[str, float, float]) -> list[Word]:
     return [Word(text, start, end, 0.9) for text, start, end in items]
+
+
+def say(text: str, start: float, end: float, probability: float = 0.9) -> list[Word]:
+    """The words of `text` spread evenly over [start, end], as Whisper would report them."""
+    parts = text.split()
+    step = (end - start) / len(parts)
+    return [
+        Word(" " + part, start + i * step, start + (i + 1) * step - 0.02, probability)
+        for i, part in enumerate(parts)
+    ]
+
+
+def srt(*cues: tuple[float, float, str]) -> str:
+    """SubRip text for (start, end, text) cues."""
+
+    def stamp(t: float) -> str:
+        ms = round(t * 1000)
+        return f"{ms // 3_600_000:02d}:{ms // 60_000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+    return "".join(f"{i}\n{stamp(s)} --> {stamp(e)}\n{text}\n\n" for i, (s, e, text) in enumerate(cues, 1))

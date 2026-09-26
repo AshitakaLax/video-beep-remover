@@ -39,8 +39,9 @@ def test_clean_mutes_detections_and_writes_report_and_edl(tmp_path: Path) -> Non
     assert report["strategy"] == {
         "requested": "hybrid",
         "used": "full",
-        "fallback_reason": "subtitle-guided analysis is not implemented yet, so no subtitles were searched",
+        "fallback_reason": "no subtitles found (OpenSubtitles: online search is not implemented yet (milestone M3))",
     }
+    assert report["subtitle_candidates"] == []
     [detection] = report["detections"]
     assert (detection["heard"], detection["category"]) == ("damn", "mild")
     assert report["intervals"] == [{"start": 1.88, "end": 2.52}]
@@ -86,10 +87,10 @@ def test_existing_output_needs_overwrite_or_skip(tmp_path: Path) -> None:
     assert (tmp_path / "movie.clean.mkv").stat().st_size > 3
 
 
-def test_no_fallback_fails_until_subtitle_strategies_exist(tmp_path: Path) -> None:
+def test_no_fallback_fails_without_subtitles(tmp_path: Path) -> None:
     source = make_clip(tmp_path / "movie.mkv")
     run = pipeline(tmp_path, **{"analysis.fallback_to_full": False})
-    with pytest.raises(VbrError, match="fallback_to_full is false"):
+    with pytest.raises(VbrError, match=r"no subtitles found .*; fallback_to_full is false"):
         run.process(source, RunOptions())
 
 

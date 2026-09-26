@@ -27,6 +27,7 @@ class Match:
     term: str
     category: str
     targets: tuple[int, ...]  # token indexes to censor
+    masked: bool = False  # found by the masked-token rule ("f***ing"), not by a listed term
 
 
 def find_matches(lexicon: Lexicon, tokens: Sequence[Token]) -> list[Match]:
@@ -65,13 +66,28 @@ def find_matches(lexicon: Lexicon, tokens: Sequence[Token]) -> list[Match]:
         category = lexicon.masked_category(token.normalized)
         if category is not None:
             label = token.normalized if category == MASKED_CATEGORY else f"masked:{token.normalized}"
-            selected.append(Match(index, index + 1, label, category, (index,)))
+            selected.append(Match(index, index + 1, label, category, (index,), masked=True))
 
     selected.sort(key=lambda m: m.start)
     return selected
 
 
-def _runs(indexes: Sequence[int]) -> list[list[int]]:
+def find_hints(lexicon: Lexicon, tokens: Sequence[Token]) -> list[int]:
+    """Indexes of tokens where a hint term (a word subtitles use instead of profanity) starts."""
+    hits = []
+    for start in range(len(tokens)):
+        for term in lexicon.hints:
+            length = len(term.words)
+            if start + length <= len(tokens) and all(
+                term.words[k].matches(tokens[start + k].forms) for k in range(length)
+            ):
+                hits.append(start)
+                break
+    return hits
+
+
+def runs(indexes: Sequence[int]) -> list[list[int]]:
+    """Split token indexes into runs of consecutive ones: [1, 2, 5] -> [[1, 2], [5]]."""
     runs: list[list[int]] = []
     for index in sorted(indexes):
         if runs and index == runs[-1][-1] + 1:
@@ -86,7 +102,7 @@ def detect_in_words(lexicon: Lexicon, words: Sequence[Word]) -> list[Detection]:
     tokens = [Token.from_raw(word.text) for word in words]
     detections: list[Detection] = []
     for match in find_matches(lexicon, tokens):
-        for run in _runs(match.targets):
+        for run in runs(match.targets):
             span = [words[i] for i in run]
             detections.append(
                 Detection(

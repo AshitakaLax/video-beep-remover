@@ -47,3 +47,13 @@ def token_forms(normalized: str) -> tuple[str, ...]:
         if joined:
             return (normalized, joined)
     return (normalized,)
+
+
+_SEPARATORS = re.compile(r"--+|\.\.\.+|[—–…]")  # dashes and ellipses between words, e.g. "hell--no"
+
+
+def split_words(text: str) -> list[tuple[str, int, int]]:
+    """Whitespace-separated words of subtitle text with their character spans; dashes and ellipses
+    between words also separate them."""
+    spaced = _SEPARATORS.sub(lambda m: " " * len(m.group()), text)
+    return [(text[m.start() : m.end()], m.start(), m.end()) for m in re.finditer(r"\S+", spaced)]
