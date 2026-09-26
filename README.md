@@ -7,33 +7,40 @@
 - **Rendering:** FFmpeg mutes each word with a short fade and re-encodes only the audio track. Video, other streams and chapters are copied untouched.
 - **Checking:** every muted span in the output is verified to be silent before the file is kept.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the design and [docs/vbr.example.toml](docs/vbr.example.toml) for every configuration option.
+See [docs/DESIGN.md](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md) for the design and [docs/vbr.example.toml](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/vbr.example.toml) for every configuration option.
 
 ## Status
 
-Milestones M0 to M4 of the [delivery plan](docs/DESIGN.md#13-delivery-plan) are implemented:
+All milestones of the [delivery plan](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#13-delivery-plan), M0 to M5, are implemented:
 
 - the full-transcription pipeline, configuration, reports and EDL output
 - subtitle-guided search with embedded and sidecar subtitles: the `hybrid` (default) and `targeted` strategies
 - online subtitles from OpenSubtitles.com, with your own free API key, and an optional re-sync with ffsubsync
 - the rest of v1: listed words masked in the output's subtitles, review subtitles, `vbr render` from an edited report, checks on other audio tracks, folder batches, and a transcript cache that makes re-runs fast
+- polish: an optional WhisperX backend and edge refinement for tighter word edges, GPU libraries installable with pip, and a release pipeline to PyPI
 
 A file without usable subtitles falls back to transcribing the whole soundtrack, as §7 of the design describes, or fails with `--no-fallback`.
 
-The defaults have been checked on a synthetic evaluation set only (see [Evaluate](#evaluate)); tuning them on real film clips is still to do, along with M5 (WhisperX, packaging and release).
+The defaults have been checked on a synthetic evaluation set only (see [Evaluate](#evaluate)); tuning them on real film clips is still to do. Changes are listed in the [changelog](https://github.com/AshitakaLax/video-beep-remover/blob/main/CHANGELOG.md).
 
 ## Install
 
 You need Python 3.11+ and FFmpeg 5.1+ (`ffmpeg` and `ffprobe` on your `PATH`).
 
 ```console
-$ pipx install git+https://github.com/AshitakaLax/video-beep-remover
+$ pipx install video-beep-remover
 $ vbr doctor          # checks FFmpeg, the mute filter, Whisper and credentials
 ```
 
-To also re-time subtitles that are badly out of sync, install the optional [ffsubsync](https://github.com/smacke/ffsubsync) extra: `pipx install "video-beep-remover[sync] @ git+https://github.com/AshitakaLax/video-beep-remover"`.
+The development version installs from GitHub: `pipx install git+https://github.com/AshitakaLax/video-beep-remover`.
 
-Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the CPU otherwise. The model downloads on first use.
+Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the CPU otherwise. The model downloads on first use. Optional extras add more, e.g. `pipx install "video-beep-remover[gpu,sync]"`:
+
+| Extra | Adds |
+|---|---|
+| `gpu` | The cuBLAS and cuDNN libraries that Whisper needs on NVIDIA GPUs, on Linux. vbr loads them itself, so there is no `LD_LIBRARY_PATH` to set. The NVIDIA driver is still needed. |
+| `align` | [WhisperX](https://github.com/m-bain/whisperX) forced alignment, for tighter word edges (see [Word edges](#word-edges)). It brings PyTorch, a large download. |
+| `sync` | [ffsubsync](https://github.com/smacke/ffsubsync), to re-time subtitles that are badly out of sync. |
 
 ## Use
 
@@ -84,6 +91,13 @@ vbr transcribes the whole soundtrack instead when:
 - the audio confirms fewer than half of the flagged lines
 
 With `--no-fallback`, the first and last cases fail the file instead. Many windows are still cheaper than everything, so they are transcribed. The JSON report records which subtitles were tried and why a fallback happened.
+
+## Word edges
+
+Whisper's word times are approximate, so each muted span is padded: 120 ms before the word and 200 ms after it (`censor.pad_before_ms`, `censor.pad_after_ms`). On the synthetic evaluation set, Whisper placed word ends up to 230 ms early, and starts early too. Two optional settings work on the edges:
+
+- **WhisperX** (`transcription.backend = "whisperx"`, with the `align` extra). After Whisper transcribes, a wav2vec2 model aligns each word to the audio. On the evaluation set, word ends then came within 50 ms of the truth, where Whisper's came up to 230 ms early. Aligned starts came up to 200 ms late, though, so vbr keeps the earlier of the two starts and the later of the two ends: alignment only ever widens a word. With the default padding, that mutes a little more around each word. `pad_after_ms = 120` still fully muted every word the default did. On a CPU, `hybrid` took 18 % longer, plus a few seconds to load PyTorch. English, French, German, Spanish, Italian and 36 more languages have an alignment model; for others, name one with `transcription.align_model`.
+- **Edge refinement** (`censor.refine_edges = true`). Each edge of a muted span moves outward, by up to 80 ms, to the quietest 10 ms nearby, so a fade doesn't cut a syllable in half. On the evaluation set it made no difference with the default padding. With `pad_after_ms = 120`, it raised the share of fully muted words from 69 % to 88 %.
 
 ## Online subtitles
 
@@ -136,7 +150,7 @@ $ python scripts/evaluate.py /tmp/vbr-eval --set transcription.device=cpu
 $ python scripts/evaluate.py /tmp/vbr-eval --set censor.pad_after_ms=200 --cache /tmp/vbr-eval-cache
 ```
 
-Synthetic speech is far cleaner than a film's soundtrack, so this set catches regressions and systematic effects but can't tune the defaults for real films. On it, every strategy mutes every word it detects, with no false positives; `hybrid` fully mutes 94 % of the listed words, and what it misses are words the subtitles softened into ordinary words. It also showed that Whisper places word ends up to 230 ms early, which is why `censor.pad_after_ms` is 200. Details are in [Appendix C of the design](docs/DESIGN.md#appendix-c-evaluation-on-the-synthetic-set).
+Synthetic speech is far cleaner than a film's soundtrack, so this set catches regressions and systematic effects but can't tune the defaults for real films. On it, every strategy mutes every word it detects, with no false positives; `hybrid` fully mutes 94 % of the listed words, and what it misses are words the subtitles softened into ordinary words. It also showed that Whisper places word ends up to 230 ms early, which is why `censor.pad_after_ms` is 200. Details are in [Appendix C of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-c-evaluation-on-the-synthetic-set).
 
 ## License
 

@@ -245,14 +245,16 @@ src/video_beep_remover/
 ├── asr/
 │   ├── base.py            # Transcriber protocol, Clip
 │   ├── faster_whisper.py  # default backend (sequential, or batched with packed windows)
+│   ├── whisperx.py        # optional backend: faster-whisper words re-timed by forced alignment
+│   ├── cuda.py            # loads the [gpu] extra's cuBLAS and cuDNN
 │   ├── vad.py             # Silero speech regions; trimming clips to their speech
-│   ├── cache.py           # transcripts and speech regions kept between runs (§8.3)
-│   └── later: whisperx.py (M5)
+│   └── cache.py           # transcripts and speech regions kept between runs (§8.3)
 ├── detect/
 │   ├── normalize.py, lexicon.py, matcher.py
 │   ├── planner.py         # flagging, windows, uncovered speech, coverage
 │   ├── confirm.py         # window transcripts → detections, confirmation, estimates
-│   └── intervals.py       # padding, min length, merge
+│   ├── intervals.py       # padding, min length, merge
+│   └── refine.py          # optional: edges moved to the quietest 10 ms nearby
 └── report/                # JSON report, EDL, review SRT; reading a report back for vbr render
 ```
 
@@ -351,7 +353,7 @@ Sources are tried in the configured order. Acquisition stops at the first candid
 | embedded | Text subtitle streams (`subrip`, `ass`, `ssa`, `webvtt`, `mov_text`, `text`). Extraction reads the whole file, so every candidate stream is extracted in one pass (`ffmpeg -i file:<input> -map 0:<index> -f srt <file> ...`), the first time one is needed. ASS stays ASS. Commentary tracks are skipped. | trusted |
 | sidecar | `<stem>.*.{srt,ass,ssa,vtt}` next to the video or inside `Subs/` or `Subtitles/`; `Subs/<stem>/*` (season packs); any file in `Subs/` when the video is alone in its folder (movie releases). Language, SDH and forced come from name tokens (`.en.`, `.eng.`, `.English.`, `.sdh.`, `.cc.`, `.forced.`). `.hi.` means hearing impaired next to a language token and Hindi on its own. | trusted |
 | OpenSubtitles.com | Hash search first, then a metadata search (§6.4). | trusted if `moviehash_match`, otherwise untrusted |
-| more providers (optional `subliminal` adapter) | Podnapisi, Addic7ed, Gestdown, and others. | untrusted |
+| more providers (a `subliminal` adapter; not implemented yet) | Podnapisi, Addic7ed, Gestdown, and others. | untrusted |
 
 **Ranking.** These filter candidates out:
 
@@ -466,7 +468,12 @@ The default backend is faster-whisper.
 - **Trimming to speech.** After a pause, Whisper tends to start the first word at the very beginning of the clip. During implementation, a word 0.85 s into a clip was placed at 0.00 s, and faster-whisper's own clamp only engages after longer pauses. So each window is trimmed to its speech (Silero VAD, which pads speech by 0.2 s, plus 0.1 s) before transcription. That brought the error to about 0.2 s, spent in silence. A window where VAD hears nothing is transcribed whole, since VAD can miss shouting or singing.
 - **Window edges.** Words within 0.3 s of a window edge are dropped as unreliable, because the edge may cut a word in half. The rule does not apply at the start or end of the file, or at an edge trimmed to silence. Where the pieces of a split window overlap, each keeps its words before or after the middle of the overlap. Windows are padded so flagged cues sit well inside them.
 - **Model files.** Models are downloaded from Hugging Face on first use and cached. With `offline = true` they load with `local_files_only=True`. A model missing from the cache is then an error (exit code 3), not a download.
-- **Optional alignment.** The `whisperx` backend adds wav2vec2 forced alignment for tighter word boundaries. Default alignment models cover English, French, German, Spanish and Italian.
+- **GPU libraries.** On a GPU, the CUDA libraries that the `[gpu]` extra installs with pip are loaded by path before the first model. ctranslate2 looks for cuBLAS and cuDNN only on the library search path, which pip's copies are not on; faster-whisper's documentation has users set `LD_LIBRARY_PATH` instead.
+- **Optional alignment.** The `whisperx` backend (`[align]` extra) re-times faster-whisper's words with wav2vec2 forced alignment, through WhisperX:
+  - **Per segment.** Each segment is aligned as soon as it is decoded, with 0.2 s of audio around it, so progress stays smooth even in full mode. WhisperX aligns the segment's words, or its characters in Chinese and Japanese, and they are paired back with Whisper's words. A segment whose alignment fails or loses words keeps Whisper's times.
+  - **Widened, not replaced.** On the evaluation set, Whisper's word ends came up to 230 ms early and the aligned ones within 50 ms. But aligned starts came up to 200 ms late, where Whisper's were always early (Appendix C). A word censored late is heard, so each word keeps the earlier of the two starts and the later of the two ends. An aligned edge more than 0.5 s outside Whisper's is taken for a misalignment and ignored.
+  - **Models.** `transcription.align_model = "auto"` uses WhisperX's default for the language: torchaudio models for English, French, German, Spanish and Italian, and Hugging Face models for 36 more. Other languages need a wav2vec2 model named explicitly; without one, the run fails with a config error. WhisperX also needs NLTK's `punkt_tab` sentence data, which is fetched up front, because WhisperX's own quiet fetch would otherwise fail every segment. Offline, the alignment model and `punkt_tab` must already be downloaded.
+  - **Scope.** Anchors (§6.6) are only matched as text, so they are never aligned. `vbr doctor` shows the alignment model and whether it is downloaded.
 
 ### 6.9 Matching and confirmation
 
@@ -495,7 +502,12 @@ Each detection `[start, end]` becomes an interval as follows:
 
 The result is **sorted and disjoint by construction**, which the renderer requires (§6.11). The renderer's fades sit inside this padding, so they never touch the word itself.
 
-An optional refinement moves each edge *outward only* to the nearest 10 ms RMS energy minimum within 80 ms. This avoids clipping half a syllable.
+**Edge refinement** (`censor.refine_edges`, off by default). Padding usually puts an edge in the pause between words. When an edge lands in speech instead, its fade cuts a syllable in half. The refinement moves each edge *outward only*, by at most 80 ms, to where a 10 ms fade would be quietest:
+
+- a start edge to the quietest 10 ms frame that starts within 80 ms before it;
+- an end edge to the quietest frame that ends within 80 ms after it.
+
+Frames within 1 dB of the quietest, or below −60 dBFS, count as equally quiet, and the one nearest the original edge wins. So an edge already in a pause stays where it is, and one in steady sound doesn't wander. Refined intervals are clamped to the file and merged again by the same `merge_gap_ms` rule, so they stay sorted and disjoint. The audio comes from the decoded track when the strategy decoded it. Otherwise it is read by seeking, one read for each group of intervals less than 5 s apart.
 
 ### 6.11 Rendering with FFmpeg
 
@@ -597,8 +609,8 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
   "windows": {"flagged_cues": {"lexicon": 38, "masked": 3, "hint": 2}, "uncovered_regions": 9, "count": 36,
               "audio_seconds": 281.0, "coverage": 0.038, "expanded": 2, "cached": 0, "partly_cached": 0},
   "confirmation": {"strong_flags": 41, "confirmed": 40},
-  "transcription": {"model": "large-v3-turbo", "device": "cuda", "compute_type": "float16", "words": 3120,
-                    "from_cache": "none"},
+  "transcription": {"backend": "faster-whisper", "model": "large-v3-turbo", "device": "cuda",
+                    "compute_type": "float16", "words": 3120, "from_cache": "none"},
   "detections": [{"start": 4383.41, "end": 4383.78, "heard": "hell", "term": "hell", "category": "mild",
                   "confidence": 0.94, "source": "asr", "cue": 812}],
   "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
@@ -676,7 +688,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 ```
 
 - **Fingerprint.** The fingerprint is the OpenSubtitles hash plus the file size, which is cheap to compute. Files under 128 KiB have none and are not cached.
-- **Settings.** The settings hash covers what changes what the model hears: model, precision, batching, language, beam size, VAD, and the `initial_prompt` *setting*. It leaves out the word list, even though `"auto"` words the prompt from it, so that editing the list reuses what was heard. Anchors are cached under their own model and no prompt.
+- **Settings.** The settings hash covers what changes what the model hears: model, precision, batching, language, beam size, VAD, and the `initial_prompt` *setting*. It leaves out the word list, even though `"auto"` words the prompt from it, so that editing the list reuses what was heard. Anchors are cached under their own model and no prompt. With the `whisperx` backend, the alignment model is part of the hash too. Aligned words are then cached apart from unaligned ones, and the hashes of unaligned transcripts are unchanged.
 - **Transcripts.** Each line holds a window as planned, the clip actually transcribed (trimmed to speech) and its words. A window is served from the cache when:
   - the same window was transcribed before; or
   - one transcript covers it reliably, i.e. without its last 0.3 s at an edge that could cut a word; or
@@ -748,7 +760,10 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - the post-render check failing on a deliberately broken command file
   - codec choice
   - stream order, tags, dispositions and chapters preserved (checked with ffprobe on the output)
-- **ASR integration tests** (opt-in). A short speech fixture with known profanity timestamps, run with `tiny.en`. Detections must fall within ±300 ms.
+- **ASR integration tests** (opt-in with `VBR_RUN_ASR_TESTS=1`; need espeak-ng). A short film synthesized with espeak-ng, with verbatim subtitles and one line missing from them, is run with `small.en`:
+  - every strategy must find the words it can hear;
+  - targeted detections must fall within 100 ms of full-mode ones;
+  - when WhisperX is installed, the `whisperx` backend must find the same words, never narrower than Whisper's own times.
 - **Evaluation set.** 20–30 annotated clips across genres, accents, music-heavy scenes and TV and film subtitles. Each clip has ground-truth profanity timestamps. The metrics are:
   - recall (primary)
   - precision
@@ -761,7 +776,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   `scripts/evaluate.py SET_DIR` runs every strategy over a folder of clips, each annotated in `<stem>.truth.json` (`{"words": [{"start", "end", "word"}]}`), with any subtitles next to it. It reports recall (listed words muted over at least 95 % of their length), partial recall (at least half), precision (detections that overlap a listed word), the median and worst start and end error of detected words, extra muted seconds, seconds of audio transcribed and wall time, the last three per minute of video. `--set KEY=VALUE` overrides settings, to compare them.
 
   No real annotated clips are in the repository: film clips cannot be shared. `scripts/make_synthetic_set.py` builds a stand-in set from espeak-ng speech: eight clips of about four minutes, several voices and speeds, noise and a music-like bed, and subtitles that are verbatim, masked, softened, missing lines, late by 1.7 s or absent. Every listed word is synthesized on its own, so its timing is exact. Synthetic speech is much cleaner than a soundtrack, so this set catches regressions and shows systematic effects, but it cannot tune the defaults for real films. Results are in Appendix C.
-- **CI.** GitHub Actions runs ruff, mypy and pytest on Linux, macOS and Windows with Python 3.11–3.13. Linux also runs against FFmpeg 5.1, 6.1 and 7.x.
+- **CI.** GitHub Actions runs ruff and mypy, and runs pytest on Linux with Python 3.11–3.13 and on macOS and Windows with Python 3.12. Linux installs the distribution's FFmpeg; the macOS and Windows runners have none, so the FFmpeg tests skip themselves there. A `package` job builds the sdist and wheel, checks them with `twine check --strict`, installs the wheel in a fresh environment and runs it. The WhisperX backend is tested against a stand-in module, since PyTorch is too heavy for CI.
 
 ## 12. Dependencies and packaging
 
@@ -778,15 +793,24 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 
 **Extras:**
 
-- `[gpu]`: CUDA 12 cuBLAS and cuDNN 9 wheels, as faster-whisper documents
+- `[gpu]`: the CUDA 12 cuBLAS and cuDNN 9 wheels that faster-whisper documents, on Linux. vbr loads them itself (§6.8), so no `LD_LIBRARY_PATH` is needed.
+- `[align]`: whisperx 3.8.1 or later (the first with offline model loading), which brings PyTorch.
 - `[sync]`: ffsubsync
-- `[align]`: whisperx
-- `[providers]`: subliminal
 - `[dev]`: pytest, hypothesis, respx, ruff, mypy
+- later, with the subliminal adapter (§6.3): `[providers]`
 
 **External:** FFmpeg and ffprobe 5.1 or later. The prototype ran on 6.1.1.
 
 **Packaging:** `pyproject.toml` (hatchling) with a `src/` layout and entry points `vbr` and `video-beep-remover`, distributed on PyPI. Installing with pipx is recommended. A container image with FFmpeg and CUDA may come later.
+
+**Releases** (`docs/RELEASING.md`). Pushing a tag `vX.Y.Z` runs the Release workflow, which:
+
+1. checks that the tag matches `__version__` and that `CHANGELOG.md` has a section for it;
+2. builds and checks the sdist and wheel;
+3. publishes them to PyPI with trusted publishing, so no token is stored;
+4. creates a GitHub release with the changelog section as its notes.
+
+Running the workflow by hand publishes to TestPyPI instead, for a trial.
 
 ## 13. Delivery plan
 
@@ -799,7 +823,11 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | M4 Complete v1 | Output subtitle censoring, review SRT, `render --report`, `other_audio_streams`, folder batch mode, span-based transcript cache | The v1 feature set is complete, and defaults are tuned on the evaluation set. |
 | M5 Polish | WhisperX backend, edge refinement, packaging and release, docs | Published to PyPI. |
 
-M0 to M4 are implemented. M4's defaults were checked on a synthetic evaluation set, which changed `pad_after_ms` and fixed the sync fit (Appendix C); tuning them on real film clips is still to do.
+M0 to M5 are implemented:
+
+- M4's defaults were checked on a synthetic evaluation set, which changed `pad_after_ms` and fixed the sync fit (Appendix C). Tuning them on real film clips is still to do.
+- M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
+- M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
 
 ## 14. Alternatives considered
 
@@ -822,7 +850,7 @@ M0 to M4 are implemented. M4's defaults were checked on a synthetic evaluation s
 **Still open**
 
 1. Does the `initial_prompt = "auto"` priming reduce masked output without adding false positives? This is decided on the evaluation set, and so is the alternative of faster-whisper `hotwords`.
-2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present? On the synthetic set, word ends came 90–120 ms early in the median and up to 230 ms early, so `pad_after_ms` went from 120 to 200 ms; starts came early too (Appendix C). Real speech should confirm both values.
+2. What should the default padding be, and should WhisperX alignment be the default when a GPU is present? On the synthetic set, word ends came 90–120 ms early in the median and up to 230 ms early, so `pad_after_ms` went from 120 to 200 ms; starts came early too (Appendix C). With alignment, ends came within 50 ms, so `pad_after_ms` could drop to about 120 ms; aligned starts came up to 200 ms late, so alignment only widens Whisper's times. Edge refinement lets a shorter padding keep most of its recall. Real speech should decide all three, and whether padding should depend on the backend.
 3. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
 4. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
 5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
@@ -924,6 +952,38 @@ Each row ran without the transcript cache.
 | 250 | 95.8 % | 87.5 % | 91.7 % | 0.5 s |
 | 300 | 95.8 % | 87.5 % | 91.7 % | 0.5 s |
 
+**Forced alignment (M5).** `hybrid` with `transcription.backend = "whisperx"`, uncached. The first run also paid for loading PyTorch and the aligner from this container's cold disk, about 150 s. The row is a second run, on a warm disk, where loading took about 6 s.
+
+| Backend | Recall | Precision | Start error, median / worst | End error, median / worst | Extra | Time |
+|---|---|---|---|---|---|---|
+| faster-whisper | 93.8 % | 100 % | −95 / −248 ms | −88 / −226 ms | 0.43 s | 8.9 s |
+| whisperx | 93.8 % | 100 % | −95 / −248 ms | −12 / −49 ms | 0.54 s | 10.5 s |
+
+The aligned times before widening, measured on whole-track transcripts by small.en, show why the backend widens (§6.8). Over 46 detected listed words:
+
+- aligned ends came −14 ms in the median and −51 ms at worst, against −117 / −226 ms for Whisper;
+- aligned starts came +13 ms in the median but up to +195 ms late, and 8 of the 46 started more than 120 ms late, which `pad_before_ms` would not have covered;
+- Whisper's starts were all early.
+
+Giving the aligner 0, 0.2 or 0.5 s of audio around each segment changed little.
+
+With aligned ends, the padding after a word can shrink. `pad_after_ms` swept for `whisperx`, with the transcripts cached:
+
+| `pad_after_ms` | 80 | 100 | 120 | 150 | 200 |
+|---|---|---|---|---|---|
+| Recall | 93.8 % | 93.8 % | 93.8 % | 93.8 % | 93.8 % |
+| Extra per minute | 0.39 s | 0.41 s | 0.44 s | 0.48 s | 0.54 s |
+
+**Edge refinement (M5).** `hybrid` with faster-whisper, the transcripts cached (so, as in M4's padding sweep, it reused the windows `targeted` had transcribed):
+
+| `pad_after_ms` | Recall, off | Recall, on | Extra per minute, off | Extra per minute, on |
+|---|---|---|---|---|
+| 120 | 68.8 % | 87.5 % | 0.33 s | 0.40 s |
+| 160 | 87.5 % | 91.7 % | 0.37 s | 0.45 s |
+| 200 | 91.7 % | 91.7 % | 0.42 s | 0.50 s |
+
+Reading the audio around the intervals by seeking added about 0.1 s per minute of video.
+
 **Findings.**
 
 1. **Word ends come early.** Whisper places the end of a word 90–120 ms early in the median and up to 230 ms early. With 120 ms of padding after, a quarter of the words kept an audible tail, hence the new default of 200 ms. Starts come early too, by 80–90 ms, so the 120 ms before a word leaves plenty of margin. On real speech the next word may start right away, and 200 ms can clip its onset; the real evaluation set should confirm the value (open question 2).
@@ -933,6 +993,8 @@ Each row ran without the transcript cache.
    - `targeted` also misses lines the subtitles leave out, which `hybrid` catches.
    - small.en, used by `full` on the CPU, did not recognize "damn" in two of the voices; large-v3-turbo in the windows did.
 4. **Speed on a CPU.** The windows cover a quarter of this dense set, and running large-v3-turbo on them costs about as much as small.en on everything. On a film, where flagged lines are minutes apart, the windows cover a few percent (§8.1). On a GPU both use large-v3-turbo.
-5. **The sync check, fixed on the way (§6.6).** The first run rejected subtitles 1.7 s late under `hybrid` (timing error 0.53 s) and accepted them under `targeted` with a scale of 1.0026, when the truth was a plain offset. Anchor words that follow a pause were placed up to 2 s early, and the fit followed them to a scale no real mismatch produces. With both fixed, the same clip passes with errors of 0.05 and 0.09 s.
+5. **Forced alignment fixes the ends, not the starts.** Aligned word ends are within 50 ms, and `pad_after_ms` could drop to 80–120 ms at no loss of recall on this set. But aligned starts can come 200 ms late, so the backend widens Whisper's times rather than replacing them. At the default padding it therefore mutes a little more, not less. On a CPU it costs about 18 % more time in `hybrid`. It stays optional, and the padding stays the same for both backends until real speech confirms the numbers (open question 2).
+6. **Edge refinement recovers what a short padding misses, and adds nothing at 200 ms.** On synthetic speech, with clean pauses between words, it lifts 120 ms of padding most of the way to the recall of 200 ms, at about 0.07 s more muting per minute. With the default padding every detected word is already fully muted, so refinement stays off by default. Real soundtracks, where words run together, decide whether it earns a place.
+7. **The sync check, fixed on the way (§6.6).** The first run rejected subtitles 1.7 s late under `hybrid` (timing error 0.53 s) and accepted them under `targeted` with a scale of 1.0026, when the truth was a plain offset. Anchor words that follow a pause were placed up to 2 s early, and the fit followed them to a scale no real mismatch produces. With both fixed, the same clip passes with errors of 0.05 and 0.09 s.
 
-**Not measured here.** Real soundtracks, accents and subtitles; the prompt setting (open question 1); `fade_ms` on real speech (open question 6); the dialogue check's threshold (§6.11); and GPU timings. These need a set of real annotated clips.
+**Not measured here.** Real soundtracks, accents and subtitles; the prompt setting (open question 1); `fade_ms` on real speech (open question 6); the dialogue check's threshold (§6.11); and GPU timings, with or without alignment. These need a set of real annotated clips and a GPU.
