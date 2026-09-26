@@ -379,7 +379,7 @@ This provider uses the REST API v1 at `https://api.opensubtitles.com/api/v1/`. E
 4. **Download.** `POST /download {"file_id": N}` returns `{link, remaining, reset_time_utc}`. The tool fetches `link`, caps the file at 5 MB and detects the encoding with charset-normalizer. The file is cached under its `file_id` and indexed by the movie hash, so a cached copy never costs quota again.
 5. **Quota and rate limits.** Downloads are limited per 24 h: 5 per IP address without logging in, more for logged-in and VIP users. The tool downloads only the top candidate and tries the next one only if the sync check fails, up to `max_candidates`. When the quota runs out (`remaining` reaches 0 or a download is refused), the tool warns, records the reset time in the report and moves on to the fallback. HTTP 429 is retried with capped exponential backoff, honouring `Retry-After`.
 
-**API key.** No API key ships with the tool. Each user creates a free OpenSubtitles.com account, registers their own API consumer to get a key, and supplies it through `${OPENSUBTITLES_API_KEY}`. Without a key, the provider is skipped with a notice, and the run falls back to local subtitles or full transcription. `vbr doctor` reports whether a key is set and accepted. The legacy OpenSubtitles.org XML-RPC API is not used.
+**API key.** No API key ships with the tool. Each user creates a free OpenSubtitles.com account, registers their own API consumer to get a key, and supplies it through `${OPENSUBTITLES_API_KEY}`. Without a key, the provider is skipped with a notice and the other subtitle sources are still tried. If none of them yields a usable candidate, the fallback rules in §7 apply: the run transcribes the whole soundtrack, or fails when `fallback_to_full = false`. `vbr doctor` reports whether a key is set and accepted. The legacy OpenSubtitles.org XML-RPC API is not used.
 
 ### 6.5 Parsing and cleaning cues
 
@@ -578,7 +578,7 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
 
 `vbr render --report` reads only `intervals`, so users can add, delete or adjust spans by hand.
 
-**EDL** (`--edl`). A mute list in the Kodi and MPlayer format, `start end 1` where action 1 means mute:
+**EDL** (`--edl`). A mute list in the Kodi and MPlayer format, written next to the input as `<input stem>.edl`. Each line is `start end 1`, where action 1 means mute:
 
 ```
 4383.29	4383.90	1

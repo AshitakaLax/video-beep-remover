@@ -145,7 +145,7 @@ other_audio_streams = "auto"        # "auto" | "censor" | "copy" | "drop" (see D
 subtitle_streams = "censor"         # "censor" | "copy" | "drop"
 subtitle_mask = "first_letter"      # "first_letter" (f***) | "asterisks" (****) | "remove"
 report = true                       # <output stem>.vbr.json
-edl = false                         # <output stem>.edl mute list for Kodi / MPlayer
+edl = false                         # <input stem>.edl next to the input: Kodi / MPlayer mute the original file
 
 [cache]
 dir = "auto"                        # per-user cache dir
