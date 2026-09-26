@@ -119,6 +119,7 @@ class OutputConfig(_Model):
 class CacheConfig(_Model):
     dir: str = "auto"
     max_size_gb: float = Field(5, ge=0)
+    transcripts: bool = True
 
 
 class ToolsConfig(_Model):

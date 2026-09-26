@@ -49,7 +49,9 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Create, show and check configuration files.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
-cache_app = typer.Typer(help="Inspect or clear the cache of downloaded subtitles.", no_args_is_help=True)
+cache_app = typer.Typer(
+    help="Inspect or clear the cache of downloaded subtitles and transcripts.", no_args_is_help=True
+)
 app.add_typer(cache_app, name="cache")
 
 console = Console(stderr=True, highlight=False)
@@ -559,21 +561,40 @@ def config_check(config: ConfigOpt = None) -> None:
 @cache_app.command("info")
 def cache_info(config: ConfigOpt = None) -> None:
     """Show where the cache is and what it holds."""
+    from video_beep_remover.asr.cache import TranscriptCache
     from video_beep_remover.subtitles.cache import SubtitleCache
 
-    root = cache_root(_load_or_exit(config).config)
-    count, size = SubtitleCache(root).usage()
+    cfg = _load_or_exit(config).config
+    root = cache_root(cfg)
+    subtitles, subtitle_bytes = SubtitleCache(root).usage()
+    transcripts, transcript_bytes = TranscriptCache(root).usage()
     console.print(f"cache: {escape(str(root))}")
-    console.print(f"downloaded subtitles: {count} files, {size / 1024:.0f} KiB")
+    console.print(f"downloaded subtitles: {subtitles} files, {subtitle_bytes / 1024:.0f} KiB")
+    state = "" if cfg.cache.transcripts else " (not kept: cache.transcripts = false)"
+    console.print(
+        f"transcripts: {transcripts} files, {transcript_bytes / 1024**2:.1f} MiB "
+        f"of at most {cfg.cache.max_size_gb:g} GB{state}"
+    )
 
 
 @cache_app.command("clear")
-def cache_clear(config: ConfigOpt = None) -> None:
-    """Delete the downloaded subtitles. Downloading them again counts against your quota."""
+def cache_clear(
+    config: ConfigOpt = None,
+    subtitles: Annotated[
+        bool, typer.Option("--subtitles", help="Only the downloaded subtitles (downloading costs quota).")
+    ] = False,
+    transcripts: Annotated[bool, typer.Option("--transcripts", help="Only the transcripts.")] = False,
+) -> None:
+    """Delete what the cache holds: everything, or only the subtitles or the transcripts."""
+    from video_beep_remover.asr.cache import TranscriptCache
     from video_beep_remover.subtitles.cache import SubtitleCache
 
-    removed = SubtitleCache(cache_root(_load_or_exit(config).config)).clear()
-    console.print(f"removed {removed} files")
+    root = cache_root(_load_or_exit(config).config)
+    both = not subtitles and not transcripts
+    if subtitles or both:
+        console.print(f"removed {SubtitleCache(root).clear()} downloaded subtitle files")
+    if transcripts or both:
+        console.print(f"removed {TranscriptCache(root).clear()} transcript files")
 
 
 @app.command()

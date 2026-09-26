@@ -189,3 +189,17 @@ def test_same_language_audio_is_muted_only_if_it_carries_the_same_dialogue(tmp_p
     for stream in ("0:a:0", "0:a:1"):
         samples = decode(result.output, stream)
         assert float(np.sqrt(np.mean(samples[int(2.0 * 48_000) : int(2.4 * 48_000)] ** 2))) < 1e-3
+
+
+def test_a_full_transcript_is_cached_and_serves_the_next_run(tmp_path: Path) -> None:
+    source = make_clip(tmp_path / "movie.mkv", duration=12.0)  # big enough for a fingerprint
+    fake = FakeTranscriber(SPOKEN)
+    loaded = load_config(None, env={}, cwd=tmp_path, overrides={"analysis.strategy": "full"})
+    Pipeline(loaded, transcriber_factory=lambda choice: fake).process(source, RunOptions(dry_run=True))
+    assert len(fake.calls) == 1
+
+    Pipeline(loaded, transcriber_factory=lambda choice: fake).process(source, RunOptions(dry_run=True))
+    report = json.loads((tmp_path / "movie.vbr.json").read_text("utf-8"))
+    assert len(fake.calls) == 1 and "decode" not in report["timings"]
+    assert report["transcription"]["from_cache"] == "all"
+    assert [d["heard"] for d in report["detections"]] == ["damn"]

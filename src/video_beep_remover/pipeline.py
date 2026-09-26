@@ -12,13 +12,15 @@ from typing import Any, Literal
 from video_beep_remover import __version__
 from video_beep_remover import guided as guided_analysis
 from video_beep_remover.asr.base import Clip, Transcriber, build_prompt
+from video_beep_remover.asr.cache import VERSION as TRANSCRIPT_VERSION
+from video_beep_remover.asr.cache import TranscriptCache, TranscriptStore, settings_key
 from video_beep_remover.asr.faster_whisper import (
     FasterWhisperTranscriber,
     ModelChoice,
     resolve_anchor_model,
     resolve_model,
 )
-from video_beep_remover.asr.vad import SpeechDetector, silero_speech
+from video_beep_remover.asr.vad import Regions, SpeechDetector, silero_speech
 from video_beep_remover.config.loader import LoadedConfig, cache_root, config_hash
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
@@ -53,7 +55,7 @@ from video_beep_remover.report import (
 from video_beep_remover.subtitles.cache import SubtitleCache
 from video_beep_remover.subtitles.online import OnlineSubtitles
 from video_beep_remover.subtitles.opensubtitles import OpenSubtitlesClient
-from video_beep_remover.subtitles.oshash import opensubtitles_hash
+from video_beep_remover.subtitles.oshash import fingerprint, opensubtitles_hash
 from video_beep_remover.subtitles.output import censor_streams, write_censored_copy
 from video_beep_remover.ui import UI, NullUI, Progress
 
@@ -99,6 +101,7 @@ class Analysis:
     words: int
     model: ModelChoice | None
     report: dict[str, Any]  # strategy-specific report sections
+    from_cache: Literal["all", "some", "none"] | None = None  # transcripts; None: nothing to transcribe
 
 
 @dataclass
@@ -183,6 +186,17 @@ class _Track:
         self.audio = None  # closes the memory map, so the temp dir can be deleted (Windows)
 
 
+@dataclass
+class _CacheScope:
+    """What the transcript cache needs to know about the file being analysed."""
+
+    fingerprint: str
+    stream: int
+    duration: float
+    speech: Regions | None  # cached speech regions, if any
+    stores: dict[str, TranscriptStore] = field(default_factory=dict)
+
+
 class Pipeline:
     def __init__(
         self,
@@ -210,6 +224,8 @@ class Pipeline:
         self.subtitle_cache = SubtitleCache(cache_root(self.config))
         self._opensubtitles = opensubtitles
         self.tag = f"{__version__};{config_hash(self.config)}"  # VBR_CENSORED on every output
+        self.transcript_cache = TranscriptCache(cache_root(self.config))
+        self._scope: _CacheScope | None = None  # the file being analysed, for the transcript cache
 
     def opensubtitles(self) -> OpenSubtitlesClient | None:
         """The OpenSubtitles client, when there is a key and the network may be used. One client
@@ -241,17 +257,46 @@ class Pipeline:
             offline=self.config.offline,
         )
 
-    def transcriber(self, role: str) -> tuple[ModelChoice, Transcriber]:
+    def model_choice(self, role: str) -> ModelChoice:
         """The model for a role: "full", "targeted" or "hybrid" (by strategy), or "anchor"."""
         settings, language = self.config.transcription, self.config.analysis.language
         if role == "anchor":
-            choice = resolve_anchor_model(settings, language=language)
-        else:
-            choice = resolve_model(settings, strategy=role, language=language)
+            return resolve_anchor_model(settings, language=language)
+        return resolve_model(settings, strategy=role, language=language)
+
+    def transcriber(self, role: str) -> tuple[ModelChoice, Transcriber]:
+        """The model for a role, loaded on first use. Loading is announced on a line of its own rather
+        than a live status, since it can happen while one is shown (e.g. during the sync check)."""
+        choice = self.model_choice(role)
         if choice not in self._transcribers:
-            with self.ui.status(f"Loading Whisper model {choice.describe()}"):
-                self._transcribers[choice] = self._factory(choice)
+            self.ui.info(f"Loading Whisper model {choice.describe()}")
+            self._transcribers[choice] = self._factory(choice)
         return choice, self._transcribers[choice]
+
+    def transcripts(self, role: str) -> TranscriptStore | None:
+        """The cached transcripts of the file being analysed, for the model and settings of `role`."""
+        scope = self._scope
+        if scope is None:
+            return None
+        choice = self.model_choice(role)
+        settings = self.config.transcription
+        key = settings_key(
+            version=TRANSCRIPT_VERSION,
+            model=choice.name,
+            compute_type=choice.compute_type,
+            batched=choice.batched,
+            language=self.config.analysis.language,
+            beam_size=settings.beam_size,
+            # The prompt setting rather than the prompt itself: "auto" words it from the word list,
+            # and editing the list should not make everything be transcribed again.
+            prompt=None if role == "anchor" else settings.initial_prompt,
+            vad_filter=settings.vad_filter,
+        )
+        if key not in scope.stores:
+            scope.stores[key] = self.transcript_cache.store(
+                scope.fingerprint, scope.stream, choice.name, key, scope.duration
+            )
+        return scope.stores[key]
 
     def guided_context(self) -> guided_analysis.Context:
         return guided_analysis.Context(
@@ -263,26 +308,54 @@ class Pipeline:
             transcriber=self.transcriber,
             detect_speech=self.detect_speech,
             online=self.online_source,
+            transcripts=self.transcripts,
+            model_choice=self.model_choice,
         )
 
     def _full(
         self, track: _Track, lap: Callable[[str], None], fallback_reason: str | None, report: dict[str, Any]
     ) -> Analysis:
-        audio = track.get()
-        lap("decode")
-        choice, transcriber = self.transcriber("full")
-        with self.ui.progress("Transcribing", len(audio) / SAMPLE_RATE) as update:
-            [words] = transcriber.transcribe(
-                [Clip(0.0, audio)],
-                language=self.config.analysis.language,
-                prompt=self.prompt,
-                vad=self.config.transcription.vad_filter,
-                on_progress=update,
-            )
+        store = self.transcripts("full")
+        words = store.track() if store else None
+        cached = words is not None
+        if words is None:
+            audio = track.get()
+            lap("decode")
+            _, transcriber = self.transcriber("full")
+            with self.ui.progress("Transcribing", len(audio) / SAMPLE_RATE) as update:
+                [words] = transcriber.transcribe(
+                    [Clip(0.0, audio)],
+                    language=self.config.analysis.language,
+                    prompt=self.prompt,
+                    vad=self.config.transcription.vad_filter,
+                    on_progress=update,
+                )
+            if store:
+                store.add_track(words, len(audio) / SAMPLE_RATE)
         lap("transcribe")
         return Analysis(
-            "full", fallback_reason, detect_in_words(self.lexicon, words), len(words), choice, report
+            "full",
+            fallback_reason,
+            detect_in_words(self.lexicon, words),
+            len(words),
+            self.model_choice("full"),
+            report,
+            "all" if cached else "none",
         )
+
+    def _track_speech(self, track: _Track, audio: Audio | None) -> Callable[[Progress], Regions]:
+        """Speech in the whole track, for hybrid: from the cache, or found with VAD and then cached."""
+        scope = self._scope
+
+        def find(update: Progress) -> Regions:
+            if scope is not None and scope.speech is not None:
+                return scope.speech
+            regions = self.detect_speech(audio if audio is not None else track.get(), update)
+            if scope is not None:
+                self.transcript_cache.remember_speech(scope.fingerprint, scope.stream, regions)
+            return regions
+
+        return find
 
     def _analyse(
         self,
@@ -301,12 +374,15 @@ class Pipeline:
             if subtitles is not None:
                 self.ui.warn("--subtitles is not used with the full strategy")
             return self._full(track, lap, None, {})
-        audio: AudioSource
+        audio: AudioSource = SeekingAudioSource(self.ff, source, stream.index)
+        speech = None
         if requested == "hybrid":
-            audio = ArrayAudioSource(track.get())  # hybrid needs the whole track for VAD anyway
-            lap("decode")
-        else:
-            audio = SeekingAudioSource(self.ff, source, stream.index)
+            decoded = None
+            if self._scope is None or self._scope.speech is None:
+                decoded = track.get()  # VAD runs over the whole track, so windows slice it too
+                audio = ArrayAudioSource(decoded)
+                lap("decode")
+            speech = self._track_speech(track, decoded)
         try:
             found = guided_analysis.analyse(
                 self.guided_context(),
@@ -316,7 +392,7 @@ class Pipeline:
                 stream.index,
                 workdir,
                 explicit=subtitles,
-                track=track.audio,
+                speech=speech,
                 lap=lap,
             )
         except guided_analysis.Fallback as fallback:
@@ -326,7 +402,13 @@ class Pipeline:
                 ) from fallback
             self.ui.info(f"using the full strategy instead of {requested!r}: {fallback.reason}")
             return self._full(track, lap, fallback.reason, fallback.report)
-        return Analysis(requested, None, found.detections, found.words, found.model, found.report)
+        windows = found.report.get("windows", {})
+        total = windows.get("count", 0) + windows.get("expanded", 0)
+        cached, partly = windows.get("cached", 0), windows.get("partly_cached", 0)
+        from_cache: Literal["all", "some", "none"] | None = None
+        if total:
+            from_cache = "all" if cached == total else "some" if cached or partly else "none"
+        return Analysis(requested, None, found.detections, found.words, found.model, found.report, from_cache)
 
     def process(
         self, source: Path, options: RunOptions, *, many: bool = False, from_folder: bool = False
@@ -397,12 +479,19 @@ class Pipeline:
         cfg = self.config
         source, info, stream, result = job.source, job.info, job.stream, job.result
         track = _Track(self, source, info, stream, job.workdir)
+        found = fingerprint(source) if cfg.cache.transcripts else None
+        if found is not None:
+            speech = self.transcript_cache.speech(found, stream.index)
+            self._scope = _CacheScope(found, stream.index, info.duration, speech)
         try:
             analysis = self._analyse(source, info, stream, job.workdir, track, job.lap, job.options.subtitles)
         finally:
+            self._scope = None
             track.release()
             if not job.options.keep_temp:
                 track.path.unlink(missing_ok=True)  # the decoded track is not needed for rendering
+            if found is not None:
+                self.transcript_cache.evict(int(cfg.cache.max_size_gb * 1024**3))
         detections = analysis.detections
         intervals = build_intervals(
             detections,
@@ -451,6 +540,7 @@ class Pipeline:
                 "compute_type": model.compute_type if model else None,
                 "prompt": self.prompt,
                 "words": analysis.words,
+                "from_cache": analysis.from_cache,
             },
             "categories": list(self.lexicon.categories),
             "detections": [detection_dict(d) for d in detections],

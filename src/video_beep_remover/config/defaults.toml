@@ -150,7 +150,8 @@ review_srt = false                  # <output stem>.review.srt: one cue per mute
 
 [cache]
 dir = "auto"                        # per-user cache dir
-max_size_gb = 5
+max_size_gb = 5                     # transcripts beyond this are deleted, least recently used first
+transcripts = true                  # keep transcripts, so re-running a file (e.g. after editing the word list) is fast
 
 [tools]
 ffmpeg = "ffmpeg"
