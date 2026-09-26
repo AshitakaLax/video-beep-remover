@@ -38,7 +38,6 @@ masked_patterns = ["[*#]"]
 
 [lexicon.categories.strong]
 enabled = true
-action = "beep"                     # "beep" | "mute"; defaults to [censor].action
 terms = [
   "*fuck*", "*shit*", "cunt*", "*cocksucker*", "bitch*", "son of a bitch", "sonofabitch",
   "*asshole*", "bastard*", "dickhead*", "twat*", "wank*",
@@ -53,7 +52,6 @@ terms = [
 
 [lexicon.categories.religious]
 enabled = true
-action = "mute"
 terms = ["goddamn*", "god damn*", "god dammit", "jesus christ", "oh my [god]", "for christ's sake"]
 
 [lexicon.categories.slurs]
@@ -66,19 +64,14 @@ terms = []                          # add your own
 terms = ["freak*", "frick*", "friggin*", "heck", "darn*", "shoot", "crud", "effin*", "eff", "bleep*"]
 
 # ---------------------------------------------------------------------------
-# How censored words sound
+# How words are muted (mute is the only action; see DESIGN.md §16 for the replacement stretch goal)
 # ---------------------------------------------------------------------------
 [censor]
-action = "beep"                     # "beep" | "mute"
 pad_before_ms = 120                 # widen each detected word a little on both sides
 pad_after_ms = 120
-min_duration_ms = 250               # very short beeps sound like clicks
-merge_gap_ms = 250                  # join censored spans closer than this
-
-[censor.beep]
-frequency_hz = 1000
-level_dbfs = -18.0                  # peak level of the tone
-channels = "dialogue"               # "dialogue" = centre channel when the track has one, else all; "all"
+min_duration_ms = 250               # very short gaps sound like glitches
+merge_gap_ms = 250                  # join muted spans closer than this
+fade_ms = 10                        # smooth fade at each edge, inside the padding; avoids clicks
 
 # ---------------------------------------------------------------------------
 # How profanity is found

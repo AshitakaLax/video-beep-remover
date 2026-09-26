@@ -4,22 +4,22 @@
 
 ## 1. Overview
 
-`vbr` is a Python command-line tool that makes a "clean" copy of a video. Every word on a configurable list is beeped or muted in the soundtrack. The video stream and everything else in the file are copied untouched.
+`vbr` is a Python command-line tool that makes a "clean" copy of a video. Every word on a configurable list is muted in the soundtrack. The video stream and everything else in the file are copied untouched.
 
 Whisper speech recognition (via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)) finds each word and its timestamps. Running Whisper over a whole two-hour film is the slow part, so the tool first looks for subtitles: inside the file, next to it, or on OpenSubtitles.com. A subtitle cue that contains a listed word, or hints at one, shows where to listen. The tool then transcribes a few seconds of audio around each such cue to get exact word timings. For a typical film that is a few percent of the runtime instead of all of it. Without usable subtitles, it falls back to transcribing everything.
 
 ```
-subtitles  →  cue 812 (01:13:02.0–01:13:05.0): "What the f*** was that?"
-audio      →  transcribe 01:13:00.5–01:13:06.5 only  →  "fucking" at 01:13:03.41–01:13:03.78
-ffmpeg     →  beep 01:13:03.29–01:13:03.90 · re-encode the audio track · copy video, subtitles, chapters
+subtitles  →  cue 812 (01:13:02.0–01:13:05.0): "What the hell was that?"
+audio      →  transcribe 01:13:00.5–01:13:06.5 only  →  "hell" at 01:13:03.41–01:13:03.78
+ffmpeg     →  mute 01:13:03.29–01:13:03.90 · re-encode the audio track · copy video, subtitles, chapters
 ```
 
 ## 2. Goals and non-goals
 
 **Goals**
 
-1. Censor every occurrence of configured words and phrases in the dialogue track. Each occurrence is beeped or muted with roughly 0.1 s precision.
-2. Drive the word list and all behaviour from a TOML config file. The file supports categories, wildcards, phrases, an allowlist and per-category actions.
+1. Mute every occurrence of configured words and phrases in the dialogue track, with roughly 0.1 s precision and short fades so the cuts don't click.
+2. Drive the word list and all behaviour from a TOML config file. The file supports categories, wildcards, phrases and an allowlist.
 3. Use subtitles (embedded, sidecar or online) to limit speech recognition to candidate regions. Fall back to full transcription automatically.
 4. Never re-encode video. Keep all other streams, chapters and metadata. Write output atomically.
 5. Be auditable: provide a dry run, a JSON report, an EDL mute list, and rendering from a hand-edited report.
@@ -27,6 +27,7 @@ ffmpeg     →  beep 01:13:03.29–01:13:03.90 · re-encode the audio track · c
 
 **Non-goals for v1**
 
+- Beep tones or other sounds over censored words. Censoring is mute-only. Replacing a word with generated speech in the speaker's voice is a stretch goal (§16).
 - Visual content (on-screen text, gestures) and cutting scenes.
 - Filtering in real time during playback. The EDL export covers players that support mute lists.
 - DRM-protected or encrypted media.
@@ -66,7 +67,6 @@ $ vbr clean "The Movie (2019).mkv"
 |---|---|---|
 | `-c, --config PATH` | n/a | See §4.1 for discovery. |
 | `-o, --output PATH` | `output.path` | A file (single input) or a directory. |
-| `--action beep\|mute` | `censor.action` | |
 | `--strategy hybrid\|targeted\|full` | `analysis.strategy` | See §7. |
 | `--no-fallback` | `analysis.fallback_to_full = false` | Fail instead of transcribing everything. |
 | `--subtitles PATH` | n/a | Use this file and skip the search. It is treated as trusted. |
@@ -98,7 +98,7 @@ Subtitles   embedded #4 "English SDH" (trusted) · 1,412 cues
 Sync        6/6 anchors · offset +0.04 s · error 0.09 s · fidelity 0.91
 Plan        43 flagged cues (38 word, 3 masked, 2 hint) + 9 unsubtitled speech regions → 36 windows · 4m41s of audio (3.8 %)
 Transcribe  ━━━━━━━━━━━━━━━━━━━━ 36/36 windows · 0:52
-Detect      47 detections (45 confirmed, 2 estimated) → 44 intervals (39 beep, 5 mute)
+Detect      47 detections (45 confirmed, 2 estimated) → 44 muted intervals
 Render      ━━━━━━━━━━━━━━━━━━━━ 100 % · 1:12 · #1 censored → eac3 640k · #2 dropped (commentary) · subtitles censored
 Done        The Movie (2019).clean.mkv · The Movie (2019).clean.vbr.json
 ```
@@ -123,8 +123,8 @@ That file is deep-merged over the packaged defaults (`defaults.toml`, which is t
 | Section | Controls |
 |---|---|
 | top level: `offline` | No network access at all (§10) |
-| `[lexicon]`, `[lexicon.categories.<name>]`, `[lexicon.hints]` | What to censor: terms, allowlist, masked-word detection, per-category `enabled`/`action`, subtitle hint words |
-| `[censor]`, `[censor.beep]` | How it sounds: beep or mute, padding, minimum length, merging, tone frequency, level and channels |
+| `[lexicon]`, `[lexicon.categories.<name>]`, `[lexicon.hints]` | What to censor: terms, allowlist, masked-word detection, per-category `enabled`, subtitle hint words |
+| `[censor]` | How muting is applied: padding, minimum length, merging, fade length |
 | `[analysis]`, `.targeted`, `.sync` | Strategy and fallback, audio stream, spoken language, window planning, sync and fidelity thresholds |
 | `[transcription]` | ASR backend, model, device, precision, batching, VAD, prompt |
 | `[subtitles]`, `.opensubtitles` | Source order, languages, preference for hearing-impaired tracks, credentials |
@@ -140,7 +140,6 @@ config_version = 1
 terms = ["*fuck*", "*shit*", "bitch*", "son of a bitch"]
 
 [lexicon.categories.religious]
-action = "mute"
 terms = ["goddamn*", "oh my [god]"]
 ```
 
@@ -165,7 +164,7 @@ The matcher runs on subtitle tokens and on Whisper words. The rules are:
 3. **Hyphenated forms.** Both the hyphenated and the joined form are tested, e.g. "mother-fucker" and "motherfucker".
 4. **Phrases.** A phrase matches consecutive words, ignoring punctuation between them.
 5. **Allowlist.** Allowlist entries (same syntax) veto single-word matches. Use them to fix wildcard collisions, e.g. `bastard*` matching "bastardize".
-6. **Masked tokens.** Masked tokens are flagged. Their category is inferred by aligning the visible letters with the terms (`f***ing` ↔ `*fuck*`). If nothing aligns, they get a built-in `masked` category that uses the default action.
+6. **Masked tokens.** Masked tokens are flagged. Their category is inferred by aligning the visible letters with the terms (`f***ing` ↔ `*fuck*`). If nothing aligns, they get a built-in `masked` category.
 7. **Overlaps.** Where terms overlap, the longest match wins. Each word is censored at most once.
 
 Prefer prefix wildcards (`cunt*`) over infix ones (`*cunt*` would match "Scunthorpe"). `vbr config check` warns about wildcard terms with fewer than three literal letters.
@@ -268,12 +267,11 @@ class Window:            # audio to transcribe
 @dataclass(frozen=True)
 class Detection:         # a listed word heard (or estimated) in the audio
     start: float; end: float; heard: str; term: str; category: str
-    action: Literal["beep", "mute"]; confidence: float
-    source: Literal["asr", "estimate", "cue"]; cue: int | None
+    confidence: float; source: Literal["asr", "estimate", "cue"]; cue: int | None
 
 @dataclass(frozen=True)
-class CensorInterval:    # what the renderer applies; always disjoint
-    start: float; end: float; action: Literal["beep", "mute"]
+class CensorInterval:    # a span the renderer mutes; always disjoint
+    start: float; end: float
 ```
 
 ### 5.4 Extension points
@@ -454,7 +452,7 @@ The default backend is faster-whisper.
 
 ### 6.9 Matching and confirmation
 
-The matcher runs over each window's words and produces detections: heard text, term, category, action and probability.
+The matcher runs over each window's words and produces detections: heard text, term, category and probability.
 
 **Confirmation.** A strong-flagged cue is **confirmed** when a detection overlaps `T(cue) ± p`. For an unconfirmed strong cue, the window is widened once by `expand_by_s` and transcribed again. If it is still unconfirmed, `on_unconfirmed` decides:
 
@@ -475,9 +473,9 @@ Each detection `[start, end]` becomes an interval as follows:
 1. Widen it by `pad_before_ms` and `pad_after_ms`, because Whisper's word timestamps are approximate.
 2. Extend it symmetrically to `min_duration_ms`.
 3. Clamp it to `[0, duration]`.
-4. Sort the intervals and merge any that are less than `merge_gap_ms` apart. A merged interval beeps if any of its detections beeps.
+4. Sort the intervals and merge any that are less than `merge_gap_ms` apart.
 
-The result is **disjoint by construction**, which the renderer requires (§6.11).
+The result is **sorted and disjoint by construction**, which the renderer requires (§6.11). The renderer's fades sit inside this padding, so they never touch the word itself.
 
 An optional refinement moves each edge *outward only* to the nearest 10 ms RMS energy minimum within 80 ms. This avoids clipping half a syllable.
 
@@ -489,41 +487,32 @@ An optional refinement moves each edge *outward only* to the nearest 10 ms RMS e
 - Only censored audio streams are re-encoded.
 - Output goes to `<name>.partial<ext>` and is renamed on success. A failed run leaves nothing half-written.
 
-For each censored stream, the renderer writes two **command files** into a job temp dir.
-
-`mute0.cmd` lists every interval:
+For each censored stream, the renderer writes one **command file** into a job temp dir. The file drives a single `afade` filter. Around each interval it re-arms the filter twice: a fade-out that starts at the interval's start, then a fade-in that ends at the interval's end. Each fade lasts `fade_ms` (default 10 ms). For the example interval, with the previous interval ending at 4371.050 s:
 
 ```
-4383.290-4383.900 [enter] volume@mute0 volume 0, [leave] volume@mute0 volume 1;
+4371.050-4383.290 [enter] afade@mute0 t out, [enter] afade@mute0 st 4383.290, [enter] afade@mute0 d 0.010;
+4383.300-4383.890 [enter] afade@mute0 t in, [enter] afade@mute0 st 4383.890, [enter] afade@mute0 d 0.010;
 ```
 
-`beep0.cmd` lists beep intervals only:
+Each line fires once, when the first audio frame that starts inside its time range arrives. The ranges are the stable stretches where the old and new settings give the same gain: full volume between intervals, silence inside one. So it doesn't matter which frame delivers a command.
+
+The filtergraph for that stream was verified in the prototype (Appendix A):
 
 ```
-4383.290-4383.900 [enter] volume@beep0 volume 1.0, [leave] volume@beep0 volume 0;
-```
-
-The filtergraph for that stream (shown for 48 kHz 5.1 with a centre-channel beep) was verified in the prototype (Appendix A):
-
-```
-[0:a:0]asetnsamples=n=240:p=0,asendcmd=f=mute0.cmd,volume@mute0=volume=1[main0];
-sine=frequency=1000:sample_rate=48000,asetnsamples=n=240:p=0,asendcmd=f=beep0.cmd,volume@beep0=volume=0,pan=5.1(side)|FC=c0[tone0];
-[main0][tone0]amix=inputs=2:duration=first:normalize=0[out0]
+[0:a:0]asetnsamples=n=480:p=0,asendcmd=f=mute0.cmd,afade@mute0=t=in:ss=0:ns=1:curve=qsin[out0]
 ```
 
 **Why this graph.**
 
-- **5 ms frames.** Commands take effect per audio frame. Codec frames would limit precision to 21 ms (AAC, 1024 samples), 32 ms (AC-3, 1536) or more (FLAC). `asetnsamples=n=<rate/200>` re-frames the audio to 5 ms. Measured for a requested 2.000–2.500 s:
-  - without it: 2.005–2.518 s
-  - with it, using `enable` expressions: 2.000–2.505 s
-  - with it, using the command-file graph above: 2.000–2.500 s
-- **`asendcmd` command files instead of `enable='between(t,…)+…'`.** Expression cost grows with the number of intervals: +75 % render time at 500 intervals, against +10 % for command files (Appendix A). Command files also avoid command-line length limits and escaping long expressions.
-- **Separate command files per chain.** Each chain has its own `asendcmd`, so commands fire on that chain's own frame timestamps.
-- **Disjoint intervals.** Intervals must not overlap. An interval's `[leave]` would otherwise un-mute an overlapping one early; §6.10 guarantees this.
-- **Beep level.** At volume 1 the `sine` source's peak is 1/8 of full scale (−18.06 dBFS). `level_dbfs` becomes the gain `10^((level_dbfs + 18.06) / 20)` in the enter command.
-- **Beep channels.** `pan=<source layout>|FC=c0` puts the beep in the centre channel only, when the track has one (`channels = "dialogue"`). Otherwise it goes to `FL=c0|FR=c0` or mono. The probe supplies the source's exact layout and sample rate.
-- **No level change.** `amix … normalize=0` keeps the original level; by default amix scales its inputs down.
-- **Mute action.** `action = "mute"` needs only the first chain, with no tone and no `amix`.
+- **Sample-accurate edges without clicks.** `afade` computes its gain for every sample from the timestamps, so each edge is a 10 ms quarter-sine ramp placed exactly where requested. Switching the volume abruptly instead snaps edges to audio frames and clicks. In the prototype, with edges falling mid-cycle on a −18 dBFS test tone:
+  - hard cut: click energy above 2 kHz peaked at −25 dBFS
+  - `afade` ramps: −67 to −79 dBFS, close to the −90 dBFS floor
+
+  Stepping the volume down in 5 ms stages made clicks worse, because each step is its own discontinuity.
+- **Command file, not expressions.** The cost doesn't grow with the number of intervals: 479 muted spans added about 4 % to a 2-hour audio re-encode. An earlier variant built `enable='between(t,…)+…'` expressions instead, and they added 75 % at 500 intervals. Long expressions also hit command-line limits and need escaping.
+- **Bounded frames.** A command fires only when a frame starts inside its time range. `asetnsamples=n=<rate/100>` caps frames at 10 ms, far shorter than any range: gaps and intervals are at least 250 ms, thanks to §6.10's merge gap and minimum length. Precision comes from `afade`, not from the frame size.
+- **Sorted, disjoint intervals.** The fade sequence assumes intervals don't overlap, which §6.10 guarantees.
+- **Initial state.** `t=in:ss=0:ns=1` starts at full volume. If the first interval starts at 0 s, its fade-out goes into these initial options instead of a command.
 - **Paths.** The job temp dir is FFmpeg's working directory, so command files are referenced by relative name. That avoids escaping paths inside the filtergraph, such as Windows drive colons. Input and output are absolute paths with the `file:` prefix, which is safe for names that start with `-` or contain `:`.
 - **Loading the graph.** Use `-/filter_complex graph.txt` on FFmpeg 7 and later, where `-filter_complex_script` is deprecated. Use `-filter_complex_script graph.txt` on 5.x and 6.x.
 
@@ -576,10 +565,10 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
   "subtitle": {"source": "embedded", "stream": 4, "trusted": true,
                "sync": {"scale": 1.0, "offset": 0.04, "error": 0.09, "anchors": 6, "matched": 6}, "fidelity": 0.91},
   "windows": {"count": 36, "audio_seconds": 281.0, "coverage": 0.038},
-  "detections": [{"start": 4383.41, "end": 4383.78, "heard": "fucking", "term": "*fuck*", "category": "strong",
-                  "action": "beep", "confidence": 0.94, "source": "asr", "cue": 812}],
-  "unconfirmed": [{"cue": 1033, "text": "Get the f*** out!", "resolution": "estimate"}],
-  "intervals": [{"start": 4383.29, "end": 4383.90, "action": "beep"}],
+  "detections": [{"start": 4383.41, "end": 4383.78, "heard": "hell", "term": "hell", "category": "mild",
+                  "confidence": 0.94, "source": "asr", "cue": 812}],
+  "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
+  "intervals": [{"start": 4383.29, "end": 4383.90}],
   "timings": {"probe": 0.3, "subtitles": 0.4, "sync": 6.8, "transcribe": 52.0, "render": 72.5}
 }
 ```
@@ -592,7 +581,7 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
 4383.29	4383.90	1
 ```
 
-Players that support EDL can mute the *original* file at playback time, with no rendering at all.
+Players that support EDL can mute the *original* file at playback time, with no rendering at all. Because the tool only mutes, the EDL describes the same edits as the cleaned file, apart from the fades.
 
 **Review SRT** (optional). One cue per interval showing the detected word. Load it in a player next to the cleaned file to spot-check the result.
 
@@ -626,7 +615,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | `targeted`, 40 flagged cues | ≈ 3.5 min (about 30 windows × 7 s) | ≈ 17 s | ≈ 27 s |
 | sync anchors, trusted subtitles | ≈ 1 min through `base.en` | a few seconds | a few seconds |
 
-**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127–140 s for two hours of stereo AAC on a 4-vCPU container (Appendix A). The cost scales with channel count and encoder. With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
+**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127 s for two hours of stereo AAC on a 4-vCPU container, and 131 s with 479 muted spans (Appendix A). The cost scales with channel count and encoder. With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
 
 ### 8.2 Techniques
 
@@ -699,9 +688,9 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - command-file and filtergraph generation (golden files)
   - the OpenSubtitles client, against mocked HTTP (respx): search, download, quota exhausted, 429
 - **Pipeline tests with fakes.** A `FakeTranscriber` returns scripted words per window, and a `FakeAudioSource` is used alongside it. Together they exercise strategy selection, confirmation, escalation and reports without models or FFmpeg.
-- **Media integration tests** (need FFmpeg). These reuse the prototype's method: render a synthetic clip, decode the result and measure tone energy in 2.5 ms blocks to verify mute and beep boundaries. They cover:
+- **Media integration tests** (need FFmpeg). These reuse the prototype's method: render a synthetic clip, decode the result and measure the tone's envelope to verify mute boundaries and fade shapes. They also measure click energy above 2 kHz at every edge. They cover:
   - timeline cases (MPEG-TS offset, late audio)
-  - 5.1 centre-channel beeps
+  - multichannel (5.1) tracks
   - codec choice
   - stream order, tags, dispositions and chapters preserved (checked with ffprobe on the output)
 - **ASR integration tests** (opt-in). A short speech fixture with known profanity timestamps, run with `tiny.en`. Detections must fall within ±300 ms.
@@ -745,7 +734,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | Milestone | Scope | Done when |
 |---|---|---|
 | M0 Skeleton | pyproject, CLI scaffold, config schema and loader, `config init/show/check`, `doctor` | The CLI installs, and config errors show TOML key paths. |
-| M1 Full-mode MVP | Probe, full-track audio, faster-whisper, matcher, intervals, renderer (beep and mute), JSON report, `--dry-run` | A test clip is censored correctly end to end, and media integration tests pass. |
+| M1 Full-mode MVP | Probe, full-track audio, faster-whisper, matcher, intervals, renderer (mute with fades), JSON report, `--dry-run` | A test clip is censored correctly end to end, and media integration tests pass. |
 | M2 Local subtitles | Embedded and sidecar sources, parsing and cleaning, flagging, window planner, trusted sync check, confirmation and `on_unconfirmed`, strategy fallbacks | Targeted mode matches full-mode recall on the evaluation clips that have verbatim subtitles. |
 | M3 Online subtitles | OpenSubtitles client, hash, ranking, subtitle cache, untrusted sync with tracking and fps snapping, optional ffsubsync | Out-of-sync and wrong-fps fixtures are corrected, and quota errors fall back cleanly. |
 | M4 Complete v1 | `hybrid` (VAD), output subtitle censoring, EDL and review SRT, `render --report`, `other_audio_streams`, folder batch mode, span-based transcript cache | The v1 feature set is complete, and defaults are tuned on the evaluation set. |
@@ -756,8 +745,10 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 - **Subtitle timing only, with no speech recognition.** Cues are 1–6 s long, so this would mute whole sentences. It survives only as the `cue` fallback.
 - **Forced alignment of subtitle text** (wav2vec2/CTC) instead of ASR inside windows. It is faster and very precise when subtitles are verbatim, but it fails on masked or paraphrased text. It may come back later as an optimization on the WhisperX backend.
 - **A dedicated keyword-spotting model.** It would need training for every word list. Whisper handles arbitrary lists.
-- **Censoring in Python** (piping decoded PCM through numpy). This is sample-accurate and allows smooth fades or custom sounds, but it pushes the entire decoded track through Python. The FFmpeg graph is already accurate to within 5 ms. This remains a possible future backend for sound effects.
-- **`enable=` timeline expressions** for mute and beep. They are the simplest option, but render time grew 75 % at 500 intervals and the expressions become huge. Replaced by `asendcmd` command files.
+- **A beep tone over censored words.** Earlier drafts mixed in a sine tone with `amix`. Dropped at review in favour of mute-only censoring.
+- **Censoring in Python** (piping decoded PCM through numpy). This is sample-accurate with smooth fades, but it pushes the entire decoded track through Python, and the FFmpeg `afade` graph is already sample-accurate and click-free. A PCM renderer comes back for the voice-replacement stretch goal (§16), which has to splice generated audio in.
+- **Hard or stepped `volume` switching.** A hard cut clicks and snaps to audio frames. Stepping the volume down in 5 ms stages clicked even more (Appendix A). Replaced by `afade`.
+- **`enable=` timeline expressions.** They are the simplest option, but render time grew 75 % at 500 intervals and the expressions become huge. Replaced by `asendcmd` command files.
 - **YAML config.** Rejected because of implicit booleans in word lists and the extra dependency.
 
 ## 15. Open questions
@@ -769,28 +760,63 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 5. Partial-word censoring ("bull[shit]"): character-proportional timing inside a word is imprecise, so v1 censors whole words.
 6. Non-English lexicons: per-language categories and normalization rules, e.g. diacritics.
 7. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
-8. Custom sound effects (`action = "sound"`) and smooth edges, e.g. a staircase of 5 ms volume commands.
+8. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
 9. An interactive review UI (`vbr review`, with ffplay previews)?
+
+## 16. Stretch goal: voice-matched word replacement
+
+Instead of silence, the censored word could be replaced by a different word spoken in the same voice, e.g. "hell" → "heck", so the line still sounds natural. This is future work outside v1. The v1 design keeps what it needs: word-level timings, the JSON report, and a renderer interface that can take a second implementation.
+
+**How it could work**
+
+1. **Substitution map.** The config maps terms to replacements, e.g. `hell = "heck"`, `damn = "darn"`. Words without a replacement are muted as in v1.
+2. **Isolate the dialogue.** The word sits in a mix with music and effects. For 5.1 tracks, work on the centre channel, which carries most dialogue. For stereo, split off a dialogue stem with a source-separation model. Replace the word in that stem, then remix it with the untouched background.
+3. **Voice reference.** Take a few seconds of the same speaker from nearby lines. Speaker diarization (e.g. pyannote) finds lines spoken by the same voice.
+4. **Generate the word.** Use a zero-shot voice-cloning or speech-editing model, for example VoiceCraft (edits words inside an existing utterance), F5-TTS or XTTS-v2. Condition it on the surrounding words so pitch and prosody fit the line.
+5. **Fit and splice.** Time-stretch the generated word to the original word's duration (e.g. with Rubber Band), then splice it in with short crossfades. Splicing needs sample-level editing, so it would use a PCM renderer (decoded audio piped through Python) next to the FFmpeg one. The report gains a per-interval `replacement` field.
+6. **Fallback.** If generation fails, or a check scores it low, mute that word as in v1. The check could compare speaker embeddings and re-run ASR to confirm the new word is heard.
+
+**Hard parts.**
+
+- Separation artefacts in music-heavy scenes.
+- Lip movements that no longer match the word; fixing that would need video editing.
+- Model size and speed; a GPU is effectively required.
+- Licences: several of the strongest voice models are non-commercial.
+
+Voice cloning should stay local. The tool should never export voice models, and the feature is meant for personal viewing copies.
 
 ## Appendix A. Prototype measurements
 
 Before writing this design, the FFmpeg parts were prototyped to check the key assumptions.
 
-**Setup.** FFmpeg 6.1.1 on a 4-vCPU Linux container. The test clip was a 10 s `testsrc2` video with a 440 Hz tone standing in for speech; the long test was 2 h of pink noise. The rendered audio was decoded to PCM, and 440 Hz and 1 kHz energy were measured in 2.5 ms blocks to find where the original sound stops and the beep starts. The requested spans were 2.000–2.500 s and 5.100–5.400 s.
+**Setup.** FFmpeg 6.1.1 on a 4-vCPU Linux container. The test clip was a 10 s `testsrc2` video with a 440 Hz tone at −18 dBFS standing in for speech; the long test was 2 h of pink noise. The rendered audio was decoded to PCM. The tone's level was measured to find where muting starts and ends, and energy above 2 kHz was measured to detect clicks.
+
+**Timing and clicks.** The first four rows used the spans 2.000–2.500 s and 5.100–5.400 s. The last row used edges that fall mid-cycle (2.0006, 2.5011, 5.1003 and 5.4007 s) so a hard cut can't hide on a zero crossing.
 
 | Experiment | Result |
 |---|---|
-| `volume` + `enable` expression, codec-sized frames (AAC, 1024 samples) | Censored 2.005–2.518 s: boundaries snap to the 21 ms codec frames |
+| `volume` + `enable` expression, codec-sized frames (AAC, 1024 samples) | Muted 2.005–2.518 s: boundaries snap to the 21 ms codec frames |
 | Same, with `asetnsamples=n=240` (5 ms frames) | 2.000–2.505 s |
-| `asendcmd` command file + `asetnsamples=n=240` | 2.000–2.500 s and 5.100–5.400 s: exact at 2.5 ms resolution |
-| Beep level at `volume 1` | Peak 0.125 (1/8 of full scale, −18 dBFS); `volume 0.25` measured 0.031 |
-| MPEG-TS input with `start_time` 31.38 s | Filter `t` and input `-ss` both measured from the container start; the censor landed at the requested media time |
+| `volume` switched by an `asendcmd` command file, 5 ms frames | 2.000–2.500 s and 5.100–5.400 s |
+| Same position, volume stepped 0.5 → 0.2 → 0 in 5 ms stages | Clicks got worse, not better: −35 dBFS peak above 2 kHz, against −42 dBFS for the hard cut |
+| Hard cut vs `afade` driven by the command file (10 ms quarter-sine), mid-cycle edges | Hard cut: edges snapped to 5 ms frames, clicks −25 dBFS. `afade`: edges on the requested sample, clicks −67 to −79 dBFS (floor −90 dBFS) |
+
+**Timelines.**
+
+| Experiment | Result |
+|---|---|
+| MPEG-TS input with `start_time` 31.38 s | Filter `t` and input `-ss` both measured from the container start; the mute landed at the requested media time |
 | MKV whose audio starts 0.479 s after the video | Plain full decode: sample 0 = 0.479 s (shift). With `aresample=async=1:first_pts=0`: sample 0 = 0 s. `-ss` window extraction was correct either way |
-| 5.1 AC-3, beep through `pan=5.1(side)\|FC=c0` | Original muted on all channels; tone present only in FC |
-| Re-encode 2 h stereo AAC, no censoring (baseline) | 127 s |
-| … + 50 intervals via `enable` expressions | 144 s (+13 %) |
-| … + 500 intervals via `enable` expressions | 222 s (+75 %) |
-| … + 500 intervals via `asendcmd` command files | 140 s (+10 %) |
+
+**Render cost** for 2 h of stereo AAC. The `enable` and first `asendcmd` rows come from an earlier draft whose graph also mixed in a beep tone.
+
+| Experiment | Result |
+|---|---|
+| No censoring (baseline) | 127 s |
+| 50 intervals via `enable` expressions | 144 s (+13 %) |
+| 500 intervals via `enable` expressions | 222 s (+75 %) |
+| 500 intervals via `asendcmd` command files | 140 s (+10 %) |
+| Final graph (`asendcmd` + `afade`), 479 merged intervals | 131 s (+4 %). Spot checks at the start, middle and end of the file were digitally silent inside the spans and untouched outside |
 
 ## Appendix B. References
 
