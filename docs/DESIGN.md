@@ -513,6 +513,7 @@ The filtergraph for that stream was verified in the prototype (Appendix A):
 - **Bounded frames.** A command fires only when a frame starts inside its time range. `asetnsamples=n=<rate/100>` caps frames at 10 ms, far shorter than any range: gaps and intervals are at least 250 ms, thanks to §6.10's merge gap and minimum length. Precision comes from `afade`, not from the frame size.
 - **Sorted, disjoint intervals.** The fade sequence assumes intervals don't overlap, which §6.10 guarantees.
 - **Initial state.** `t=in:ss=0:ns=1` starts at full volume. If the first interval starts at 0 s, its fade-out goes into these initial options instead of a command.
+- **FFmpeg versions.** `afade` has accepted `t`, `st` and `d` as runtime commands since FFmpeg 5.0. The graph was run on 5.1.1 and 6.1.1 with identical results.
 - **Paths.** The job temp dir is FFmpeg's working directory, so command files are referenced by relative name. That avoids escaping paths inside the filtergraph, such as Windows drive colons. Input and output are absolute paths with the `file:` prefix, which is safe for names that start with `-` or contain `:`.
 - **Loading the graph.** Use `-/filter_complex graph.txt` on FFmpeg 7 and later, where `-filter_complex_script` is deprecated. Use `-filter_complex_script graph.txt` on 5.x and 6.x.
 
@@ -526,6 +527,8 @@ ffmpeg -hide_banner -nostdin -y -i file:/abs/in.mkv -filter_complex_script graph
   -map_metadata 0 -map_chapters 0 -max_muxing_queue_size 4096 \
   -progress pipe:1 -nostats file:/abs/out.partial.mkv
 ```
+
+**Verifying the output.** FFmpeg ignores a filter command it rejects without any warning, and still exits with code 0. A generator bug or an unusual FFmpeg build could therefore produce an unmuted file silently. So after rendering, the tool decodes the core of every muted span from the output (the span minus its fades) using input seeking, which is cheap. Each core must be below −60 dBFS RMS. If any span fails, the output is deleted and the run exits with code 1. `vbr doctor` runs the same graph on a one-second synthetic tone, which catches an FFmpeg that can't run the graph before any real work starts.
 
 Filtered streams lose their per-stream tags, so language, title and disposition are re-applied from the probe. MP4 and MOV outputs also get `-movflags +faststart`. Progress comes from `out_time_us` on the `-progress` pipe.
 
@@ -657,6 +660,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | Compound words ("bullshit") | Infix wildcards; the whole word is censored. |
 | Hundreds of detections | The coverage guard picks `full`. Render cost is flat (command files). |
 | DTS or TrueHD source | Codec table: FLAC in MKV. |
+| FFmpeg silently rejects a mute command | The post-render check finds a span that isn't silent, deletes the output and exits with code 1 (§6.11). |
 | Output already exists | Error unless `--overwrite`; `--skip-existing` for batches. |
 | Run interrupted (Ctrl-C) | Partial output deleted. Caches keep the finished work. |
 | File smaller than 128 KiB | No OpenSubtitles hash; metadata search only. |
@@ -691,6 +695,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 - **Media integration tests** (need FFmpeg). These reuse the prototype's method: render a synthetic clip, decode the result and measure the tone's envelope to verify mute boundaries and fade shapes. They also measure click energy above 2 kHz at every edge. They cover:
   - timeline cases (MPEG-TS offset, late audio)
   - multichannel (5.1) tracks
+  - the post-render check failing on a deliberately broken command file
   - codec choice
   - stream order, tags, dispositions and chapters preserved (checked with ffprobe on the output)
 - **ASR integration tests** (opt-in). A short speech fixture with known profanity timestamps, run with `tiny.en`. Detections must fall within ±300 ms.
@@ -789,7 +794,7 @@ Voice cloning should stay local. The tool should never export voice models, and 
 
 Before writing this design, the FFmpeg parts were prototyped to check the key assumptions.
 
-**Setup.** FFmpeg 6.1.1 on a 4-vCPU Linux container. The test clip was a 10 s `testsrc2` video with a 440 Hz tone at −18 dBFS standing in for speech; the long test was 2 h of pink noise. The rendered audio was decoded to PCM. The tone's level was measured to find where muting starts and ends, and energy above 2 kHz was measured to detect clicks.
+**Setup.** FFmpeg 6.1.1 on a 4-vCPU Linux container, plus a 5.1.1 static build for the version check. The test clip was a 10 s `testsrc2` video with a 440 Hz tone at −18 dBFS standing in for speech; the long test was 2 h of pink noise. The rendered audio was decoded to PCM. The tone's level was measured to find where muting starts and ends, and energy above 2 kHz was measured to detect clicks.
 
 **Timing and clicks.** The first four rows used the spans 2.000–2.500 s and 5.100–5.400 s. The last row used edges that fall mid-cycle (2.0006, 2.5011, 5.1003 and 5.4007 s) so a hard cut can't hide on a zero crossing.
 
@@ -800,6 +805,8 @@ Before writing this design, the FFmpeg parts were prototyped to check the key as
 | `volume` switched by an `asendcmd` command file, 5 ms frames | 2.000–2.500 s and 5.100–5.400 s |
 | Same position, volume stepped 0.5 → 0.2 → 0 in 5 ms stages | Clicks got worse, not better: −35 dBFS peak above 2 kHz, against −42 dBFS for the hard cut |
 | Hard cut vs `afade` driven by the command file (10 ms quarter-sine), mid-cycle edges | Hard cut: edges snapped to 5 ms frames, clicks −25 dBFS. `afade`: edges on the requested sample, clicks −67 to −79 dBFS (floor −90 dBFS) |
+| Same `afade` graph on FFmpeg 5.1.1 | Identical results: `t`, `st` and `d` are accepted as runtime commands |
+| A command FFmpeg rejects (unknown option name) | Ignored silently: no warning, exit code 0. This is why §6.11 verifies the output |
 
 **Timelines.**
 
