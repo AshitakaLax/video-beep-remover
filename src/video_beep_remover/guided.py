@@ -360,7 +360,6 @@ def transcribe_windows(
         else:
             todo += [(window, *fill_gap(gap, window, min_window)) for gap in gaps]
     if todo:
-        _, transcriber = ctx.transcriber(role)
         with ctx.ui.status("Reading audio"):
             samples = _read_all(audio, [Window(start, end) for _, start, end in todo])
             trimmed = [
@@ -370,6 +369,7 @@ def transcribe_windows(
         clips = [clip for clip, _, _ in trimmed if clip.duration >= MIN_CLIP_S]
         heard: list[list[Word]] = []
         if clips:
+            _, transcriber = ctx.transcriber(role)
             with ctx.ui.progress(label, sum(c.duration for c in clips)) as update:
                 heard = transcriber.transcribe(
                     clips,
@@ -380,14 +380,12 @@ def transcribe_windows(
                 )
         results = iter(heard)
         for (window, start, end), (clip, clean_start, clean_end) in zip(todo, trimmed, strict=True):
-            if clip.duration < MIN_CLIP_S:
-                continue
-            transcript = Transcript(
-                clip.start, clip.start + clip.duration, tuple(next(results)), clean_start, clean_end
-            )
-            pieces.append((window, transcript))
-            if store:
+            words = tuple(next(results)) if clip.duration >= MIN_CLIP_S else ()
+            transcript = Transcript(clip.start, clip.start + clip.duration, words, clean_start, clean_end)
+            if store:  # even an empty one, so the next run does not read it again
                 store.add_window(start, end, transcript)
+            if clip.duration >= MIN_CLIP_S:
+                pieces.append((window, transcript))
     if not pieces:
         return [], 0, (complete, partial)
     detections, count = detect_in_windows(
