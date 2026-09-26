@@ -124,6 +124,20 @@ $ VBR_RUN_ASR_TESTS=1 pytest       # also runs real Whisper on synthesized speec
 $ ruff check src tests && ruff format --check src tests && mypy
 ```
 
+## Evaluate
+
+`scripts/evaluate.py` scores vbr against clips whose listed words are annotated with their times (`<clip>.truth.json` next to each clip; the script's docstring has the format). It runs every strategy and reports recall, precision, how far detected word edges are from the annotated ones, extra muted time, audio transcribed and wall time. `--set KEY=VALUE` compares settings.
+
+Real film clips can't be shared, so `scripts/make_synthetic_set.py` builds a stand-in set from espeak-ng speech with exact word timings:
+
+```console
+$ python scripts/make_synthetic_set.py /tmp/vbr-eval
+$ python scripts/evaluate.py /tmp/vbr-eval --set transcription.device=cpu
+$ python scripts/evaluate.py /tmp/vbr-eval --set censor.pad_after_ms=200 --cache /tmp/vbr-eval-cache
+```
+
+Synthetic speech is far cleaner than a film's soundtrack, so this set catches regressions and systematic effects but can't tune the defaults for real films. Results are in [Appendix C of the design](docs/DESIGN.md#appendix-c-evaluation-on-the-synthetic-set).
+
 ## License
 
 MIT

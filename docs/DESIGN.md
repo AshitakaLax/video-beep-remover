@@ -894,3 +894,7 @@ Before writing this design, the FFmpeg parts were prototyped to check the key as
 - FFmpeg filters (`asendcmd`, `volume`, `asetnsamples`, `amix`, `sine`, `pan`, timeline editing): <https://ffmpeg.org/ffmpeg-filters.html>
 - FFmpeg 7 deprecation of `-filter_complex_script` in favour of `-/filter_complex`: <https://patchwork.ffmpeg.org/project/ffmpeg/patch/20240117092233.8503-5-anton@khirnov.net/>
 - Kodi EDL format (action 1 = mute): <https://kodi.wiki/view/Edit_decision_list>
+
+## Appendix C. Evaluation on the synthetic set
+
+`scripts/evaluate.py` over the set that `scripts/make_synthetic_set.py` builds (§11): eight clips, 35 minutes, 48 annotated listed words, on a 4-vCPU container without a GPU. The results are being measured and will be added here.
