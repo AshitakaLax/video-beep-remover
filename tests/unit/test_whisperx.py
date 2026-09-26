@@ -23,6 +23,7 @@ from video_beep_remover.pipeline import Pipeline, _CacheScope
 
 CLIP = Clip(100.0, np.zeros(10 * SAMPLE_RATE, dtype=np.float32))  # 100-110 s on the media timeline
 WEIGHTS = "wav2vec2_fairseq_base_ls960_asr_ls960.pth"
+NO_FFMPEG: Any = SimpleNamespace()  # these pipelines never run FFmpeg, which some CI runners lack
 
 
 class FakeWhisperX(types.ModuleType):
@@ -277,7 +278,7 @@ def test_the_whisperx_backend_aligns_the_models_that_find_words(tmp_path: Path) 
         loaded = load_config(
             None, env={}, cwd=tmp_path, overrides={"transcription.device": "cpu", **overrides}
         )
-        run = Pipeline(loaded, ui=StrictUI(), transcriber_factory=lambda choice: None)  # type: ignore[arg-type,return-value]
+        run = Pipeline(loaded, ui=StrictUI(), ff=NO_FFMPEG, transcriber_factory=lambda choice: None)  # type: ignore[arg-type,return-value]
         run._scope = _CacheScope("fingerprint", 1, 100.0, None)
         return run
 
@@ -320,7 +321,7 @@ def test_the_pipeline_wraps_faster_whisper_when_aligning(
             "analysis.language": "ja",
         },
     )
-    run = Pipeline(loaded, ui=StrictUI())
+    run = Pipeline(loaded, ui=StrictUI(), ff=NO_FFMPEG)
     assert isinstance(run._load_transcriber(run.model_choice("hybrid")), WhisperXTranscriber)
     assert isinstance(run._load_transcriber(run.model_choice("anchor")), Whisper)
     assert fake.loaded == [("ja", "cpu", "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", False)]
