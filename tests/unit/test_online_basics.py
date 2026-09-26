@@ -25,6 +25,8 @@ def reference_hash(data: bytes) -> str:
         b"\xff" * 200_000,  # every word is 2**64 - 1: the sum wraps around
         random.Random(1).randbytes(1_000_003),  # the two ends do not overlap
     ],
+    # Short ids: pytest puts the test id in an environment variable, which Windows limits to 32767 characters.
+    ids=["zeros", "wrap-around", "random"],
 )
 def test_hash_matches_the_reference_algorithm(tmp_path: Path, data: bytes) -> None:
     path = tmp_path / "movie.mkv"
