@@ -1,6 +1,6 @@
 # video-beep-remover
 
-A planned command-line tool that beeps or mutes a configurable list of curse words in video files.
+A planned command-line tool that mutes a configurable list of curse words in video files.
 
 - **Speech recognition:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) gives word-accurate timing.
 - **Rendering:** FFmpeg rewrites only the audio track; video is copied untouched.
