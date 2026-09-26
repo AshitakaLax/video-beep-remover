@@ -107,6 +107,27 @@ def _finish_in_background(pipeline: Pipeline, job: Job) -> Outcome:
         return Outcome(job.source, error=exc, messages=ui.messages)
 
 
+def output_clashes(
+    inputs: list[Input], template: str, output: Path | None, *, many: bool
+) -> tuple[dict[Path, Path], dict[Path, str]]:
+    """Where each input would be written ({resolved output: input}), and the inputs whose output
+    another input, earlier in the list, would already write: rendering both would lose one of them."""
+    writers: dict[Path, Path] = {}
+    clashes: dict[Path, str] = {}
+    for item in inputs:
+        try:
+            target = resolve_output(item.path, template, output, many=many).resolve()
+        except VbrError:
+            continue  # the file's own run reports it
+        first = writers.setdefault(target, item.path)
+        if first != item.path:
+            clashes[item.path] = (
+                f"its output {target} would also be written for {first}; "
+                "run them separately, or change output.path or -o so their outputs differ"
+            )
+    return writers, clashes
+
+
 def run_batch(
     pipeline: Pipeline,
     inputs: list[Input],
@@ -117,9 +138,17 @@ def run_batch(
 ) -> None:
     """Process the inputs in order and pass each outcome to `report`, also in order. With `overlap`, a
     file is rendered in the background while the next one is analysed, one render at a time. A
-    DependencyError (FFmpeg or a model missing) would fail every file, so it stops the batch."""
+    DependencyError (FFmpeg or a model missing) would fail every file, so it stops the batch.
+
+    Two inputs with the same output would overwrite each other (a background render may not have
+    written its output yet when the next file checks), so the later one fails up front. An input that
+    another input writes is analysed only after the renders before it are done."""
     many = len(inputs) > 1
     queue: deque[Outcome | Future[Outcome]] = deque()
+    writers: dict[Path, Path] = {}
+    clashes: dict[Path, str] = {}
+    if not options.dry_run:
+        writers, clashes = output_clashes(inputs, pipeline.config.output.path, options.output, many=many)
 
     def flush(block: bool) -> None:
         while queue:
@@ -140,6 +169,12 @@ def run_batch(
 
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vbr-render") as renders:
         for position, item in enumerate(inputs):
+            if item.path in clashes:
+                queue.append(Outcome(item.path, error=UsageError(clashes[item.path])))
+                flush(block=False)
+                continue
+            if item.path.resolve() in writers:
+                wait_for_render()  # it may be the output of a render still running
             try:
                 prepared = pipeline.prepare(item.path, options, many=many, from_folder=item.from_folder)
             except DependencyError:

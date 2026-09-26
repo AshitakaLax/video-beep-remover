@@ -66,7 +66,7 @@ Useful options:
 
 Run `vbr clean --help` for everything.
 
-**Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own outputs found there are skipped: files named like another input's output (`Movie.clean.mkv`) and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed. A file that fails doesn't stop the batch; the exit code is then 4.
+**Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own outputs found there are skipped: files named like another input's output (`Movie.clean.mkv`) and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed. A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
 
 **Editing the result.** Every run writes a JSON report whose `intervals` list the muted spans. Edit them (add, remove or move spans) and run `vbr render VIDEO --report REPORT` to mute exactly those, without detecting anything. A report made for a different file is refused unless you add `--force`.
 

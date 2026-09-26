@@ -90,7 +90,8 @@ def mask_text(text: str, lexicon: Lexicon, mask: Mask) -> Censored:
                 continue
             start, end = cores[0][0], cores[-1][1]
             for p in range(start, end):
-                if not _BREAK.match(text, positions[p]):  # a line break inside a phrase stays
+                # Line breaks inside a phrase stay, in the file ("\n") and in ASS text ("\N").
+                if text[positions[p]] not in "\r\n" and not _BREAK.match(text, positions[p]):
                     replace[positions[p]] = ""
             before = visible[start - 1] if start > 0 else ""
             after = visible[end] if end < len(visible) else ""
@@ -104,31 +105,51 @@ def mask_text(text: str, lexicon: Lexicon, mask: Mask) -> Censored:
     return Censored("".join(replace.get(i, ch) for i, ch in enumerate(text)), masked)
 
 
+def _shown(line: str) -> bool:
+    return bool(_visible(line)[0].strip())
+
+
 def _censor_cue_blocks(text: str, lexicon: Lexicon, mask: Mask) -> Censored:
-    """SRT and WebVTT: the lines after each timing line, up to the next blank line, are cue text."""
+    """SRT and WebVTT: the lines after each timing line, up to the next blank line, are cue text.
+
+    A blank line ends a cue, so a line that removing words leaves empty is dropped rather than
+    kept blank, and a cue with nothing left to show is dropped altogether."""
     out: list[str] = []
+    header: list[str] = []  # the block's lines up to its timing line
     cue: list[str] = []
     masked = 0
 
-    def flush() -> None:
+    def flush() -> bool:
+        """Write the block; False if it was dropped."""
         nonlocal masked
+        lines = cue
         if cue:
             done = mask_text("".join(cue), lexicon, mask)
-            out.append(done.text)
             masked += done.masked
-            cue.clear()
+            after = done.text.splitlines(keepends=True)
+            if len(after) == len(cue):  # masking keeps every line break
+                lines = [new for old, new in zip(cue, after, strict=True) if _shown(new) or not _shown(old)]
+            else:
+                lines = after
+        kept = bool(lines) or not cue
+        if kept:
+            out.extend(header)
+            out.extend(lines)
+        header.clear()
+        cue.clear()
+        return kept
 
     in_cue = False
     for line in text.splitlines(keepends=True):
         if not line.strip():
-            flush()
+            if flush():
+                out.append(line)
             in_cue = False
-            out.append(line)
         elif in_cue:
             cue.append(line)
         else:
+            header.append(line)
             in_cue = bool(_TIMING.match(line))
-            out.append(line)
     flush()
     return Censored("".join(out), masked)
 

@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from helpers import FakeTranscriber, StrictUI, make_clip, words
-from video_beep_remover.batch import Input, Outcome, collect_inputs, run_batch, skip_outputs
+from video_beep_remover.batch import Input, Outcome, collect_inputs, output_clashes, run_batch, skip_outputs
 from video_beep_remover.cli import app
 from video_beep_remover.config import load_config
 from video_beep_remover.errors import MediaError
@@ -36,6 +36,35 @@ def test_outputs_found_in_folders_are_skipped(tmp_path: Path) -> None:
     ]
     named = [Input(tmp_path / "a.mkv", True), Input(tmp_path / "a.clean.mkv", False)]
     assert skip_outputs(named, "{stem}.clean{ext}", None)[1] == []  # named on the command line: kept
+
+
+def test_inputs_with_the_same_output_are_caught_before_rendering(tmp_path: Path) -> None:
+    inputs = [
+        Input(tmp_path / "s1" / "Episode 01.mkv", True),
+        Input(tmp_path / "s2" / "Episode 01.mkv", True),
+    ]
+    out = tmp_path / "clean"
+    writers, clashes = output_clashes(inputs, "{stem}.clean{ext}", out, many=True)
+    assert writers == {(out / "Episode 01.clean.mkv").resolve(): inputs[0].path}
+    assert list(clashes) == [inputs[1].path] and "would also be written for" in clashes[inputs[1].path]
+    assert output_clashes(inputs, "{stem}.clean{ext}", None, many=True)[1] == {}  # next to each input
+
+
+def test_a_colliding_input_fails_and_the_first_output_survives(tmp_path: Path) -> None:
+    for season in ("s1", "s2"):
+        (tmp_path / season).mkdir()
+        make_clip(tmp_path / season / "Episode 01.mkv", duration=3.0)
+    inputs = collect_inputs([tmp_path / "s1", tmp_path / "s2"], recursive=False)
+    outcomes: list[Outcome] = []
+    options = RunOptions(output=tmp_path / "clean", overwrite=True)  # not even --overwrite lets it through
+    run_batch(pipeline(tmp_path), inputs, options, outcomes.append)
+    assert [
+        (o.path.parent.name, o.result.status if o.result else type(o.error).__name__) for o in outcomes
+    ] == [
+        ("s1", "cleaned"),
+        ("s2", "UsageError"),
+    ]
+    assert (tmp_path / "clean" / "Episode 01.clean.mkv").is_file()
 
 
 def test_batch_renders_in_the_background_and_reports_in_order(

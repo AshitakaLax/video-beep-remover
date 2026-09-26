@@ -137,3 +137,21 @@ def test_censored_copy_is_named_after_the_output(tmp_path: Path) -> None:
         censored_copy_path(tmp_path / "Movies.srt", video, output, None)
         == tmp_path / "out" / "Movie.clean.srt"
     )
+
+
+def test_removing_keeps_line_breaks_and_drops_what_is_left_empty() -> None:
+    assert mask_text("You son of a\nbitch!", LEXICON, "remove").text == "You\n!"
+    text = srt(
+        (1.0, 2.0, "Son of a\nbitch\nI hate you"),
+        (3.0, 4.0, "Bullshit"),  # nothing left: the cue goes
+        (5.0, 6.0, "<i>Fuck</i>\nFine"),  # a line left with markup only goes too
+    )
+    done = censor_subtitles(text, LEXICON, "remove")
+    assert done.text == (
+        "1\n00:00:01,000 --> 00:00:02,000\nI hate you\n\n3\n00:00:05,000 --> 00:00:06,000\nFine\n\n"
+    )
+    assert done.masked == 6
+    vtt = "WEBVTT\n\n00:01.000 --> 00:02.000\nDamn\n\n00:03.000 --> 00:04.000\nFine\n"
+    assert censor_subtitles(vtt, LEXICON, "remove").text == "WEBVTT\n\n00:03.000 --> 00:04.000\nFine\n"
+    # The other masks never empty a line.
+    assert censor_subtitles(text, LEXICON, "asterisks").text.count("\n") == text.count("\n")
