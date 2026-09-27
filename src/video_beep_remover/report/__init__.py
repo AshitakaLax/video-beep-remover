@@ -1,5 +1,5 @@
 """JSON report, EDL and review SRT outputs (DESIGN.md §6.12), and reading a report back for
-`vbr render --report`."""
+`vbr render`."""
 
 import json
 import math

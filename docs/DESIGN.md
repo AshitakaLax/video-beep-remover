@@ -790,7 +790,13 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - on a 5.1 AC3 track, which starts 256 samples before zero, only the front centre changes, and the check hears the track as the analysis does;
   - a second audio stream, the EDL and `vbr render` mute the span;
   - a word that fails the check is muted;
-  - a term set to no substitutes is always muted.
+  - a term set to no substitutes is always muted;
+  - in AAC in MP4, the new word replaces the old one too.
+- **Where files go** (§6.12). With real FFmpeg, on MP4 and MKV:
+  - `--backup` keeps the original byte for byte, and a second run skips the file;
+  - `--in-place` leaves one file;
+  - a render that fails verification leaves the original as it was;
+  - a folder is scanned, then rendered and cleaned in place, from the command line. Backups, cleaned files and a video without a report are skipped.
 - **Evaluation set.** 20–30 annotated clips across genres, accents, music-heavy scenes and TV and film subtitles. Each clip has ground-truth profanity timestamps. The metrics are:
   - recall (primary)
   - precision

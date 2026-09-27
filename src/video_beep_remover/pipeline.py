@@ -1,4 +1,16 @@
-"""Run the stages for one file (DESIGN.md §5.1) and choose between strategies (§7)."""
+"""Run the stages for one file (DESIGN.md §5.1) and choose between strategies (§7).
+
+One file goes through Pipeline in this order:
+
+1. prepare: where the output goes (outputs.place), the probe, the audio stream;
+2. _analyse_job: _analyse runs the strategy (full here, targeted and hybrid in guided.py) and falls
+   back to full; then context analysis (_run_context, context/), the muted spans (detect/intervals.py,
+   detect/refine.py) and voice replacement (_replace_words, voice/);
+3. finish: _render (media/render.py, subtitles/output.py), then _write_outputs (report, EDL, review
+   subtitles).
+
+batch.py calls prepare and finish separately, so that one file renders while the next is analysed.
+render_report (`vbr render`) takes a report's intervals straight to finish."""
 
 import shutil
 import tempfile

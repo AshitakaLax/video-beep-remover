@@ -1,3 +1,6 @@
+"""Configuration (DESIGN.md §4): the pydantic schema, the packaged defaults, and loading a user's file
+with environment variables and command-line overrides."""
+
 from video_beep_remover.config.loader import (
     LoadedConfig,
     cache_root,
