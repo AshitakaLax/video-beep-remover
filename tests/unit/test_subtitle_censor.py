@@ -11,6 +11,7 @@ from video_beep_remover.subtitles.censor import (
     mask_text,
     subtitle_format,
 )
+from video_beep_remover.subtitles.output import write_censored_copy
 
 LEXICON: Lexicon = compile_lexicon(
     LexiconConfig(
@@ -136,6 +137,25 @@ def test_censored_copy_is_named_after_the_output(tmp_path: Path) -> None:
     assert (
         censored_copy_path(tmp_path / "Movies.srt", video, output, None)
         == tmp_path / "out" / "Movie.clean.srt"
+    )
+
+
+@pytest.mark.parametrize("backup", [None, "Movie.orig.mkv"])
+def test_in_place_the_censored_copy_takes_the_subtitle_files_place(
+    tmp_path: Path, backup: str | None
+) -> None:
+    video = tmp_path / "Movie.mkv"
+    subtitle = tmp_path / "Movie.en.srt"
+    subtitle.write_text(srt((1.0, 2.0, "Damn it")), "utf-8")
+    copy = write_censored_copy(
+        subtitle, video=video, output=video, language="en", lexicon=LEXICON, mask="first_letter",
+        fps=None, overwrite=False, backup=tmp_path / backup if backup else None,
+    )  # fmt: skip
+    assert copy.path == subtitle and "D*** it" in subtitle.read_text("utf-8")
+    if backup:  # --backup: the unmodified file is kept next to the video's backup
+        assert "Damn it" in (tmp_path / "Movie.orig.en.srt").read_text("utf-8")
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["Movie.en.srt"] + (["Movie.orig.en.srt"] if backup else [])
     )
 
 

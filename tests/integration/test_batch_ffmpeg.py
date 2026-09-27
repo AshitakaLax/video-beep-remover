@@ -12,6 +12,7 @@ from helpers import FakeTranscriber, StrictUI, make_clip, words
 from video_beep_remover.batch import Input, Outcome, collect_inputs, output_clashes, run_batch, skip_outputs
 from video_beep_remover.cli import app
 from video_beep_remover.config import load_config
+from video_beep_remover.config.schema import OutputConfig
 from video_beep_remover.errors import MediaError
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import probe
@@ -27,15 +28,16 @@ def pipeline(tmp_path: Path) -> Pipeline:
     return Pipeline(loaded, ui=StrictUI(), transcriber_factory=lambda choice: fake)
 
 
-def test_outputs_found_in_folders_are_skipped(tmp_path: Path) -> None:
-    inputs = [Input(tmp_path / name, True) for name in ("a.mkv", "a.clean.mkv", "b.mp4")]
-    kept, skipped = skip_outputs(inputs, "{stem}.clean{ext}", None)
+def test_outputs_and_backups_found_in_folders_are_skipped(tmp_path: Path) -> None:
+    inputs = [Input(tmp_path / name, True) for name in ("a.mkv", "a.clean.mkv", "b.mp4", "b.orig.mp4")]
+    kept, skipped = skip_outputs(inputs, OutputConfig(), None)
     assert [i.path.name for i in kept] == ["a.mkv", "b.mp4"]
     assert [(r.input.name, r.status, r.notes) for r in skipped] == [
-        ("a.clean.mkv", "skipped", ["it is the output for a.mkv"])
+        ("a.clean.mkv", "skipped", ["it is the output of a.mkv"]),
+        ("b.orig.mp4", "skipped", ["it is the backup of b.mp4"]),
     ]
     named = [Input(tmp_path / "a.mkv", True), Input(tmp_path / "a.clean.mkv", False)]
-    assert skip_outputs(named, "{stem}.clean{ext}", None)[1] == []  # named on the command line: kept
+    assert skip_outputs(named, OutputConfig(), None)[1] == []  # named on the command line: kept
 
 
 def test_inputs_with_the_same_output_are_caught_before_rendering(tmp_path: Path) -> None:
@@ -44,10 +46,10 @@ def test_inputs_with_the_same_output_are_caught_before_rendering(tmp_path: Path)
         Input(tmp_path / "s2" / "Episode 01.mkv", True),
     ]
     out = tmp_path / "clean"
-    writers, clashes = output_clashes(inputs, "{stem}.clean{ext}", out, many=True)
+    writers, clashes = output_clashes(inputs, OutputConfig(), out, many=True)
     assert writers == {(out / "Episode 01.clean.mkv").resolve(): inputs[0].path}
     assert list(clashes) == [inputs[1].path] and "would also be written for" in clashes[inputs[1].path]
-    assert output_clashes(inputs, "{stem}.clean{ext}", None, many=True)[1] == {}  # next to each input
+    assert output_clashes(inputs, OutputConfig(), None, many=True)[1] == {}  # next to each input
 
 
 def test_a_colliding_input_fails_and_the_first_output_survives(tmp_path: Path) -> None:
@@ -87,7 +89,7 @@ def test_batch_renders_in_the_background_and_reports_in_order(
         original(self, job, ui)
 
     monkeypatch.setattr(Pipeline, "_render", render)
-    inputs, skipped = skip_outputs(collect_inputs([folder], recursive=False), "{stem}.clean{ext}", None)
+    inputs, skipped = skip_outputs(collect_inputs([folder], recursive=False), OutputConfig(), None)
     assert [r.input.name for r in skipped] == ["a.clean.mkv"]
     outcomes: list[Outcome] = []
     run_batch(run, inputs, RunOptions(overwrite=True), outcomes.append)
@@ -140,7 +142,7 @@ def test_clean_a_folder_from_the_command_line(tmp_path: Path, monkeypatch: pytes
     assert first.output.index("a.mkv: muted 1 spans") < first.output.index("b.mkv: muted 1 spans")
     second = runner.invoke(app, ["clean", str(tmp_path), "--device", "cpu", "--skip-existing"])
     assert second.exit_code == 0, second.output
-    assert "a.clean.mkv: skipped (it is the output for a.mkv)" in second.output
+    assert "a.clean.mkv: skipped (it is the output of a.mkv)" in second.output
     assert "a.mkv: skipped (output already exists)" in second.output
     assert not list(tmp_path.glob("*.clean.clean.*"))
 

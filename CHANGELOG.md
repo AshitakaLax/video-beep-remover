@@ -32,8 +32,10 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 ### Output and workflow
 
 - A JSON report for every file, with optional EDL and review-subtitle outputs.
-- `vbr render` mutes exactly the spans in a hand-edited report.
-- Folder batches keep the model loaded and render each file while the next one is analysed. Files vbr already censored are skipped.
+- `vbr render` mutes exactly the spans in a hand-edited report, found next to each video or named with `--report`.
+- Every command that takes videos takes files, folders, or both: `clean`, `scan`, `render` and `subs`. MKV and MP4 are tested; the output keeps the input's container.
+- Folder batches keep the model loaded and render each file while the next one is analysed. Files vbr already censored, and its outputs and backups, are skipped.
+- `--backup` puts the cleaned file in the original's place and keeps the unmodified original as `Movie.orig.mp4`; `--in-place` does the same with no backup (`output.mode`). The original is only touched once the new file is verified.
 - A transcript cache makes re-runs fast, for example after editing the word list.
 - Other commands: `vbr doctor`, `vbr subs`, `vbr cache` and `vbr config init/show/check`.
 

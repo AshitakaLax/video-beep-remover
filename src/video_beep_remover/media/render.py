@@ -4,6 +4,7 @@ the changes that voice replacement made to a replaced word's span (§16)."""
 import logging
 import math
 import os
+import shutil
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -451,6 +452,23 @@ class RenderResult:
     timeline_shift: float = 0.0  # the muted spans sit this much later in the output (see timeline_shift)
 
 
+def _put_in_place(partial: Path, output: Path, backup: Path | None) -> None:
+    """Rename the verified file to `output`, first moving what is there to `backup`, if given. If the
+    rename fails, the original goes back."""
+    if backup is None:
+        os.replace(partial, output)
+        return
+    if backup.exists():
+        raise RenderError(f"{backup} already exists; the original was left as it is")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(output, backup)  # a rename, unless the backup is on another file system
+    try:
+        os.replace(partial, output)
+    except BaseException:
+        shutil.move(backup, output)
+        raise
+
+
 def render(
     ff: FFmpeg,
     info: MediaInfo,
@@ -465,8 +483,12 @@ def render(
     tag: str | None = None,
     on_progress: Callable[[float], None] | None = None,
     splices: Mapping[int, Sequence[Splice]] | None = None,
+    backup: Path | None = None,
 ) -> RenderResult:
-    """Render to <name>.partial<ext>, verify every muted span, then rename. Nothing half-written survives."""
+    """Render to <name>.partial<ext>, verify every muted span, then rename. Nothing half-written survives.
+
+    `output` may be the input itself (--in-place, --backup): it is replaced only once the new file is
+    verified. With `backup`, the input is first moved there, unmodified."""
     spans = normalize_intervals(intervals, info.duration)
     partial = output.with_name(f"{output.stem}.partial{output.suffix}")
     command = build_command(
@@ -503,7 +525,7 @@ def render(
                 f"verification failed: {len(failures)} of {checked} muted spans are not silent; "
                 f"the output was deleted.\n  {shown}{more}"
             )
-        os.replace(partial, output)
+        _put_in_place(partial, output, backup)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise

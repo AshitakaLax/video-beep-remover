@@ -9,9 +9,11 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from video_beep_remover.config.schema import OutputConfig
 from video_beep_remover.errors import DependencyError, UsageError, VbrError
 from video_beep_remover.media.probe import VIDEO_SUFFIXES
-from video_beep_remover.pipeline import FileResult, Job, Pipeline, RunOptions, resolve_output
+from video_beep_remover.outputs import backup_path, place
+from video_beep_remover.pipeline import FileResult, Job, Pipeline, RunOptions
 from video_beep_remover.ui import Progress
 
 
@@ -47,21 +49,24 @@ def collect_inputs(paths: list[Path], recursive: bool) -> list[Input]:
 
 
 def skip_outputs(
-    inputs: list[Input], template: str, output: Path | None
+    inputs: list[Input], config: OutputConfig, output: Path | None
 ) -> tuple[list[Input], list[FileResult]]:
-    """Leave out files found in folders that are another input's output, e.g. movie.clean.mkv next to
-    movie.mkv: cleaning it again would write movie.clean.clean.mkv. Files named on the command line
-    are always processed."""
-    outputs: dict[Path, Path] = {}
+    """Leave out files found in folders that are another input's output or backup: movie.clean.mkv or
+    movie.orig.mkv next to movie.mkv. Cleaning movie.clean.mkv again would write
+    movie.clean.clean.mkv. Files named on the command line are always processed."""
+    outputs: dict[Path, tuple[Path, str]] = {}
     for item in inputs:
         with contextlib.suppress(VbrError):
-            outputs[resolve_output(item.path, template, output, many=True).resolve()] = item.path
+            outputs[backup_path(item.path, config.backup_path).resolve()] = (item.path, "backup")
+        with contextlib.suppress(VbrError):
+            target = place(item.path, config, output, many=True).output.resolve()
+            outputs.setdefault(target, (item.path, "output"))
     kept: list[Input] = []
     skipped: list[FileResult] = []
     for item in inputs:
-        source = outputs.get(item.path)
+        source, role = outputs.get(item.path, (None, ""))
         if item.from_folder and source is not None and source != item.path:
-            skipped.append(FileResult(item.path, "skipped", notes=[f"it is the output for {source.name}"]))
+            skipped.append(FileResult(item.path, "skipped", notes=[f"it is the {role} of {source.name}"]))
         else:
             kept.append(item)
     return kept, skipped
@@ -108,7 +113,7 @@ def _finish_in_background(pipeline: Pipeline, job: Job) -> Outcome:
 
 
 def output_clashes(
-    inputs: list[Input], template: str, output: Path | None, *, many: bool
+    inputs: list[Input], config: OutputConfig, output: Path | None, *, many: bool
 ) -> tuple[dict[Path, Path], dict[Path, str]]:
     """Where each input would be written ({resolved output: input}), and the inputs whose output
     another input, earlier in the list, would already write: rendering both would lose one of them."""
@@ -116,7 +121,7 @@ def output_clashes(
     clashes: dict[Path, str] = {}
     for item in inputs:
         try:
-            target = resolve_output(item.path, template, output, many=many).resolve()
+            target = place(item.path, config, output, many=many).output.resolve()
         except VbrError:
             continue  # the file's own run reports it
         first = writers.setdefault(target, item.path)
@@ -148,7 +153,7 @@ def run_batch(
     writers: dict[Path, Path] = {}
     clashes: dict[Path, str] = {}
     if not options.dry_run:
-        writers, clashes = output_clashes(inputs, pipeline.config.output.path, options.output, many=many)
+        writers, clashes = output_clashes(inputs, pipeline.config.output, options.output, many=many)
 
     def flush(block: bool) -> None:
         while queue:
@@ -173,7 +178,7 @@ def run_batch(
                 queue.append(Outcome(item.path, error=UsageError(clashes[item.path])))
                 flush(block=False)
                 continue
-            if item.path.resolve() in writers:
+            if writers.get(item.path.resolve(), item.path) != item.path:
                 wait_for_render()  # it may be the output of a render still running
             try:
                 prepared = pipeline.prepare(item.path, options, many=many, from_folder=item.from_folder)

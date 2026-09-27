@@ -159,7 +159,12 @@ exclude_machine_translated = true    # skip machine- and AI-translated subtitles
 # ---------------------------------------------------------------------------
 [output]
 path = "{stem}.clean{ext}"          # relative to the input's folder; {stem} {ext} {dir}
-overwrite = false
+mode = "new"                        # "new": write the cleaned copy to path, leaving the original alone;
+                                    # "backup" (--backup): the cleaned file takes the original's name,
+                                    # and the original is kept, unmodified, at backup_path;
+                                    # "in_place" (--in-place): the cleaned file replaces the original
+backup_path = "{stem}.orig{ext}"    # for "backup": relative to the input's folder; {stem} {ext} {dir}
+overwrite = false                   # replace existing outputs (never a backup)
 when_clean = "copy"                 # no profanity found: "copy" (stream copy) | "skip"
 audio_codec = "auto"                # same codec as the source when FFmpeg can encode it
 audio_bitrate = "auto"
