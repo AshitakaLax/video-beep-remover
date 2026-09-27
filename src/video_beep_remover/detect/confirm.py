@@ -64,15 +64,15 @@ def detect_in_windows(
     transcripts: Sequence[Sequence[Word]],
     duration: float,
     clean_edges: Sequence[tuple[bool, bool]] | None = None,
-) -> tuple[list[Detection], int]:
-    """Detections in window transcripts, and the number of words they were found among. Each group of
-    windows is matched on its own, so a phrase never spans two separate windows."""
+) -> tuple[list[Detection], list[Word]]:
+    """Detections in window transcripts, and the words they were found among. Each group of windows
+    is matched on its own, so a phrase never spans two separate windows."""
     detections: list[Detection] = []
-    count = 0
+    heard: list[Word] = []
     for words in assemble(windows, transcripts, duration, clean_edges):
-        count += len(words)
+        heard += words
         detections += detect_in_words(lexicon, words)
-    return detections, count
+    return detections, heard
 
 
 def dedupe(detections: Iterable[Detection]) -> list[Detection]:

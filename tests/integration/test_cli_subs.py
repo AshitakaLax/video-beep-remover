@@ -24,7 +24,7 @@ LINES = [
 def heard(monkeypatch: pytest.MonkeyPatch) -> list[Word]:
     """What the scripted "Whisper" hears; tests fill it in."""
     words: list[Word] = []
-    monkeypatch.setattr(Pipeline, "_load_faster_whisper", lambda self, choice: FakeTranscriber(words))
+    monkeypatch.setattr(Pipeline, "_load_transcriber", lambda self, choice: FakeTranscriber(words))
     monkeypatch.setattr("video_beep_remover.pipeline.silero_speech", lambda audio, on_progress=None: [])
     return words
 

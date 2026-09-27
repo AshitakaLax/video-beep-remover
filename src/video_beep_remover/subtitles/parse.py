@@ -8,7 +8,7 @@ import charset_normalizer
 import pysubs2
 
 from video_beep_remover.errors import SubtitleError
-from video_beep_remover.models import Cue
+from video_beep_remover.models import Cue, Sound
 
 MAX_FILE_BYTES = 20 * 1024 * 1024  # heavily typeset ASS files can be a few MB; nothing real is this big
 
@@ -95,24 +95,26 @@ def _without_vtt_metadata(text: str) -> str:
     return "\n\n".join(kept) + "\n"
 
 
-def parse_subtitles(text: str, *, fps: float | None = None) -> list[Cue]:
-    """Parse SRT, ASS/SSA, WebVTT or MicroDVD (which needs `fps`) into cleaned cues, in time order.
-
-    Comments, drawings and cues left empty by cleaning are dropped. The same line repeated in
-    overlapping cues (e.g. on two ASS layers) becomes one cue.
-    """
-    text = text.lstrip("﻿")
+def _events(text: str, fps: float | None) -> list[pysubs2.SSAEvent]:
+    """The file's dialogue events: comments, drawings and events with no duration left out."""
+    text = text.lstrip("\ufeff")
     if text.startswith("WEBVTT"):
         text = _without_vtt_metadata(text)
     try:
         subs = pysubs2.SSAFile.from_string(text, fps=fps)
     except Exception as exc:  # untrusted input: any parser failure means "not usable"
         raise SubtitleError(f"not a subtitle file pysubs2 can read ({type(exc).__name__}: {exc})") from exc
+    return [e for e in subs if not (e.is_comment or e.is_drawing or e.end <= e.start)]
 
+
+def parse_subtitles(text: str, *, fps: float | None = None) -> list[Cue]:
+    """Parse SRT, ASS/SSA, WebVTT or MicroDVD (which needs `fps`) into cleaned cues, in time order.
+
+    Comments, drawings and cues left empty by cleaning are dropped. The same line repeated in
+    overlapping cues (e.g. on two ASS layers) becomes one cue.
+    """
     items: list[tuple[float, float, str, bool]] = []
-    for event in subs:
-        if event.is_comment or event.is_drawing or event.end <= event.start:
-            continue
+    for event in _events(text, fps):
         spoken, lyrics = clean_text(event.plaintext)
         if spoken:
             items.append((event.start / 1000, event.end / 1000, spoken, lyrics))
@@ -126,3 +128,16 @@ def parse_subtitles(text: str, *, fps: float | None = None) -> list[Cue]:
         else:
             merged.append((start, end, spoken, lyrics))
     return [Cue(i + 1, start, end, spoken, lyrics) for i, (start, end, spoken, lyrics) in enumerate(merged)]
+
+
+def parse_sounds(text: str, *, fps: float | None = None) -> list[Sound]:
+    """The sound descriptions that cleaning removes ("[moaning]", "(whispering)"), with the times of
+    their cues, including cues that hold nothing else. The context layer reads them (DESIGN.md §17.2)."""
+    sounds = []
+    for event in _events(text, fps):
+        plain = _OVERRIDE.sub("", _TAG.sub("", event.plaintext))
+        for match in _DESCRIPTION.finditer(plain):
+            description = " ".join(match.group()[1:-1].split()).casefold()
+            if description:
+                sounds.append(Sound(event.start / 1000, event.end / 1000, description))
+    return sorted(sounds, key=lambda s: (s.start, s.end))

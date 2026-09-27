@@ -4,6 +4,8 @@ Subtitles show where listed words are likely to be; only a few seconds of audio 
 are transcribed. Anything that makes the subtitles untrustworthy raises Fallback, and the pipeline
 then transcribes the whole track (or fails, with `fallback_to_full = false`)."""
 
+import bisect
+import itertools
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -103,6 +105,8 @@ class GuidedResult:
     words: int
     model: ModelChoice | None  # None when nothing needed transcribing
     report: dict[str, Any]
+    subtitles: SubtitleChoice | None = None  # the subtitles that guided the search
+    heard: list[Word] = field(default_factory=list)  # the words heard in the windows, in time order
 
 
 def _sync_report(sync: SyncResult) -> dict[str, Any]:
@@ -333,14 +337,14 @@ def transcribe_windows(
     label: str,
     *,
     stitch: bool = True,
-) -> tuple[list[Detection], int, tuple[int, int]]:
+) -> tuple[list[Detection], list[Word], tuple[int, int]]:
     """Transcribe the windows (trimmed to their speech) and find listed words in them.
 
     Cached transcripts are used first: what they reliably cover is neither read nor transcribed, only
     the gaps are, and the model is loaded only if there are gaps. Without `stitch`, a window is served
     from the cache only by one transcript heard with at least as much context (the wider re-check wants
-    the whole window heard in one go). Returns the detections, the number of words heard, and how many
-    windows the cache served entirely and in part."""
+    the whole window heard in one go). Returns the detections, the words heard, and how many windows
+    the cache served entirely and in part."""
     store = ctx.transcripts(role)
     min_window = ctx.config.analysis.targeted.min_window_s
     pieces: list[tuple[Window, Transcript]] = []
@@ -393,15 +397,30 @@ def transcribe_windows(
             if clip.duration >= MIN_CLIP_S:
                 pieces.append((window, transcript))
     if not pieces:
-        return [], 0, (complete, partial)
-    detections, count = detect_in_windows(
+        return [], [], (complete, partial)
+    detections, heard_words = detect_in_windows(
         ctx.lexicon,
         [Window(t.start, t.end, w.reasons, w.cues) for w, t in pieces],
         [list(t.words) for _, t in pieces],
         duration,
         [(t.clean_start, t.clean_end) for _, t in pieces],
     )
-    return detections, count, (complete, partial)
+    return detections, heard_words, (complete, partial)
+
+
+def merge_words(first: Sequence[Word], second: Sequence[Word]) -> list[Word]:
+    """Words from two passes over overlapping audio, in time order. Where the passes heard the same
+    audio, their words overlap in time (with slightly different edges); the second pass's are kept,
+    since it heard that audio with more context."""
+    later = sorted(second, key=lambda w: (w.start, w.end))
+    starts = [w.start for w in later]
+    reach = list(itertools.accumulate((w.end for w in later), max))  # the latest end so far
+    kept = []
+    for word in first:
+        i = bisect.bisect_left(starts, word.end)  # later[:i] start before this word ends
+        if not (i and reach[i - 1] > word.start):
+            kept.append(word)
+    return sorted([*kept, *later], key=lambda w: (w.start, w.end))
 
 
 def _flag_counts(flags: Sequence[FlaggedCue]) -> dict[str, int]:
@@ -492,13 +511,15 @@ def analyse(
         )
 
     detections: list[Detection] = []
+    heard: list[Word] = []
     words = 0
     model: ModelChoice | None = None
     if windows:
         model = ctx.choice(strategy)
-        detections, words, (complete, partial) = transcribe_windows(
+        detections, heard, (complete, partial) = transcribe_windows(
             ctx, strategy, audio, windows, duration, "Transcribing"
         )
+        words = len(heard)
         confirmed, unconfirmed = split_confirmed(flags, detections, sync, pad)
         if unconfirmed and settings.expand_by_s > 0:
             grow = settings.expand_by_s
@@ -509,10 +530,11 @@ def analyse(
                 ]
             )
             report["windows"]["expanded"] = len(wider)
-            more, heard, (also, partly) = transcribe_windows(
+            more, again, (also, partly) = transcribe_windows(
                 ctx, strategy, audio, wider, duration, "Re-checking", stitch=False
             )
-            detections, words = dedupe(detections + more), words + heard
+            detections, words = dedupe(detections + more), words + len(again)
+            heard = merge_words(heard, again)
             complete, partial = complete + also, partial + partly
         report["windows"]["cached"] = complete
         report["windows"]["partly_cached"] = partial
@@ -534,4 +556,4 @@ def analyse(
         {"cue": f.cue.index, "text": f.cue.text, "resolution": resolution} for f in unconfirmed
     ]
     detections = attribute(dedupe(detections), flags, sync, pad)
-    return GuidedResult(detections, words, model, report)
+    return GuidedResult(detections, words, model, report, choice, heard)

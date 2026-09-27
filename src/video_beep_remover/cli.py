@@ -108,7 +108,7 @@ def _setup_logging(verbose: bool) -> None:
         format="%(levelname)s %(name)s: %(message)s",
     )
     # Model downloads log an "unauthenticated requests" warning that is only noise for this tool.
-    for noisy in ("faster_whisper", "httpx", "urllib3", "huggingface_hub"):
+    for noisy in ("faster_whisper", "whisperx", "httpx", "urllib3", "huggingface_hub"):
         logging.getLogger(noisy).setLevel(logging.INFO if verbose else logging.ERROR)
 
 
@@ -134,6 +134,8 @@ def _overrides(**flags: Any) -> dict[str, Any]:
         overrides["analysis.fallback_to_full"] = False
     if flags.get("offline"):
         overrides["offline"] = True
+    if flags.get("context"):
+        overrides["context.enabled"] = True
     return overrides
 
 
@@ -237,6 +239,14 @@ ReviewOpt = Annotated[
     bool,
     typer.Option("--review-srt", help="Also write .review.srt: one cue per muted span, for spot checks."),
 ]
+ContextOpt = Annotated[
+    bool,
+    typer.Option(
+        "--context",
+        help="Also read each listed word and the script in context with local models, and add the "
+        "verdicts to the report (report only; needs the [context] extra).",
+    ),
+]
 OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")]
 OverwriteOpt = Annotated[bool, typer.Option("--overwrite", help="Replace existing outputs.")]
 KeepTempOpt = Annotated[bool, typer.Option("--keep-temp", help="Keep temporary files for debugging.")]
@@ -263,6 +273,7 @@ def clean(
     report: ReportOpt = None,
     edl: EdlOpt = False,
     review_srt: ReviewOpt = False,
+    context: ContextOpt = False,
     overwrite: OverwriteOpt = False,
     skip_existing: Annotated[
         bool, typer.Option("--skip-existing", help="Skip inputs whose output exists.")
@@ -299,6 +310,7 @@ def clean(
         language=language,
         audio_stream=audio_stream,
         recursive=recursive,
+        context=context,
     )
 
 
@@ -318,6 +330,7 @@ def scan(
     report: ReportOpt = None,
     edl: EdlOpt = False,
     review_srt: ReviewOpt = False,
+    context: ContextOpt = False,
     overwrite: Annotated[
         bool, typer.Option("--overwrite", help="Replace an existing EDL or review subtitles.")
     ] = False,
@@ -349,6 +362,7 @@ def scan(
         language=language,
         audio_stream=audio_stream,
         recursive=recursive,
+        context=context,
     )
 
 
@@ -575,6 +589,10 @@ def cache_info(config: ConfigOpt = None) -> None:
         f"transcripts: {transcripts} files, {transcript_bytes / 1024**2:.1f} MiB "
         f"of at most {cfg.cache.max_size_gb:g} GB{state}"
     )
+    answers = [path for path in (root / "context").glob("*.jsonl") if path.is_file()]
+    if answers:
+        size = sum(path.stat().st_size for path in answers)
+        console.print(f"context judge answers: {len(answers)} files, {size / 1024:.0f} KiB")
 
 
 @cache_app.command("clear")
@@ -585,7 +603,8 @@ def cache_clear(
     ] = False,
     transcripts: Annotated[bool, typer.Option("--transcripts", help="Only the transcripts.")] = False,
 ) -> None:
-    """Delete what the cache holds: everything, or only the subtitles or the transcripts."""
+    """Delete what the cache holds: everything (context judge answers too), or only the subtitles or
+    the transcripts."""
     from video_beep_remover.asr.cache import TranscriptCache
     from video_beep_remover.subtitles.cache import SubtitleCache
 
@@ -595,6 +614,12 @@ def cache_clear(
         console.print(f"removed {SubtitleCache(root).clear()} downloaded subtitle files")
     if transcripts or both:
         console.print(f"removed {TranscriptCache(root).clear()} transcript files")
+    if both:
+        answers = [path for path in (root / "context").glob("*.jsonl") if path.is_file()]
+        for path in answers:
+            path.unlink(missing_ok=True)
+        if answers:
+            console.print(f"removed {len(answers)} files of context judge answers")
 
 
 @app.command()
@@ -658,6 +683,8 @@ def doctor(config: ConfigOpt = None) -> None:
             row("Whisper model", ok, f"{choice.describe()} is not downloaded yet; the first run downloads it")
     except ImportError:
         row("faster-whisper", False, "not installed: pip install faster-whisper")
+    row(*_whisperx_status(cfg))
+    row(*_context_status(cfg))
 
     row(*_opensubtitles_status(cfg))
     from video_beep_remover.subtitles.ffsubsync import ffsubsync_command
@@ -672,6 +699,66 @@ def doctor(config: ConfigOpt = None) -> None:
     )
     console.print(table)
     raise typer.Exit(EXIT_DEPENDENCY if failed else EXIT_OK)
+
+
+def _whisperx_status(cfg: Config) -> tuple[str, bool | None, str]:
+    """doctor's WhisperX row: needed only by the whisperx backend, which also needs its models."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    name = "WhisperX"
+    try:
+        installed = version("whisperx")
+    except PackageNotFoundError:
+        if cfg.transcription.backend != "whisperx":
+            return name, None, "not installed; optional: pip install 'video-beep-remover[align]'"
+        return (
+            name,
+            False,
+            "not installed, but backend = \"whisperx\": pip install 'video-beep-remover[align]'",
+        )
+    if cfg.transcription.backend != "whisperx":
+        return name, None, f'{installed}, not used (transcription.backend = "faster-whisper")'
+    from video_beep_remover.asr.whisperx import status
+
+    try:
+        downloaded, details = status(cfg.analysis.language, cfg.transcription.align_model)
+    except VbrError as exc:
+        return name, False, f"{installed}: {exc}"
+    return name, True if downloaded else (False if cfg.offline else None), f"{installed}, aligner {details}"
+
+
+def _context_status(cfg: Config) -> tuple[str, bool | None, str]:
+    """doctor's row for context analysis (DESIGN.md §17): its extra, its models and the judge."""
+    from importlib.util import find_spec
+
+    from video_beep_remover.asr.faster_whisper import cuda_available
+    from video_beep_remover.context import judge_model
+
+    name = "context analysis"
+    installed = find_spec("torch") is not None and find_spec("transformers") is not None
+    enabled = cfg.context.enabled
+    if not installed:
+        if not enabled:
+            return name, None, "off; optional: pip install 'video-beep-remover[context]', then --context"
+        return name, False, "context.enabled, but not installed: pip install 'video-beep-remover[context]'"
+    device = cfg.transcription.device
+    if device == "auto":
+        device = "cuda" if cuda_available() else "cpu"
+    judge = judge_model(cfg.context.judge, device)
+    models = [cfg.context.classifier] + ([judge] if judge else [])
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        missing = [m for m in models if not isinstance(try_to_load_from_cache(m, "config.json"), str)]
+    except ImportError:
+        missing = []
+    details = f"{'on' if enabled else 'off (--context turns it on)'}; classifier {cfg.context.classifier}; "
+    details += (
+        f"judge {judge}" if judge else "no judge (no GPU)" if cfg.context.judge == "auto" else "no judge"
+    )
+    if missing:
+        details += f"; not downloaded yet: {', '.join(missing)} (the first run downloads them)"
+    return name, (False if missing and cfg.offline and enabled else True if enabled else None), details
 
 
 def _opensubtitles_status(cfg: Config) -> tuple[str, bool | None, str]:

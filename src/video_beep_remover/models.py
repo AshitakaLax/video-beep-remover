@@ -54,6 +54,15 @@ class Cue:
 
 
 @dataclass(frozen=True, slots=True)
+class Sound:
+    """A sound description in SDH subtitles ("moaning" from "[moaning]"). Subtitle time."""
+
+    start: float
+    end: float
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class SyncModel:
     """Maps subtitle time to media time: t_media = scale * t_sub + offset."""
 

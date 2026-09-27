@@ -58,6 +58,26 @@ terms = ["goddamn*", "god damn*", "god dammit", "jesus christ", "oh my [god]", "
 enabled = true
 terms = []                          # add your own
 
+# Phrases of a sexual nature. Off by default: turning it on mutes them. Either way, context analysis
+# (below) reports the lines they occur in. Several have innocent senses too ("I sleep with the window
+# open"); context.ambiguous lists those, so the context layer checks how they are meant.
+[lexicon.categories.sexual]
+enabled = false
+terms = [
+  "have sex", "having sex", "had sex", "has sex", "oral sex", "phone sex", "sex tape",
+  "make love", "making love", "made love", "makes love",
+  "sleep with", "sleeping with", "slept with", "sleeps with",
+  "sleep together", "slept together", "sleeping together",
+  "go to bed with", "went to bed with", "going to bed with",
+  "get laid", "got laid", "getting laid", "hook up", "hooked up", "hooking up",
+  "one night stand", "one-night stand", "booty call", "friends with benefits",
+  "go down on", "went down on", "going down on", "blow job", "blowjob*", "hand job", "handjob*",
+  "jerk off", "jerking off", "jack off", "jacking off", "turn me on", "turns me on", "turned me on",
+  "take off your clothes", "take your clothes off", "get it on", "getting it on",
+  "in the sack with", "roll in the hay", "lose my virginity", "lost my virginity",
+  "lose your virginity", "lost her virginity", "lost his virginity",
+]
+
 # Words that subtitles often use *instead of* profanity. A cue containing one of these is
 # checked against the audio, but the hint word itself is never censored.
 [lexicon.hints]
@@ -68,10 +88,11 @@ terms = ["freak*", "frick*", "friggin*", "heck", "darn*", "shoot", "crud", "effi
 # ---------------------------------------------------------------------------
 [censor]
 pad_before_ms = 120                 # widen each detected word a little on both sides
-pad_after_ms = 200                  # more after: Whisper places word ends early (DESIGN.md Appendix C)
+pad_after_ms = 200                  # more after: Whisper places word ends early (with backend = "whisperx", try 120)
 min_duration_ms = 250               # very short gaps sound like glitches
 merge_gap_ms = 250                  # join muted spans closer than this
 fade_ms = 10                        # smooth fade at each edge, inside the padding; avoids clicks
+refine_edges = false                # move each edge outward, up to 80 ms, to the quietest 10 ms nearby
 
 # ---------------------------------------------------------------------------
 # How profanity is found
@@ -104,7 +125,8 @@ min_fidelity = 0.6                  # 0-1; below this, subtitles are too paraphr
 ffsubsync = "fallback"              # "never" | "fallback": re-time subtitles that fail (needs the [sync] extra)
 
 [transcription]
-backend = "faster-whisper"          # "faster-whisper" | "whisperx"
+backend = "faster-whisper"          # "faster-whisper" | "whisperx": re-time words by forced alignment ([align] extra)
+align_model = "auto"                # whisperx only: a wav2vec2 model; auto has one for en, fr, de, es, it and 36 more
 model = "auto"                      # e.g. "large-v3-turbo", "small.en"; auto picks by device and strategy
 anchor_model = "base.en"            # small, fast model used only for sync anchors
 device = "auto"                     # "auto" | "cuda" | "cpu"
@@ -147,6 +169,33 @@ subtitle_mask = "first_letter"      # "first_letter" (f***) | "asterisks" (****)
 report = true                       # <output stem>.vbr.json
 edl = false                         # <input stem>.edl next to the input: Kodi / MPlayer mute the original file
 review_srt = false                  # <output stem>.review.srt: one cue per muted span, to spot-check in a player
+
+# ---------------------------------------------------------------------------
+# Context analysis (DESIGN.md §17): report-only for now
+# ---------------------------------------------------------------------------
+# Reads the dialogue around each listed word, and the whole script, with local models, and adds its
+# verdicts to the report and the review subtitles: whether a use looks harmless ("the nine circles
+# of hell"), and which lines look sexual. It never changes what is muted. Needs pip install
+# "video-beep-remover[context]"; the models download on first use and run locally.
+[context]
+enabled = false                     # or --context on the command line
+classifier = "unitary/unbiased-toxic-roberta"   # scores every line (about 500 MB)
+judge = "auto"                      # a small language model for the few lines that need judging;
+                                    # "auto": Qwen/Qwen3-4B-Instruct-2507 on an NVIDIA GPU, none on a
+                                    # CPU (20-35 s per question there); "" never; or a model name
+ambiguous = [                       # listed terms, as written above, with innocent senses too
+  "hell", "damned", "ass", "asses", "jackass*", "bitch*", "bastard*", "piss", "pissed", "jesus christ",
+  "sleep with", "sleeping with", "slept with", "sleeps with", "sleep together", "slept together",
+  "sleeping together", "hook up", "hooked up", "hooking up", "go down on", "went down on",
+  "going down on", "get it on", "getting it on", "take off your clothes", "take your clothes off",
+]
+triggers = [                        # words that make the judge check a line for innuendo
+  "bed", "naked", "nude", "undress*", "sexy", "seduc*", "virgin*", "lover*", "aroused", "horny",
+  "spend the night", "come upstairs", "your place or mine", "take it off",
+]
+min_sexual_score = 0.5              # classifier score from which a line counts as sexual
+clean_below = 0.3                   # a use can be harmless only if the line scores below this
+profane_above = 0.5                 # a line scoring this much is profane without asking the judge
 
 [cache]
 dir = "auto"                        # per-user cache dir

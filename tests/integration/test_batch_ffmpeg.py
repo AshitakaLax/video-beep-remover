@@ -131,7 +131,7 @@ def test_a_failed_background_render_fails_only_its_file(
 
 
 def test_clean_a_folder_from_the_command_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(Pipeline, "_load_faster_whisper", lambda self, choice: FakeTranscriber(SPOKEN))
+    monkeypatch.setattr(Pipeline, "_load_transcriber", lambda self, choice: FakeTranscriber(SPOKEN))
     monkeypatch.setattr("video_beep_remover.pipeline.silero_speech", lambda audio, on_progress=None: [])
     for name in ("a.mkv", "b.mkv"):
         make_clip(tmp_path / name, duration=3.0)

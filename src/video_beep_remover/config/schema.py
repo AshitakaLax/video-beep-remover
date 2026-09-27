@@ -35,6 +35,7 @@ class CensorConfig(_Model):
     min_duration_ms: int = Field(250, ge=0, le=5000)
     merge_gap_ms: int = Field(250, ge=0, le=5000)
     fade_ms: int = Field(10, ge=1, le=100)
+    refine_edges: bool = False
 
 
 class TargetedConfig(_Model):
@@ -71,6 +72,7 @@ class AnalysisConfig(_Model):
 
 class TranscriptionConfig(_Model):
     backend: Literal["faster-whisper", "whisperx"] = "faster-whisper"
+    align_model: str = "auto"
     model: str = "auto"
     anchor_model: str = "base.en"
     device: Literal["auto", "cuda", "cpu"] = "auto"
@@ -116,6 +118,29 @@ class OutputConfig(_Model):
     review_srt: bool = False
 
 
+_AMBIGUOUS = [
+    "hell", "damned", "ass", "asses", "jackass*", "bitch*", "bastard*", "piss", "pissed", "jesus christ",
+    "sleep with", "sleeping with", "slept with", "sleeps with", "sleep together", "slept together",
+    "sleeping together", "hook up", "hooked up", "hooking up", "go down on", "went down on",
+    "going down on", "get it on", "getting it on", "take off your clothes", "take your clothes off",
+]  # fmt: skip
+_TRIGGERS = [
+    "bed", "naked", "nude", "undress*", "sexy", "seduc*", "virgin*", "lover*", "aroused", "horny",
+    "spend the night", "come upstairs", "your place or mine", "take it off",
+]  # fmt: skip
+
+
+class ContextConfig(_Model):
+    enabled: bool = False
+    classifier: str = "unitary/unbiased-toxic-roberta"
+    judge: str = "auto"  # "auto": the default judge on a CUDA GPU, none on a CPU; "": none
+    ambiguous: list[str] = Field(default_factory=lambda: list(_AMBIGUOUS))
+    triggers: list[str] = Field(default_factory=lambda: list(_TRIGGERS))
+    min_sexual_score: float = Field(0.5, ge=0, le=1)
+    clean_below: float = Field(0.3, ge=0, le=1)
+    profane_above: float = Field(0.5, ge=0, le=1)
+
+
 class CacheConfig(_Model):
     dir: str = "auto"
     max_size_gb: float = Field(5, ge=0)
@@ -136,5 +161,6 @@ class Config(_Model):
     transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     subtitles: SubtitlesConfig = Field(default_factory=SubtitlesConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)

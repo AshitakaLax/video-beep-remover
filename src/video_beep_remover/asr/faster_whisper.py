@@ -2,7 +2,7 @@
 
 import bisect
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from video_beep_remover.asr.base import Clip, ProgressCallback
+from video_beep_remover.asr.cuda import load_pip_libraries
 from video_beep_remover.config.schema import TranscriptionConfig
 from video_beep_remover.errors import DependencyError
 from video_beep_remover.media.audio import SAMPLE_RATE
@@ -36,9 +37,10 @@ class ModelChoice:
     device: str
     compute_type: str
     batched: bool  # BatchedInferencePipeline; used on GPU
+    align: bool = False  # re-time the words with wav2vec2 forced alignment (the whisperx backend)
 
     def describe(self) -> str:
-        return f"{self.name} ({self.device}, {self.compute_type})"
+        return f"{self.name} ({self.device}, {self.compute_type})" + (" with alignment" if self.align else "")
 
 
 def _device_and_precision(config: TranscriptionConfig) -> tuple[str, str]:
@@ -60,17 +62,34 @@ def resolve_model(config: TranscriptionConfig, *, strategy: str, language: str) 
             name = "large-v3-turbo"
         else:
             name = "small.en" if language.lower().startswith("en") else "small"
-    return ModelChoice(name=name, device=device, compute_type=compute_type, batched=device == "cuda")
+    return ModelChoice(
+        name=name,
+        device=device,
+        compute_type=compute_type,
+        batched=device == "cuda",
+        align=config.backend == "whisperx",
+    )
 
 
 def resolve_anchor_model(config: TranscriptionConfig, *, language: str) -> ModelChoice:
     """The small model for sync anchors. English-only models (".en") fall back to their multilingual
-    version for other languages. Anchors are transcribed one at a time, so never batched."""
+    version for other languages. Anchors are transcribed one at a time, so never batched, and only
+    matched as text, so never aligned."""
     device, compute_type = _device_and_precision(config)
     name = config.anchor_model
     if name.endswith(".en") and not language.lower().startswith("en"):
         name = name.removesuffix(".en")
     return ModelChoice(name=name, device=device, compute_type=compute_type, batched=False)
+
+
+@dataclass(frozen=True)
+class Segment:
+    """A stretch of decoded speech, with times on the media timeline."""
+
+    clip: int  # the index of the clip it was heard in
+    start: float
+    end: float
+    words: tuple[Word, ...]
 
 
 class FasterWhisperTranscriber:
@@ -88,6 +107,8 @@ class FasterWhisperTranscriber:
             from faster_whisper import BatchedInferencePipeline, WhisperModel
         except ImportError as exc:
             raise DependencyError("faster-whisper is not installed: pip install faster-whisper") from exc
+        if choice.device == "cuda":
+            load_pip_libraries()
         self.name = choice.describe()
         self.choice = choice
         self.beam_size = beam_size
@@ -125,21 +146,43 @@ class FasterWhisperTranscriber:
         vad: bool = False,
         on_progress: ProgressCallback | None = None,
     ) -> list[list[Word]]:
+        results: list[list[Word]] = [[] for _ in clips]
+        for segment in self.segments(
+            clips, language=language, prompt=prompt, vad=vad, on_progress=on_progress
+        ):
+            results[segment.clip] += segment.words
+        return results
+
+    def segments(
+        self,
+        clips: Sequence[Clip],
+        *,
+        language: str,
+        prompt: str | None,
+        vad: bool = False,
+        on_progress: ProgressCallback | None = None,
+    ) -> Iterator[Segment]:
+        """The segments heard in the clips, as they are decoded. Progress is reported when the caller
+        asks for the next segment, so it includes whatever the caller did with the last one."""
         options = self._options(language, prompt, vad)
         if self._pipeline is not None and len(clips) > 1 and all(c.duration <= CHUNK_S for c in clips):
-            return self._transcribe_packed(clips, options, on_progress)
-        results: list[list[Word]] = []
+            yield from self._packed_segments(clips, options, on_progress)
+            return
         done = 0.0
-        for clip in clips:
-            results.append(self._transcribe_clip(clip, options, done, on_progress))
+        for index, clip in enumerate(clips):
+            yield from self._clip_segments(index, clip, options, done, on_progress)
             done += clip.duration
             if on_progress is not None:
                 on_progress(done)
-        return results
 
-    def _transcribe_clip(
-        self, clip: Clip, options: dict[str, Any], done: float, on_progress: ProgressCallback | None
-    ) -> list[Word]:
+    def _clip_segments(
+        self,
+        index: int,
+        clip: Clip,
+        options: dict[str, Any],
+        done: float,
+        on_progress: ProgressCallback | None,
+    ) -> Iterator[Segment]:
         audio = np.ascontiguousarray(clip.audio, dtype=np.float32)
         if self._pipeline is not None:
             if clip.duration > CHUNK_S and not options["vad_filter"]:
@@ -153,17 +196,18 @@ class FasterWhisperTranscriber:
             segments, _ = self._pipeline.transcribe(audio, batch_size=self.batch_size, **options)
         else:
             segments, _ = self._model.transcribe(audio, **options)
-        words: list[Word] = []
+        count = 0
         for segment in segments:  # a generator: decoding happens while iterating
-            words += _words(segment.words or (), shift=clip.start)
+            found = _segment(index, segment, shift=clip.start)
+            count += len(found.words)
+            yield found
             if on_progress is not None:
                 on_progress(done + float(segment.end))
-        log.debug("transcribed %.1f s at %.1f s into %d words", clip.duration, clip.start, len(words))
-        return words
+        log.debug("transcribed %.1f s at %.1f s into %d words", clip.duration, clip.start, count)
 
-    def _transcribe_packed(
+    def _packed_segments(
         self, clips: Sequence[Clip], options: dict[str, Any], on_progress: ProgressCallback | None
-    ) -> list[list[Word]]:
+    ) -> Iterator[Segment]:
         """All clips in one buffer, one batch item each (DESIGN.md §6.8): the GPU decodes them together."""
         assert self._pipeline is not None
         starts: list[float] = []
@@ -178,13 +222,19 @@ class FasterWhisperTranscriber:
         segments, _ = self._pipeline.transcribe(
             buffer, batch_size=self.batch_size, **(options | {"clip_timestamps": stamps})
         )
-        results: list[list[Word]] = [[] for _ in clips]
         for segment in segments:
             index = max(0, bisect.bisect_right(starts, float(segment.start) + _CLIP_TOLERANCE_S) - 1)
-            results[index] += _words(segment.words or (), shift=clips[index].start - starts[index])
+            yield _segment(index, segment, shift=clips[index].start - starts[index])
             if on_progress is not None:
                 on_progress(float(segment.end))
-        return results
+
+
+def _segment(clip: int, segment: Any, *, shift: float) -> Segment:
+    """A faster-whisper segment, moved onto the media timeline."""
+    start = shift + max(0.0, float(segment.start))
+    return Segment(
+        clip, start, max(start, shift + float(segment.end)), tuple(_words(segment.words or (), shift=shift))
+    )
 
 
 def _words(found: Iterable[Any], *, shift: float) -> list[Word]:

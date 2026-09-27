@@ -20,7 +20,9 @@ def test_defaults_load_without_a_config_file(tmp_path: Path) -> None:
     cfg = loaded.config
     assert cfg.analysis.strategy == "hybrid"
     assert cfg.censor.fade_ms == 10
-    assert list(cfg.lexicon.categories) == ["strong", "mild", "religious", "slurs"]
+    assert list(cfg.lexicon.categories) == ["strong", "mild", "religious", "slurs", "sexual"]
+    assert not cfg.lexicon.categories["sexual"].enabled  # phrases; context analysis reports them anyway
+    assert not cfg.context.enabled and cfg.context.judge == "auto"
 
 
 def test_discovery_order(tmp_path: Path) -> None:
