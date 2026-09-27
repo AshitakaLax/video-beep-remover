@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from helpers import FakeTranscriber, StrictUI, Track, decode, make_clip, tone_gain, words
+from helpers import MUSIC_HZ, FakeTranscriber, StrictUI, Track, decode, make_clip, tone_gain, words
 from video_beep_remover.asr.base import Clip
 from video_beep_remover.config import load_config
 from video_beep_remover.context.models import LABELS
@@ -83,7 +83,13 @@ class Encoder:
         return np.ones(4, dtype=np.float32)
 
 
-def run(tmp_path: Path, editor: Editor, **overrides: Any) -> tuple[Pipeline, Any]:
+def run(
+    tmp_path: Path,
+    editor: Editor,
+    tracks: Sequence[Track] = (Track(default=True), Track(title="Downmix")),  # the same dialogue twice
+    audio_codec: str = "flac",
+    **overrides: Any,
+) -> tuple[Pipeline, Any]:
     loaded = load_config(
         None,
         env={},
@@ -98,8 +104,7 @@ def run(tmp_path: Path, editor: Editor, **overrides: Any) -> tuple[Pipeline, Any
         context_models=(lambda name, device: Classifier(), lambda name, device: None),
         voice_models=(Separator, lambda: editor, Encoder),
     )
-    tracks = (Track(default=True), Track(title="Downmix"))  # the second carries the same dialogue
-    source = make_clip(tmp_path / "movie.mkv", audio_codec="flac", tracks=tracks)
+    source = make_clip(tmp_path / "movie.mkv", audio_codec=audio_codec, tracks=tracks)
     return pipeline, pipeline.process(source, RunOptions(review_srt=True, edl=True))
 
 
@@ -136,6 +141,22 @@ def test_a_replaced_word_is_said_again_instead_of_muted(tmp_path: Path) -> None:
     )
     again = decode(rendered.output)  # type: ignore[arg-type]
     assert tone_gain(again, 2.2) < 0.01 and tone_gain(again, 2.2, frequency=NEW_WORD_HZ) < 0.01
+
+
+def test_a_surround_track_is_edited_in_its_front_centre(tmp_path: Path) -> None:
+    # The dialogue tone is in the front centre, and the other channels carry "music". The check hears
+    # the track through FFmpeg's downmix, as the analysis does; an even mix of the six channels would
+    # bury the new word. AC3 starts 256 samples early, before zero: the old tone cancels only if the
+    # change is added at the exact sample.
+    _, result = run(tmp_path, Editor(), tracks=(Track(default=True, surround=True),), audio_codec="ac3")
+    assert (result.status, result.replaced) == ("cleaned", 1)
+    centre, left = decode(result.output, channel="FC"), decode(result.output, channel="FL")
+    assert tone_gain(centre, 2.2, window=0.1) < 0.01
+    assert tone_gain(centre, 2.2, frequency=NEW_WORD_HZ, window=0.1) == pytest.approx(1.0, abs=0.02)
+    assert tone_gain(centre, 1.1, window=0.1) == pytest.approx(1.0, abs=0.02)
+    # The music under the word stays.
+    assert tone_gain(left, 2.2, frequency=MUSIC_HZ, window=0.1) == pytest.approx(1.0, abs=0.02)
+    assert tone_gain(left, 2.2, frequency=NEW_WORD_HZ, window=0.1) < 0.01
 
 
 def test_a_word_that_fails_the_check_is_muted(tmp_path: Path) -> None:

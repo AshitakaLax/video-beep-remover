@@ -133,7 +133,7 @@ That file is deep-merged over the packaged defaults (`defaults.toml`, which is t
 | `[subtitles]`, `.opensubtitles` | Source order, languages, preference for hearing-impaired tracks, credentials |
 | `[output]` | Output path, overwrite, codecs, other audio and subtitle streams, report and EDL |
 | `[cache]`, `[tools]` | Cache location and size, FFmpeg and ffprobe paths |
-| `[context]`, `[replace]` (planned, §17.8) | Context verdicts, ambiguous terms, sexual-content lines; substitutes for voice replacement |
+| `[context]`, `[replace]` (§17.8, §16) | Context analysis and its actions, ambiguous terms, sexual-content lines; voice replacement and its substitutes |
 
 A minimal config needs only the word list:
 
@@ -773,6 +773,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 - **Context analysis** (§17). Unit tests run the layer with stand-in models, so CI needs no PyTorch. They cover lines, rules, the combination of verdicts, answer parsing and the judge's cache. A pipeline test checks that verdicts reach the report and the review subtitles, and that the muted spans do not change. With the M7 actions on, it checks that a harmless use is kept, that a sexual line is muted from its first heard word to its last, and that `vbr render` keeps the review cues. `scripts/evaluate_context.py` scores the real models on `scripts/data/context_lines.jsonl`, a set of 71 labelled lines, and on `scripts/data/context_crafted.jsonl`, lines crafted to fool them (Appendix D).
 - **Voice replacement** (§16). Unit tests cover the choice of substitute, the sentence and its new text, the dialogue channels and the change. A pipeline test runs it with real FFmpeg and stand-in models: a tone stands in for speech, the stand-in voice model says the word again as a second tone, and the stand-in speech recognition hears that tone as the substitute. It checks that:
   - the new word replaces the old one in the analysed stream, sample-exactly, and nothing else changes;
+  - on a 5.1 AC3 track, which starts 256 samples before zero, only the front centre changes, and the check hears the track as the analysis does;
   - a second audio stream, the EDL and `vbr render` mute the span;
   - a word that fails the check is muted;
   - a term set to no substitutes is always muted.
@@ -846,7 +847,7 @@ M0 to M5 are implemented:
 - M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
 - M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
 
-M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only. Appendix D measures it on 71 labelled lines. M7's actions are implemented, off by default and experimental. They meet their targets on the labelled set and on crafted lines (Appendix D.3), after a defence against prompt injection that the crafted lines showed was needed. Measuring them on real films is still to do. M8, voice replacement (§16), is implemented, off by default and experimental. On a test clip, a word it replaced passed the check, and every word it could not replace was muted (Appendix E).
+M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only. Appendix D measures it on 71 labelled lines. M7's actions are implemented, off by default and experimental. They meet their targets on the labelled set and on crafted lines (Appendix D.3), after a defence against prompt injection that the crafted lines showed was needed. Measuring them on real films is still to do. M8, voice replacement (§16), is implemented, off by default and experimental. On a stereo and a 5.1 test clip, the words it replaced passed the check, and every word it could not replace was muted (Appendix E).
 
 ## 14. Alternatives considered
 
@@ -894,7 +895,7 @@ Instead of silence, a listed word can be replaced by a milder one spoken in the 
 4. **Isolating the dialogue.** The front-centre channel of a surround track, or the front pair otherwise, goes through Demucs (`htdemucs`), which returns the voice without music and effects.
 5. **Saying it again.** F5-TTS regenerates the word's muted span inside the separated voice. The span's mel frames are masked and filled in from the sentence's text, and the rest of the sentence conditions them. So the new word keeps the speaker's voice, pace and pitch, and the span keeps its length, which keeps lip sync as far as it can.
 6. **The change.** The change is the new voice minus the old, within the span, faded over 20 ms at each edge. It is spread over the dialogue channels as the old voice was. The renderer mixes it into the analysed stream (FFmpeg `amix` after an `adelay` by sample count) and does not mute that span there. The music and effects under the word stay.
-7. **The check.** The window with the change is transcribed again, with the analysis's own model and prompt:
+7. **The check.** The window with the change is downmixed by FFmpeg, as the analysis heard the track, and transcribed again with the analysis's own model and prompt:
    - the substitute must be heard in the span, and no listed word;
    - the new word must sound like the speaker about as much as the old one did. Their ECAPA speaker embeddings are compared with the rest of the sentence's, and the new word's cosine may be at most `voice_margin` (0.15) below the old word's.
 
@@ -925,6 +926,7 @@ The voice weights' non-commercial licence fits what the feature is for: personal
 **Hard parts still open.**
 
 - Separation artefacts in music-heavy scenes, and words said over each other.
+- Dialogue mixed into other channels too, such as reverb in the front pair of a 5.1 track: only the front centre is edited, so the old word stays faintly in the others.
 - Lip movements that no longer match the word; fixing that would need video editing.
 - Languages: F5-TTS's base model speaks English and Chinese.
 - Licences: the strongest voice models are non-commercial (open question 9).
@@ -1411,4 +1413,18 @@ Whisper `small.en` and `base.en` both heard: "What the heck is going on over the
 4. **The voice check was close for one word.** "heck" passed with 0.006 to spare. Single-word speaker embeddings are noisy, which is why the check compares the new word with the old one rather than with a fixed threshold. Real voices must set `voice_margin`.
 5. **The old word leaves a trace.** In a probe on the same kind of chord bed, Demucs left about 9 % of the voice in the background, so a faint trace of the old word stays under the new one. Whisper did not hear it; a listening test on real films is still to do.
 
-**Not measured here.** Real films, GPU speed, 5.1 tracks, music-heavy scenes, and how natural the words sound to a person: nobody listened, only Whisper.
+**A 5.1 track.** The same speech was remixed as a film's main track might be: 5.1 AC3 at 448 kb/s, with the voice alone in the front centre, the chord bed in the front pair and the surrounds, and its lowest note in the LFE. AC3 starts 256 samples before zero, which the reading and the renderer both have to count. The outcomes were those of the stereo clip:
+
+| Word | Without a judge | With the judge | Similarity with the judge, new / old |
+|---|---|---|---|
+| hell | muted | heck | 0.24 / 0.29 |
+| damn | darn | darn | 0.51 / 0.44 |
+| fuck | muted | freaking | 0.57 / 0.34 |
+
+- Only the front centre changed. Under each replaced word, the other five channels kept their level, and they matched the source to within 0.1 %, the AC3 re-encode's error. So did every channel outside the spans.
+- With the judge, Whisper `small.en` and `base.en` both heard the sentences as in stereo, and no listed word. Without it, `base.en` heard "What is going on over there? That was a darn fine cup of coffee, detective. Get out of my orchard right now." `small.en` wrote "f***" in both muted gaps, although they were silent in every channel: it guessed the words from the sentence.
+- "heck" passed with more room than in stereo: 0.05 below the old word's similarity rather than 0.14. Single-word similarities move with the mix.
+- The replacements took 166 s for the three words, as in stereo.
+- The check used to hear an even mix of the six channels. FFmpeg's downmix, which the analysis hears, keeps the front centre at full level, the front pair at 0.71 and the surrounds at 0.5, and leaves out the LFE. The even mix therefore made the music 3–6 dB louder against the dialogue than the analysis heard it, and added the LFE. The check now hears FFmpeg's downmix. With the even mix, the pipeline test's stand-in speech recognition missed the new word on a 5.1 track.
+
+**Not measured here.** Real films and their mixes, GPU speed, music-heavy scenes, and how natural the words sound to a person: nobody listened, only Whisper.

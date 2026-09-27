@@ -209,7 +209,7 @@ class Replacer:
         edited = self.models.editor().edit(voice, rate, candidate.spoken.text, local)
         delta = splice.change(window, vocals, edited, local, rate, rows)
 
-        words = self.transcribe(self._to_16k((window + delta).mean(axis=0), rate, workdir), start)
+        words = self.transcribe(self._to_16k(window + delta, rate, stream.channel_layout, workdir), start)
         near = [w for w in words if span[0] <= (w.start + w.end) / 2 <= span[1]]  # the span is padded
         text = " ".join(w.text.strip() for w in near)
         leaked = [d for d in detect_in_words(self.lexicon, words) if d.start < span[1] and span[0] < d.end]
@@ -234,13 +234,17 @@ class Replacer:
             similarity, baseline, path, start + first / rate,
         )  # fmt: skip
 
-    def _to_16k(self, mono: FloatArray, rate: int, workdir: Path) -> Audio:
+    def _to_16k(self, audio: FloatArray, rate: int, layout: str | None, workdir: Path) -> Audio:
+        """`audio` (channels × samples) as the analysis hears a track: FFmpeg's downmix at 16 kHz mono,
+        which keeps the front centre at full level. An even mix of a 5.1 track's channels would make the
+        music 3–6 dB louder against the dialogue than the analysis heard it."""
         raw = workdir / "replace-check.f32"
-        raw.write_bytes(np.ascontiguousarray(mono, dtype=np.float32).tobytes())
+        raw.write_bytes(np.ascontiguousarray(audio.T, dtype=np.float32).tobytes())
+        channels = ["-ac", str(audio.shape[0]), *(["-ch_layout", layout] if layout else [])]
         try:
             data = self.ff.capture([
-                "-f", "f32le", "-ar", str(rate), "-ac", "1", "-i", file_arg(raw),
-                "-ar", "16000", "-f", "f32le", "pipe:1",
+                "-f", "f32le", "-ar", str(rate), *channels, "-i", file_arg(raw),
+                "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1",
             ])  # fmt: skip
         finally:
             raw.unlink(missing_ok=True)

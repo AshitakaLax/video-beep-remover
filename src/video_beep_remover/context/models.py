@@ -41,6 +41,8 @@ def _libraries() -> tuple[Any, Any]:
     except ImportError as exc:
         raise DependencyError(_MISSING) from exc
     transformers.logging.set_verbosity_error()
+    if not logging.getLogger().isEnabledFor(logging.DEBUG):
+        transformers.logging.disable_progress_bar()  # "Loading weights"; downloads keep their own bars
     return torch, transformers
 
 

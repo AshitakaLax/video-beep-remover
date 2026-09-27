@@ -1,5 +1,6 @@
 """The context layer (DESIGN.md §17) against stand-in models: no PyTorch or downloads needed."""
 
+import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -27,6 +28,7 @@ from video_beep_remover.context.models import (
     CachedJudge,
     LocalJudge,
     ToxicityClassifier,
+    _libraries,
 )
 from video_beep_remover.context.rules import Phrases, delivery, intensity, sexual_sounds
 from video_beep_remover.errors import DependencyError
@@ -451,7 +453,7 @@ def test_a_judge_that_does_not_fit_says_how_to_go_without(monkeypatch: pytest.Mo
     transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=lambda name, **options: object()),
         AutoModelForCausalLM=SimpleNamespace(from_pretrained=lambda name, **options: Model()),
-        logging=SimpleNamespace(set_verbosity_error=lambda: None),
+        logging=SimpleNamespace(set_verbosity_error=lambda: None, disable_progress_bar=lambda: None),
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bfloat16"))
     monkeypatch.setitem(sys.modules, "transformers", transformers)
@@ -459,6 +461,24 @@ def test_a_judge_that_does_not_fit_says_how_to_go_without(monkeypatch: pytest.Mo
         DependencyError, match=r'context\.judge = "" runs without a judge: CUDA out of memory'
     ):
         LocalJudge(DEFAULT_JUDGE, device="cuda", offline=False)
+
+
+def test_models_load_without_a_progress_bar_unless_the_run_is_verbose(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    bars: list[str] = []
+    transformers = SimpleNamespace(
+        logging=SimpleNamespace(
+            set_verbosity_error=lambda: None, disable_progress_bar=lambda: bars.append("off")
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    caplog.set_level(logging.WARNING, logger="")
+    _libraries()
+    caplog.set_level(logging.DEBUG, logger="")  # -v
+    _libraries()
+    assert bars == ["off"]
 
 
 def test_without_the_extra_a_run_fails_before_anything_is_transcribed(
