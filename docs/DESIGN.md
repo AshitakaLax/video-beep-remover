@@ -837,7 +837,7 @@ M0 to M5 are implemented:
 - M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
 - M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
 
-M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only.
+M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only. Appendix D measures it on 71 labelled lines.
 
 ## 14. Alternatives considered
 
@@ -868,7 +868,7 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
 6. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
 7. An interactive review UI (`vbr review`, with ffplay previews)?
-8. Which judge model (§17.3)? A 4-billion-parameter model is noticeably better than a 1.5-billion one, but judges harmless uses poorly and innuendo only partly (Appendix D). A larger or newer model on a GPU may do better; the labelled set decides.
+8. Which judge model (§17.3)? On the labelled set, Qwen3-4B-Instruct recognizes 10 of 16 harmless uses without calling any profane use harmless, but finds only 3 of the 10 sexual lines it is asked about (Appendix D). A larger or newer model on a GPU may do better; the labelled set decides.
 
 ## 16. Stretch goal: voice-matched word replacement
 
@@ -908,7 +908,7 @@ v1 decides by the word alone: a listed word is muted wherever it is heard. This 
 - **Local only.** Every model runs on the user's machine, from the model cache when offline (§10). No dialogue leaves the machine.
 - **Report-only first.** The first milestone adds verdicts to the report and the review subtitles, and changes nothing that is muted. Acting on verdicts comes later, opt-in, once they are measured.
 - **The `sexual` category holds phrases of a sexual nature** ("have sex", "sleep with", "make love", …) rather than single words. It is off by default, since turning it on changes what every existing config mutes. Its phrases count as evidence for sexual lines either way (§17.5).
-- **No judge without a GPU by default.** `context.judge = "auto"` runs the judge only on an NVIDIA GPU; on a CPU, where it takes about 28 s per question, the layer uses the rules and the classifier alone. A judge can still be named explicitly.
+- **No judge without a GPU by default.** `context.judge = "auto"` runs the judge only on an NVIDIA GPU; on a CPU, where it takes 20–35 s per question (Appendix D), the layer uses the rules and the classifier alone. A judge can still be named explicitly.
 
 ### 17.1 What a first test showed
 
@@ -1023,18 +1023,19 @@ The emotion and intensity go to the voice model as a condition, where it accepts
 
 ### 17.7 Evaluation
 
-The synthetic set of §11 has no context to judge. M6 adds a text-only set of labelled lines, written for the purpose, since film subtitles cannot be shared:
+The synthetic set of §11 has no context to judge. M6 adds `scripts/data/context_lines.jsonl`, a text-only set of labelled lines written for the purpose, since film subtitles cannot be shared:
 
-- uses of each ambiguous listed word, labelled profane or harmless;
-- lines labelled sexual or not, including innuendo and sound descriptions;
-- the emotion and the fitting substitute where they matter.
+- uses of ambiguous listed words, labelled profane or harmless;
+- lines labelled sexual or not, including innuendo, sound descriptions, and innocent senses of the same phrases.
 
-A script scores the layer on it, and users can run the same script on their own subtitle files locally. The metrics are:
+Labels for emotion and substitutes will come with voice replacement (M8), which needs them.
+
+`scripts/evaluate_context.py` scores the layer on the set, and users can run it locally on lines of their own. The metrics are:
 
 - **precision of `harmless`**, the costly error;
-- **recall of sexual lines**;
+- **recall of sexual lines**, and false flags;
 - **the share of detections left `unsure`**;
-- **judge questions and time per film.**
+- **judge questions and time.**
 
 The thresholds, the choice of models, and whether any action ever becomes a default all come from this set and from real films.
 
@@ -1207,7 +1208,9 @@ Reading the audio around the intervals by seeking added about 0.1 s per minute o
 
 **Not measured here.** Real soundtracks, accents and subtitles; the prompt setting (open question 1); `fade_ms` on real speech (open question 6); the dialogue check's threshold (§6.11); and GPU timings, with or without alignment. These need a set of real annotated clips and a GPU.
 
-## Appendix D. Context analysis: a first test
+## Appendix D. Context analysis: measurements
+
+### D.1 A first test
 
 **Setup.** Twenty hand-written lines, on the same 4-vCPU container as Appendix C, with PyTorch 2.8 on the CPU and transformers 4.57. The classifier ran in 32-bit floats and the judges in bfloat16. This is not a benchmark. It checks what each kind of model can and cannot do before §17 was designed.
 
@@ -1251,3 +1254,40 @@ The table repeated to 1,500 lines, in batches of 64, took 17.6 s on four threads
 | Sexual lines without explicit words found, of 3 | 2 | 1 |
 | Neutral lines kept, of 2 | 2 | 2 |
 | Time per detection question / line question | 9 s / 3 s | 28 s / 8 s |
+
+### D.2 The M6 layer on 71 labelled lines
+
+**Setup.** `scripts/data/context_lines.jsonl` holds 71 hand-written lines:
+
+- 33 uses of ambiguous listed words, 16 harmless and 17 profane: "hell" (9), "ass" (6), "damned", "bitch", "bastard" and "Jesus Christ" (4 each), and "jackass" (2);
+- 38 lines to check for sexual content, 19 sexual and 19 not, three of each being a sound description alone. The others include innocent senses of the same phrases ("I sleep with the window open", "hook up the printer") and of the trigger words ("I'm going to bed, I'm exhausted").
+
+`scripts/evaluate_context.py` judged each line alone, without neighbours, on the same container as D.1. It used the default classifier, and Qwen3-4B-Instruct-2507 as the judge, in bfloat16 on the CPU. The first two runs scored each line with its ambiguous word in place; the masking of §17.3 came out of them.
+
+| | Rules and classifier | With the judge | Rules and classifier, word masked | With the judge, word masked (M6) |
+|---|---|---|---|---|
+| Harmless uses called harmless, of 16 | 0 | 5 | 0 | 10 |
+| Profane uses called harmless, of 17 | 0 | 0 | 0 | 0 |
+| Uses left unsure, of 33 | 11 | 0 | 30 | 0 |
+| Sexual lines flagged certain / at all, of 19 | 4 / 12 | 7 / 13 | 4 / 12 | 7 / 13 |
+| Other lines flagged certain / at all, of 19 | 0 / 8 | 0 / 8 | 0 / 8 | 0 / 8 |
+| Judge questions | – | 32 | – | 51 |
+
+**What it showed.**
+
+1. **Masking doubled the harmless uses found, and no profane use was called harmless.** With the word in place, the classifier found every line with "damned", "bitch", "bastard" or "jackass" rude, and five of the six lines with "ass" sexual. So 10 of the 16 harmless uses never reached the judge. Masked, the classifier settled only three uses on its own, all of them profane: "You stupid jackass!", "Life's a bitch, and then you die." and "You rotten bastard!". The judge saw the rest.
+2. **The judge erred only toward profane.** It called six harmless uses profane: "the road to hell" (a curse, it said), the farmer's ass, the old jackass, both dogs called bitches, and the old king's bastard son. It got the other ten right, among them every religious and literal sense of "hell", "damned" and "Jesus Christ". An error in this direction only mutes a word that could have stayed.
+3. **Explicit content was found; innuendo mostly was not.**
+   - The seven certain flags came from the classifier ("Let's get naked", 0.60), from unambiguous phrases ("have sex", "made love", "lost her virginity") and from the judge (three lines).
+   - Sound descriptions and ambiguous phrases alone gave six more *possible* flags.
+   - The judge said yes to only 3 of the 10 sexual lines it was asked about. It said no to "I want to take you to bed tonight", "Your place or mine?" and "He's an animal in bed".
+   - Two sexual lines held no trigger word, so the judge was never asked: "She wants to see my etchings, if you know what I mean" and "Stay the night with me".
+4. **No line was wrongly flagged as certain.** The judge said no to all 11 other lines it was asked about. The eight *possible* flags on other lines are the seven innocent uses of ambiguous phrases, and "[panting after running]".
+5. **Speed.** Without the judge, the whole set took 8 s, loading the classifier included. With it, questions took 23 s each in the masked run and 35 s in the unmasked one. A film that needs 50 questions would take 20–30 minutes on this CPU, which is why `context.judge = "auto"` leaves the judge off without a GPU.
+6. **Rewording the sexual question did not help.** The judge was asked about all 32 spoken lines of the sexual part of the set, twice:
+   - once with the question of §17.3;
+   - once with a longer one that defines innuendo ("a sexual proposition, a euphemism for sex, or a double meaning about it") and rules out romance and innocent undressing.
+
+   Both called 7 of the 16 sexual lines sexual: four explicit ones, plus "She slept with her boss to get the promotion", "Take off your clothes and get into bed with me" and "Take it off. All of it.". Neither recognized any of the other nine, from "Did you sleep with him?" to "Your place or mine?". The longer question also flagged "Take off your clothes, they're soaking wet". So the question stays as it is, and innuendo waits for a stronger judge (open question 8). These short questions took about 9 s each.
+
+**Not measured here.** Real dialogue and subtitles, neighbouring lines, emotion, and anything on a GPU. The set is small, and it was written alongside the rules and word lists, so its numbers flatter the layer.

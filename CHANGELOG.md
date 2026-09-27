@@ -4,15 +4,6 @@ All notable changes to video-beep-remover. The format follows [Keep a Changelog]
 
 ## [Unreleased]
 
-### Added
-
-- Context analysis, report-only (`--context`, `[context]` extra, DESIGN.md §17):
-  - local models judge whether each ambiguous listed word is used harmlessly;
-  - lines that look sexual are listed, with their evidence;
-  - the verdicts go into the report and the review subtitles, and never change what is muted.
-- A `sexual` word category of phrases of a sexual nature, off by default.
-- `scripts/evaluate_context.py` and a labelled set of 71 lines, to measure the context layer.
-
 ## [0.1.0]
 
 The first release: the complete v1 of [the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md).
@@ -45,6 +36,14 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 - Folder batches keep the model loaded and render each file while the next one is analysed. Files vbr already censored are skipped.
 - A transcript cache makes re-runs fast, for example after editing the word list.
 - Other commands: `vbr doctor`, `vbr subs`, `vbr cache` and `vbr config init/show/check`.
+
+### Context analysis (preview)
+
+- `--context` (`[context]` extra) reads the dialogue in context with local models. It is report-only: its verdicts go into the report and the review subtitles, and never change what is muted.
+  - Each ambiguous listed word gets a verdict: profane, probably harmless ("the nine circles of hell"), or unsure.
+  - Lines that look sexual are listed with their evidence: explicit wording, phrases, sound descriptions such as `[moaning]`, and innuendo the judge recognizes.
+- A `sexual` word category of phrases of a sexual nature, off by default.
+- `scripts/evaluate_context.py` and a labelled set of 71 lines, to measure the context layer.
 
 [Unreleased]: https://github.com/AshitakaLax/video-beep-remover/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/AshitakaLax/video-beep-remover/releases/tag/v0.1.0

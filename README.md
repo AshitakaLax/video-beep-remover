@@ -111,7 +111,7 @@ $ pipx install --force "video-beep-remover[context]"   # adds PyTorch and transf
 $ vbr scan movie.mkv --context --review-srt
 ```
 
-- **Harmless uses.** Each listed word gets a verdict: `profane`, `harmless` (e.g. "the road to hell", a farmer's ass) or `unsure`. Only words listed in `context.ambiguous` are checked; the rest are profane by definition. A use is called harmless only when a small language model (the *judge*) says so *and* a toxicity classifier finds the line clean. Anything unsure counts as profane.
+- **Harmless uses.** Each listed word gets a verdict: `profane`, `harmless` (e.g. "the nine circles of hell", or a donkey called an ass) or `unsure`. Only words listed in `context.ambiguous` are checked; the rest are profane by definition. A use is called harmless only when a small language model (the *judge*) says so *and* a toxicity classifier finds the line clean. Anything unsure counts as profane.
 - **Sexual lines.** Lines that look sexual are listed, with their evidence:
   - a classifier score for explicit lines;
   - phrases from the `sexual` word category, such as "have sex" and "sleep with";
@@ -120,10 +120,10 @@ $ vbr scan movie.mkv --context --review-srt
 
   Phrases with an innocent sense too ("hook up the printer") only make a line *possibly* sexual on their own.
 - **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
-- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU, where it needs about 8 GB of memory next to Whisper's. On a CPU it takes about 28 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless.
+- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU, where it needs about 8 GB of memory next to Whisper's. On a CPU it takes 20–35 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless.
 - **Privacy.** Everything runs locally, and the models download once.
 
-`scripts/evaluate_context.py` measures it on labelled lines (see [Evaluate](#evaluate)); [Appendix D of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-d-context-analysis-a-first-test) has the first numbers.
+On a labelled set of 71 lines, with the judge, it recognized 10 of 16 harmless uses and called no profane use harmless. It flagged explicit lines, but found little innuendo. [Appendix D of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-d-context-analysis-measurements) has the numbers, and `scripts/evaluate_context.py` measures your own lines (see [Evaluate](#evaluate)).
 
 ## Online subtitles
 

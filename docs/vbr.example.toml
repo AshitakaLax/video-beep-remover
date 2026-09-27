@@ -174,15 +174,15 @@ review_srt = false                  # <output stem>.review.srt: one cue per mute
 # Context analysis (DESIGN.md §17): report-only for now
 # ---------------------------------------------------------------------------
 # Reads the dialogue around each listed word, and the whole script, with local models, and adds its
-# verdicts to the report and the review subtitles: whether a use looks harmless ("the road to hell"),
-# and which lines look sexual. It never changes what is muted. Needs pip install
+# verdicts to the report and the review subtitles: whether a use looks harmless ("the nine circles
+# of hell"), and which lines look sexual. It never changes what is muted. Needs pip install
 # "video-beep-remover[context]"; the models download on first use and run locally.
 [context]
 enabled = false                     # or --context on the command line
 classifier = "unitary/unbiased-toxic-roberta"   # scores every line (about 500 MB)
 judge = "auto"                      # a small language model for the few lines that need judging;
                                     # "auto": Qwen/Qwen3-4B-Instruct-2507 on an NVIDIA GPU, none on a
-                                    # CPU (about 28 s per question there); "" never; or a model name
+                                    # CPU (20-35 s per question there); "" never; or a model name
 ambiguous = [                       # listed terms, as written above, with innocent senses too
   "hell", "damned", "ass", "asses", "jackass*", "bitch*", "bastard*", "piss", "pissed", "jesus christ",
   "sleep with", "sleeping with", "slept with", "sleeps with", "sleep together", "slept together",
