@@ -80,7 +80,7 @@ class Window:
 
     start: float
     end: float
-    reasons: frozenset[str] = frozenset()  # "lexicon", "masked", "hint", "uncovered", "expanded"
+    reasons: frozenset[str] = frozenset()  # "lexicon", "masked", "hint", "uncovered", "expanded", "context"
     cues: tuple[int, ...] = ()
 
     @property

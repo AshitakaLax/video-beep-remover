@@ -10,7 +10,9 @@ content:
     {"text": "Your place or mine?", "sexual": true}
     {"text": "", "sounds": ["moaning"], "sexual": true}
 
-Each line is judged on its own, without neighbouring lines. The script reports:
+A line is a subtitle cue, judged on its own. Optional fields add what a film would: "heard", what the
+audio says where it differs from the subtitle ("text" by default), and "before" and "after", the
+neighbouring cues, which are never heard. The script reports:
 
     harmless precision  of the uses called harmless, the share that are; a profane use called harmless
                         is the costly error, since acting on the verdict would leave it audible
@@ -32,13 +34,20 @@ from typing import Any
 from video_beep_remover.config import load_config
 from video_beep_remover.context import ContextLayer
 from video_beep_remover.context.lines import Line
-from video_beep_remover.models import Detection
+from video_beep_remover.models import Detection, Word
 
 DEFAULT_SET = Path(__file__).parent / "data" / "context_lines.jsonl"
 
 
 def read_set(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+
+
+def spoken(text: str, start: float, end: float) -> list[Word]:
+    """The words of `text` spread evenly over [start, end], as Whisper would report them."""
+    parts = text.split()
+    step = (end - start) / max(len(parts), 1)
+    return [Word(" " + part, start + i * step, start + (i + 1) * step - 0.02) for i, part in enumerate(parts)]
 
 
 def ratio(part: int, whole: int) -> str:
@@ -77,16 +86,22 @@ def main() -> None:
     started = time.monotonic()
     questions = 0
     for row in rows:
-        line = Line(0.0, 2.0, row.get("text", ""), tuple(row.get("sounds", [])), 1)
+        line = Line(3.0, 5.0, row.get("text", ""), tuple(row.get("sounds", [])), 2)
+        lines = [line]
+        if row.get("before"):
+            lines.insert(0, Line(0.0, 2.0, row["before"], (), 1))
+        if row.get("after"):
+            lines.append(Line(6.0, 8.0, row["after"], (), 3))
+        heard = spoken(row.get("heard", line.text), 3.1, 4.9)
         if "use" in row:
             word = row.get("word", row["term"])
-            detection = Detection(0.5, 0.8, f" {word}", row["term"], "listed", 0.9, "asr", 1)
-            result, section = layer.run([detection], [line])
+            detection = Detection(3.5, 3.8, f" {word}", row["term"], "listed", 0.9, "asr", 2)
+            result, section = layer.run([detection], lines, heard)
             verdict = result.verdicts[0]
             results.append(row | {"got": verdict.use, "reason": verdict.reason, "scores": verdict.scores})
         else:
-            result, section = layer.run([], [line])
-            flag = result.sexual[0] if result.sexual else None
+            result, section = layer.run([], lines, heard)
+            flag = next((s for s in result.sexual if s.line is line), None)
             got = "certain" if flag and flag.certain else "possible" if flag else "no"
             results.append(row | {"got": got, "evidence": list(flag.evidence) if flag else []})
         questions += section["judge_questions"]

@@ -132,6 +132,8 @@ _TRIGGERS = [
 
 class ContextConfig(_Model):
     enabled: bool = False
+    harmless: Literal["report", "keep"] = "report"  # "keep": leave uses judged harmless unmuted
+    sexual: Literal["report", "mute"] = "report"  # "mute": mute the lines flagged as sexual
     classifier: str = "unitary/unbiased-toxic-roberta"
     judge: str = "auto"  # "auto": the default judge on a CUDA GPU, none on a CPU; "": none
     ambiguous: list[str] = Field(default_factory=lambda: list(_AMBIGUOUS))
@@ -139,6 +141,50 @@ class ContextConfig(_Model):
     min_sexual_score: float = Field(0.5, ge=0, le=1)
     clean_below: float = Field(0.3, ge=0, le=1)
     profane_above: float = Field(0.5, ge=0, le=1)
+    min_heard: float = Field(0.7, ge=0, le=1)  # share of a subtitle line's words heard, to trust it
+
+
+_SUBSTITUTES = {
+    "*fuck*": ["freaking", "frick", "fricking", "fudge"],
+    "*shit*": ["shoot", "shucks", "baloney", "crummy"],
+    "bitch*": ["witch"],
+    "son of a bitch": ["son of a gun"],
+    "sonofabitch": ["son of a gun"],
+    "*asshole*": ["jerk"],
+    "bastard*": ["rascal"],
+    "dickhead*": ["dummy"],
+    "damn": ["darn"],
+    "damned": ["darned"],
+    "dammit": ["darn it"],
+    "damnit": ["darn it"],
+    "damn it": ["darn it"],
+    "hell": ["heck"],
+    "crap": ["crud"],
+    "crappy": ["crummy"],
+    "ass": ["butt"],
+    "asses": ["butts"],
+    "dumbass*": ["dummy"],
+    "jackass*": ["jerk"],
+    "smartass*": ["smarty-pants"],
+    "pissed": ["ticked"],
+    "goddamn*": ["gosh darn"],
+    "god damn*": ["gosh darn"],
+    "god dammit": ["gosh darn it"],
+    "jesus christ": ["jeez"],
+    "oh my [god]": ["gosh"],
+    "for christ's sake": ["for crying out loud"],
+}
+
+
+class ReplaceConfig(_Model):
+    enabled: bool = False
+    model: str = "F5TTS_v1_Base"  # the voice editing model (F5-TTS)
+    separation: str = "htdemucs"  # the model that splits the dialogue from music and effects
+    steps: int = Field(32, ge=4, le=64)  # the voice model's sampling steps
+    voice_margin: float = Field(0.15, ge=0, le=2)  # how much less like the speaker a new word may sound
+    substitutes: dict[str, list[str]] = Field(
+        default_factory=lambda: {k: list(v) for k, v in _SUBSTITUTES.items()}
+    )
 
 
 class CacheConfig(_Model):
@@ -162,5 +208,6 @@ class Config(_Model):
     subtitles: SubtitlesConfig = Field(default_factory=SubtitlesConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    replace: ReplaceConfig = Field(default_factory=ReplaceConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)

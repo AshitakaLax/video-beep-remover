@@ -121,6 +121,27 @@ def test_context_flag_turns_the_layer_on() -> None:
 
     assert _overrides(context=True) == {"context.enabled": True}
     assert _overrides(context=False) == {}
+    assert _overrides(replace=True) == {"replace.enabled": True}
+
+
+def test_doctor_shows_voice_replacement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    from video_beep_remover.cli import _voice_status
+
+    installed = {"torch": False, "torchaudio": False, "f5_tts": False, "demucs": False, "speechbrain": False}
+    real = importlib.util.find_spec
+
+    def find_spec(name: str, *rest: Any) -> Any:
+        return (object() if installed[name] else None) if name in installed else real(name, *rest)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    assert _voice_status(_config(tmp_path))[1] is None  # off, and not installed: nothing wrong
+    ok, details = _voice_status(_config(tmp_path, **{"replace.enabled": True}))[1:]
+    assert ok is False and "video-beep-remover[voice]" in details
+    installed.update(dict.fromkeys(installed, True))
+    ok, details = _voice_status(_config(tmp_path, **{"replace.enabled": True}))[1:]
+    assert ok is True and "F5TTS_v1_Base" in details and "non-commercial" in details
 
 
 def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,7 +168,12 @@ def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.Monke
 
     installed.update(torch=True, transformers=True)
     ok, details = _context_status(_config(tmp_path, **on))[1:]
-    assert ok is True and "no judge (no GPU)" in details
+    assert ok is True and "no judge (no GPU); report only" in details
+    acting = {**on, "context.harmless": "keep", "context.sexual": "mute"}
+    assert (
+        "keeps harmless uses and mutes sexual lines (experimental)"
+        in _context_status(_config(tmp_path, **acting))[2]
+    )
     assert "not downloaded yet: unitary/unbiased-toxic-roberta" in details
     judged = {**on, "context.judge": "Qwen/Qwen3-4B-Instruct-2507", "offline": True}
     ok, details = _context_status(_config(tmp_path, **judged))[1:]

@@ -15,6 +15,7 @@ from video_beep_remover.models import Word
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 SR = 48_000
 TONE_AMPLITUDE = 0.125  # the lavfi sine source's peak level
+MUSIC_HZ = 300  # the tone in a surround track's other channels
 
 
 def run_ffmpeg(*args: str) -> None:
@@ -29,6 +30,7 @@ class Track:
     default: bool = False
     delay: float = 0.0
     noise_seed: int | None = None  # white noise instead of the tone: unlike a tone, it matches only itself
+    surround: bool = False  # 5.1(side): the tone in the front centre, MUSIC_HZ in the other main channels
 
 
 def make_clip(
@@ -54,11 +56,15 @@ def make_clip(
     for track in tracks:
         if track.delay:
             args += ["-itsoffset", str(track.delay)]
-        source = (
-            f"anoisesrc=seed={track.noise_seed}:amplitude=0.2:sample_rate={sample_rate}:duration={duration}"
-            if track.noise_seed is not None
-            else f"sine=frequency={track.frequency}:sample_rate={sample_rate}:duration={duration}"
-        )
+        timing = f"sample_rate={sample_rate}:duration={duration}"
+        if track.noise_seed is not None:
+            source = f"anoisesrc=seed={track.noise_seed}:amplitude=0.2:{timing}"
+        elif track.surround:
+            tone, music = (f"{TONE_AMPLITUDE}*sin(2*PI*{hz}*t)" for hz in (track.frequency, MUSIC_HZ))
+            exprs = "|".join((music, music, tone, "0", music, music))  # FL FR FC LFE SL SR
+            source = f"aevalsrc=exprs={exprs}:channel_layout=5.1(side):{timing}"
+        else:
+            source = f"sine=frequency={track.frequency}:{timing}"
         args += ["-f", "lavfi", "-i", source]
         maps += ["-map", f"{index}:a"]
         index += 1
@@ -90,11 +96,13 @@ def extract_subtitles(path: Path, stream: str = "0:s:0") -> str:
     return result.stdout.decode("utf-8")
 
 
-def decode(path: Path, stream: str = "0:a:0") -> np.ndarray:
-    """Mono float32 at 48 kHz; sample 0 is the start of the file."""
+def decode(path: Path, stream: str = "0:a:0", channel: str | None = None) -> np.ndarray:
+    """Mono float32 at 48 kHz; sample 0 is the start of the file. `channel` (e.g. "FC") takes that
+    channel alone instead of a downmix."""
+    pick = f",pan=mono|c0={channel}" if channel else ""
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", stream,
-         "-af", "aresample=async=1:first_pts=0", "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1"],
+         "-af", f"aresample=async=1:first_pts=0{pick}", "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1"],
         capture_output=True, check=True,
     )  # fmt: skip
     return np.frombuffer(result.stdout, dtype=np.float32)

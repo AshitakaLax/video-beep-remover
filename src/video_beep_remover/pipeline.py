@@ -3,7 +3,7 @@
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,14 +25,19 @@ from video_beep_remover.asr.vad import Regions, SpeechDetector, silero_speech
 from video_beep_remover.config.loader import LoadedConfig, cache_root, config_hash
 from video_beep_remover.context import (
     ContextLayer,
+    Line,
     ModelFactory,
     build_lines,
     check_installed,
+    kept_cues,
     review_cues,
+    review_labels,
     review_notes,
     verdict_dict,
     word_lines,
 )
+from video_beep_remover.context.analyse import ContextResult
+from video_beep_remover.context.lines import COVER_MARGIN_S
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.detect.matcher import detect_in_words
@@ -45,12 +50,20 @@ from video_beep_remover.media.audio import (
     AudioSource,
     SeekingAudioSource,
     decode_track,
+    read_pcm_windows,
     read_window,
 )
 from video_beep_remover.media.dialogue import same_dialogue
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import MediaInfo, StreamInfo, probe, select_audio_stream
-from video_beep_remover.media.render import CENSORED_TAG, RenderResult, StreamPlan, plan_streams, render
+from video_beep_remover.media.render import (
+    CENSORED_TAG,
+    RenderResult,
+    Splice,
+    StreamPlan,
+    plan_streams,
+    render,
+)
 from video_beep_remover.models import CensorInterval, Detection, Word
 from video_beep_remover.report import (
     SCHEMA_VERSION,
@@ -71,6 +84,8 @@ from video_beep_remover.subtitles.oshash import fingerprint, opensubtitles_hash
 from video_beep_remover.subtitles.output import censor_streams, write_censored_copy
 from video_beep_remover.subtitles.parse import parse_sounds
 from video_beep_remover.ui import UI, NullUI, Progress
+from video_beep_remover.voice import Candidate, Replacement, Replacer, VoiceModels
+from video_beep_remover.voice import check_installed as check_voice_installed
 
 __all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOptions", "resolve_output"]
 
@@ -102,6 +117,7 @@ class FileResult:
     subtitle_copy: Path | None = None  # the censored copy of the subtitle file the analysis used
     detections: int = 0
     intervals: int = 0
+    replaced: int = 0  # of the detections, said again as a milder word (DESIGN.md §16)
     strategy: str = ""  # the strategy that ran ("report" for vbr render)
     notes: list[str] = field(default_factory=list)
 
@@ -141,6 +157,7 @@ class Job:
     report: dict[str, Any] | None = None  # None: no report is written (vbr render)
     context: dict[str, Any] | None = None  # the report's "context" section (DESIGN.md §17)
     verdicts: list[dict[str, Any] | None] = field(default_factory=list)  # one per detection
+    replacements: list[Replacement] = field(default_factory=list)  # voice replacement (DESIGN.md §16)
     render: bool = False
     rendered: RenderResult | None = None
     timings: dict[str, float] = field(default_factory=dict)
@@ -231,6 +248,7 @@ class Pipeline:
         speech_detector: SpeechDetector | None = None,
         opensubtitles: OpenSubtitlesClient | None = None,
         context_models: tuple[ModelFactory, ModelFactory] | None = None,
+        voice_models: tuple[Callable[[], Any], Callable[[], Any], Callable[[], Any]] | None = None,
     ) -> None:
         self.config = loaded.config
         self.ui: UI = ui or NullUI()
@@ -251,6 +269,9 @@ class Pipeline:
         self._scope: _CacheScope | None = None  # the file being analysed, for the transcript cache
         self._context_models = context_models  # (classifier, judge) factories, for tests
         self._context: ContextLayer | None = None
+        self._voice_models = voice_models  # (separator, editor, speaker encoder) factories, for tests
+        self._replacer: Replacer | None = None
+        self._check_role = "full"  # the transcriber that checks replaced words: the analysis's
 
     def opensubtitles(self) -> OpenSubtitlesClient | None:
         """The OpenSubtitles client, when there is a key and the network may be used. One client
@@ -486,8 +507,10 @@ class Pipeline:
         started = time.monotonic()
         if options.subtitles is not None and not options.subtitles.is_file():
             raise UsageError(f"subtitle file not found: {options.subtitles}")
-        if cfg.context.enabled and self._context_models is None:
+        if (cfg.context.enabled or cfg.replace.enabled) and self._context_models is None:
             check_installed()  # the layer runs last: fail before the transcription, not after it
+        if cfg.replace.enabled and self._voice_models is None:
+            check_voice_installed()
         output = None
         if not options.dry_run:
             checked = self._check_output(source, options, many)
@@ -536,8 +559,18 @@ class Pipeline:
         try:
             analysis = self._analyse(source, info, stream, job.workdir, track, job.lap, job.options.subtitles)
             detections = analysis.detections
+            to_mute = detections
+            context: ContextResult | None = None
+            if cfg.context.enabled or cfg.replace.enabled:
+
+                def audio_source() -> AudioSource:
+                    if track.audio is not None:
+                        return ArrayAudioSource(track.audio)
+                    return SeekingAudioSource(self.ff, source, stream.index)
+
+                to_mute, context = self._run_context(job, analysis, detections, audio_source)
             intervals = build_intervals(
-                detections,
+                to_mute,
                 duration=info.duration,
                 pad_before=cfg.censor.pad_before_ms / 1000,
                 pad_after=cfg.censor.pad_after_ms / 1000,
@@ -554,6 +587,8 @@ class Pipeline:
                     intervals, audio, duration=info.duration, merge_gap=cfg.censor.merge_gap_ms / 1000
                 )
                 job.lap("refine")
+            if cfg.replace.enabled and context is not None:
+                self._replace_words(job, analysis, detections, to_mute, intervals, context)
         finally:
             self._scope = None
             track.release()
@@ -562,6 +597,7 @@ class Pipeline:
             if found is not None:
                 self.transcript_cache.evict(int(cfg.cache.max_size_gb * 1024**3))
         result.detections, result.intervals = len(detections), len(intervals)
+        result.replaced = sum(r.replaced for r in job.replacements)
         result.strategy = analysis.strategy
         heard = sum(d.source == "asr" for d in detections)
         estimated = len(detections) - heard
@@ -569,9 +605,8 @@ class Pipeline:
             f"{len(detections)} listed words found"
             + (f" ({heard} heard, {estimated} from subtitles only)" if estimated else "")
             + f" → {len(intervals)} spans to mute"
+            + (f", {result.replaced} of them replaced" if result.replaced else "")
         )
-        if cfg.context.enabled:
-            self._run_context(job, analysis, detections)
 
         model = analysis.model
         job.report = {
@@ -612,6 +647,7 @@ class Pipeline:
             ],
             "intervals": [interval_dict(i) for i in intervals],
             **({"context": job.context} if job.context is not None else {}),
+            **({"replacements": [r.as_dict() for r in job.replacements]} if cfg.replace.enabled else {}),
             "output": None,
             "timings": job.timings,
         }
@@ -664,6 +700,13 @@ class Pipeline:
                 subtitle_files=subtitles.files,
                 tag=self.tag,
                 on_progress=update,
+                splices={
+                    job.stream.index: [
+                        Splice(CensorInterval(r.start, r.end), r.delta, r.delta_start)
+                        for r in job.replacements
+                        if r.replaced and r.delta is not None
+                    ]
+                },
             )
         job.lap("render")
         job.rendered = rendered
@@ -757,8 +800,23 @@ class Pipeline:
                 spans = rendered.intervals if rendered else job.intervals
                 shift = rendered.timeline_shift if rendered else 0.0
                 notes = review_notes(job.verdicts)
-                extra = review_cues(job.context)
-                write_text(review, review_srt(spans, job.detections, shift=shift, notes=notes, extra=extra))
+                extra = review_cues(job.context, spans) + kept_cues(job.detections, job.verdicts, spans)
+                labels = review_labels(job.context)
+                replaced = [
+                    (r.start, r.end, f"{r.word} → {r.substitute}") for r in job.replacements if r.replaced
+                ]
+                write_text(
+                    review,
+                    review_srt(
+                        spans,
+                        job.detections,
+                        shift=shift,
+                        notes=notes,
+                        extra=extra,
+                        labels=labels,
+                        replaced=replaced,
+                    ),
+                )
                 result.review = review
 
     def discard(self, job: Job) -> None:
@@ -783,10 +841,26 @@ class Pipeline:
                 classifier_factory=classifier,
                 judge_factory=judge,
             )
+            settings = self.config.context
+            if settings.harmless == "keep" or settings.sexual == "mute":
+                self.ui.warn(
+                    "acting on context verdicts is experimental: it is measured on a small labelled set "
+                    "only (DESIGN.md §17.7); check the review subtitles (--review-srt)"
+                )
+            if settings.harmless == "keep" and self._context.judge_name is None:
+                self.ui.warn('context.harmless = "keep" keeps nothing without a judge (context.judge)')
         return self._context
 
-    def _run_context(self, job: Job, analysis: Analysis, detections: list[Detection]) -> None:
-        """Context verdicts for the report and the review subtitles; what is muted does not change."""
+    def _run_context(
+        self,
+        job: Job,
+        analysis: Analysis,
+        detections: list[Detection],
+        audio: Callable[[], AudioSource],
+    ) -> tuple[list[Detection], ContextResult]:
+        """Context verdicts for the report and the review subtitles (DESIGN.md §17). Returns what to mute
+        (the detections, less the uses kept as harmless with context.harmless = "keep", plus a span for
+        each line flagged as sexual with context.sexual = "mute"), and the verdicts."""
         chosen = analysis.subtitles
         if chosen is not None:
             try:
@@ -798,22 +872,190 @@ class Pipeline:
             lines = word_lines(analysis.heard)
         layer = self.context_layer()
         with self.ui.status("Reading the dialogue in context"):
-            result, section = layer.run(detections, lines)
+            result, section = layer.run(detections, lines, analysis.heard)
         job.context = section
         job.verdicts = [verdict_dict(v, result.lines) for v in result.verdicts]
+        settings = self.config.context
+        keep = settings.harmless == "keep"
+        to_mute = [
+            d for d, v in zip(detections, result.verdicts, strict=True) if not (keep and v.use == "harmless")
+        ]
+        actions = []
+        if keep:
+            section["kept"] = len(detections) - len(to_mute)
+            actions.append(f"{section['kept']} kept as harmless")
+        if settings.sexual == "mute":
+            flagged = [(i, s) for i, s in enumerate(result.sexual) if s.certain and s.line.text]
+            spans = self._line_spans([found.line for _, found in flagged], analysis, audio, job.info.duration)
+            for (i, found), (start, end, heard) in zip(flagged, spans, strict=True):
+                section["sexual_lines"][i]["muted"] = {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "from": "heard" if heard else "cue",
+                }
+                to_mute.append(
+                    Detection(
+                        start,
+                        end,
+                        found.line.text,
+                        "sexual line",
+                        "context",
+                        1.0,
+                        "asr" if heard else "cue",
+                        found.line.cue,
+                    )
+                )
+            actions.append(f"{len(flagged)} sexual lines muted")
         counts = section["verdicts"]
         certain = sum(item["certain"] for item in section["sexual_lines"])
         self.ui.info(
-            f"Context (report only): {counts['profane']} profane, {counts['harmless']} probably harmless, "
-            f"{counts['unsure']} unsure · {certain} sexual lines"
+            f"Context{'' if actions else ' (report only)'}: {counts['profane']} profane, "
+            f"{counts['harmless']} probably harmless, {counts['unsure']} unsure · {certain} sexual lines"
             + (
                 f" (+{len(section['sexual_lines']) - certain} possible)"
                 if len(section["sexual_lines"]) > certain
                 else ""
             )
+            + "".join(f" · {action}" for action in actions)
             + ("" if layer.judge_name else " · no judge: " + section.get("judge_off", "off"))
         )
         job.lap("context")
+        return to_mute, result
+
+    def _line_spans(
+        self,
+        lines: Sequence[Line],
+        analysis: Analysis,
+        audio: Callable[[], AudioSource],
+        duration: float,
+    ) -> list[tuple[float, float, bool]]:
+        """Where each line is spoken, from its first heard word to its last, and whether words were heard
+        there at all; a line nothing was heard in keeps its own span. A subtitle line is transcribed
+        again in a window of its own (DESIGN.md §17.5), so that all of it is heard: the analysis
+        only transcribed around listed words (the transcript cache serves what it already heard)."""
+        chosen = analysis.subtitles
+        cued = [i for i, line in enumerate(lines) if line.cue is not None]
+        heard: Sequence[Word] = analysis.heard
+        if cued and chosen is not None:
+            heard = guided_analysis.transcribe_spans(
+                self.guided_context(),
+                analysis.strategy,
+                audio(),
+                [(lines[i].start, lines[i].end) for i in cued],
+                chosen.sync.model,
+                duration,
+            )
+            heard = guided_analysis.merge_words(analysis.heard, heard)
+        spans = []
+        for line in lines:
+            words = [
+                w
+                for w in heard
+                if line.start - COVER_MARGIN_S <= (w.start + w.end) / 2 <= line.end + COVER_MARGIN_S
+            ]
+            if words:
+                spans.append((min(w.start for w in words), max(w.end for w in words), True))
+            else:
+                spans.append((line.start, line.end, False))
+        return spans
+
+    def replacer(self, role: str) -> Replacer:
+        """Voice replacement (DESIGN.md §16), created once: its models serve every file of a batch. The
+        check hears the new words with the transcriber of the analysis (`role`)."""
+        if self._replacer is None:
+            cfg = self.config
+            separator, editor, encoder = self._voice_models or (None, None, None)
+            models = VoiceModels(
+                cfg.replace,
+                device=_context_device(cfg.transcription.device),
+                offline=cfg.offline,
+                cache_dir=cache_root(cfg) / "voice",
+                separator=separator,
+                editor=editor,
+                encoder=encoder,
+            )
+            self._replacer = Replacer(cfg.replace, self.lexicon, self.ff, models, self._check_transcriber)
+            self.ui.warn(
+                "voice replacement is experimental (DESIGN.md §16): check the review subtitles "
+                "(--review-srt); its voice model's weights are licensed for non-commercial use only"
+            )
+        self._check_role = role
+        return self._replacer
+
+    def _check_transcriber(self, audio: Audio, start: float) -> list[Word]:
+        _, transcriber = self.transcriber(self._check_role)
+        [words] = transcriber.transcribe(
+            [Clip(start, audio)], language=self.config.analysis.language, prompt=self.prompt, vad=False
+        )
+        return list(words)
+
+    def _replace_words(
+        self,
+        job: Job,
+        analysis: Analysis,
+        detections: list[Detection],
+        to_mute: list[Detection],
+        intervals: list[CensorInterval],
+        context: ContextResult,
+    ) -> None:
+        """Say a milder word in place of each listed word the context layer lets through (DESIGN.md §16,
+        §17.6). A word's span is replaced only if no other muted word shares it; any failure mutes it."""
+        choices = self.context_layer().substitutes(detections, context, self.config.replace.substitutes)
+        candidates = []
+        for index, (detection, choice) in enumerate(zip(detections, choices, strict=True)):
+            verdict = job.verdicts[index] if index < len(job.verdicts) else None
+            if verdict is not None:
+                verdict["substitute"] = choice.substitute
+                verdict["substitute_reason"] = choice.reason
+            if choice.substitute is None or detection not in to_mute:
+                continue
+            middle = (detection.start + detection.end) / 2
+            span = next((i for i in intervals if i.start <= middle <= i.end), None)
+            if span is None:
+                continue
+            crowded = any(d != detection and d.start < span.end and span.start < d.end for d in to_mute)
+            candidates.append((index, detection, choice.substitute, span, crowded))
+        replacer = self.replacer(analysis.strategy)
+        planned: list[Candidate | Replacement] = []
+        for index, detection, substitute, span, crowded in candidates:
+            if crowded:
+                planned.append(
+                    Replacement(
+                        index, span.start, span.end, detection.heard.strip(), substitute, False,
+                        "another muted word shares its span",
+                    )
+                )  # fmt: skip
+            else:
+                planned.append(
+                    replacer.plan(
+                        index=index,
+                        detection=detection,
+                        span=(span.start, span.end),
+                        substitute=substitute,
+                        heard=analysis.heard,
+                        duration=job.info.duration,
+                    )
+                )
+        todo = [c for c in planned if isinstance(c, Candidate)]
+        windows = iter(
+            read_pcm_windows(self.ff, job.source, job.stream, [c.window for c in todo]) if todo else []
+        )
+        done: list[Replacement] = []
+        with self.ui.progress("Replacing words", len(planned)) as update:
+            for count, item in enumerate(planned, 1):
+                if isinstance(item, Candidate):
+                    item = replacer.replace(item, next(windows), job.stream, job.workdir)
+                done.append(item)
+                update(count)
+        job.replacements = done
+        if candidates:
+            replaced = sum(r.replaced for r in done)
+            reasons = sorted({r.reason for r in done if not r.replaced})
+            self.ui.info(
+                f"Voice replacement: {replaced} of {len(done)} words said again"
+                + (f"; the rest stay muted ({'; '.join(reasons)})" if reasons else "")
+            )
+        job.lap("replace")
 
     def render_report(
         self, source: Path, report: Path, options: RunOptions, *, force: bool = False
@@ -844,6 +1086,11 @@ class Pipeline:
         stream = select_audio_stream(info, cfg.analysis.language, requested)
         items = report_detection_items(data)
         detections = [detection for detection, _ in items]
+        said_again = [r for r in data.get("replacements") or [] if isinstance(r, dict) and r.get("replaced")]
+        if said_again:
+            self.ui.warn(
+                f"{len(said_again)} replaced words are muted instead: only vbr clean can replace words"
+            )
         subtitle = data.get("subtitle")
         context = data.get("context")
         job = Job(

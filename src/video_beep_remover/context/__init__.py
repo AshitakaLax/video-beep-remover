@@ -1,7 +1,8 @@
-"""Context analysis (DESIGN.md §17). Report-only in M6: verdicts on the detections, and the lines
-that look sexual, go into the report and the review subtitles; what is muted does not change."""
+"""Context analysis (DESIGN.md §17): verdicts on the detections, and the lines that look sexual, for
+the report and the review subtitles. Acting on them is opt-in (M7): context.harmless = "keep" leaves
+uses judged harmless unmuted, and context.sexual = "mute" mutes the lines flagged as sexual."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +10,13 @@ from video_beep_remover.config.schema import Config
 from video_beep_remover.context import rules
 from video_beep_remover.context.analyse import (
     QUESTIONS_VERSION,
+    Choice,
     ContextResult,
     Settings,
     SexualLine,
     Verdict,
     analyse_context,
+    choose_substitutes,
 )
 from video_beep_remover.context.lines import Line, build_lines, word_lines
 from video_beep_remover.context.models import (
@@ -25,9 +28,10 @@ from video_beep_remover.context.models import (
     ToxicityClassifier,
     check_installed,
 )
-from video_beep_remover.models import Detection
+from video_beep_remover.models import CensorInterval, Detection, Word
 
 __all__ = [
+    "Choice",
     "ContextLayer",
     "ContextResult",
     "Line",
@@ -35,7 +39,9 @@ __all__ = [
     "build_lines",
     "check_installed",
     "judge_model",
+    "kept_cues",
     "review_cues",
+    "review_labels",
     "review_notes",
     "verdict_dict",
     "word_lines",
@@ -71,11 +77,14 @@ class ContextLayer:
             min_sexual_score=settings.min_sexual_score,
             clean_below=settings.clean_below,
             profane_above=settings.profane_above,
+            min_heard=settings.min_heard,
         )
         sexual = config.lexicon.categories.get("sexual")
         self.phrases = rules.Phrases(sexual.terms if sexual else [], "sexual")
         self.triggers = rules.Phrases(settings.triggers, "trigger")
         self.device = device
+        self.harmless = settings.harmless
+        self.sexual = settings.sexual
         self.classifier_name = settings.classifier
         self.judge_setting = settings.judge
         self.judge_name = judge_model(settings.judge, device)
@@ -104,9 +113,10 @@ class ContextLayer:
         return self._judge
 
     def run(
-        self, detections: Sequence[Detection], lines: Sequence[Line]
+        self, detections: Sequence[Detection], lines: Sequence[Line], heard: Sequence[Word] | None = None
     ) -> tuple[ContextResult, dict[str, Any]]:
-        """Verdicts and sexual lines, and the report's `context` section."""
+        """Verdicts and sexual lines, and the report's `context` section. `heard`: the words heard in
+        the audio, against which subtitle lines are checked (None: trust every line)."""
         judge = self.judge()
         asked, seconds = (judge.asked, judge.seconds) if judge else (0, 0.0)
         result = analyse_context(
@@ -117,11 +127,14 @@ class ContextLayer:
             phrases=self.phrases,
             triggers=self.triggers,
             settings=self.settings,
+            heard=heard,
         )
         uses = [v.use for v in result.verdicts]
         section = {
             "classifier": self.classifier_name,
             "judge": self.judge_name,
+            "harmless": self.harmless,
+            "sexual": self.sexual,
             "lines": len(lines),
             "verdicts": {use: uses.count(use) for use in ("profane", "harmless", "unsure")},
             "judge_questions": (judge.asked - asked) if judge else 0,
@@ -135,6 +148,12 @@ class ContextLayer:
                 else 'no GPU: context.judge = "auto" runs the judge only on an NVIDIA GPU'
             )
         return result, section
+
+    def substitutes(
+        self, detections: Sequence[Detection], result: ContextResult, table: Mapping[str, Sequence[str]]
+    ) -> list[Choice]:
+        """The substitute to say in place of each detection, if any (DESIGN.md §17.6)."""
+        return choose_substitutes(detections, result, table, self.judge())
 
 
 def verdict_dict(verdict: Verdict, lines: Sequence[Line]) -> dict[str, Any]:
@@ -182,14 +201,59 @@ def review_notes(verdicts: Sequence[dict[str, Any] | None]) -> list[str | None]:
     return notes
 
 
-def review_cues(section: dict[str, Any] | None) -> list[tuple[float, float, str]]:
-    """A review cue for each line the report flags as sexual."""
+def _evidence(item: dict[str, Any]) -> str:
+    return "; ".join(str(e) for e in item.get("evidence") or [])
+
+
+def _span(item: Any) -> tuple[float, float] | None:
+    try:
+        return float(item["start"]), float(item["end"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def _covered(span: tuple[float, float] | None, intervals: Sequence[CensorInterval]) -> bool:
+    return span is not None and any(i.start < span[1] and span[0] < i.end for i in intervals)
+
+
+def review_cues(
+    section: dict[str, Any] | None, intervals: Sequence[CensorInterval] = ()
+) -> list[tuple[float, float, str]]:
+    """A review cue for each line the report flags as sexual, unless it was muted (and still is: a
+    span can be deleted from the report by hand)."""
     cues = []
     for item in (section or {}).get("sexual_lines") or []:
-        try:
-            start, end = float(item["start"]), float(item["end"])
-        except (TypeError, KeyError, ValueError):
+        span = _span(item)
+        if span is None or _covered(_span(item.get("muted")), intervals):
             continue
         label = "[sexual line]" if item.get("certain") else "[possibly sexual]"
-        cues.append((start, end, f"{label} {'; '.join(str(e) for e in item.get('evidence') or [])}".strip()))
+        cues.append((*span, f"{label} {_evidence(item)}".strip()))
+    return cues
+
+
+def review_labels(section: dict[str, Any] | None) -> list[tuple[float, float, str]]:
+    """Labels for the spans muted because a line was flagged as sexual (context.sexual = "mute")."""
+    labels = []
+    for item in (section or {}).get("sexual_lines") or []:
+        span = _span(item.get("muted"))
+        if span is not None:
+            labels.append((*span, f"sexual line ({_evidence(item)})"))
+    return labels
+
+
+def kept_cues(
+    detections: Sequence[Detection],
+    verdicts: Sequence[dict[str, Any] | None],
+    intervals: Sequence[CensorInterval],
+) -> list[tuple[float, float, str]]:
+    """A review cue for each use judged harmless that no muted span covers: context.harmless = "keep"
+    left it audible."""
+    cues = []
+    for detection, verdict in zip(detections, verdicts, strict=False):
+        if (verdict or {}).get("use") != "harmless":
+            continue
+        if any(i.start < detection.end and detection.start < i.end for i in intervals):
+            continue
+        text = f"[kept] {detection.heard.strip()} (probably harmless: {(verdict or {}).get('reason')})"
+        cues.append((detection.start, detection.end, text))
     return cues

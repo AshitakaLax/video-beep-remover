@@ -7,19 +7,21 @@ a sexual line is never harmless; anything else undecided is "unsure", which mute
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any, Literal
 
 from video_beep_remover.context import rules
-from video_beep_remover.context.lines import Line, line_for, neighbours
+from video_beep_remover.context.lines import Line, heard_share, line_for, neighbours
 from video_beep_remover.context.models import LABELS, Classifier, Judge
-from video_beep_remover.models import Detection
+from video_beep_remover.models import Detection, Word
 
 QUESTIONS_VERSION = 1  # bump when a question changes, so cached answers are not reused
 Use = Literal["profane", "harmless", "unsure"]
 _RUDE = ("toxicity", "obscene", "insult")
 _REASONS = ("curse", "insult", "exclamation", "sexual", "literal", "religious", "place", "name", "other")
+_HARMLESS_REASONS = ("literal", "religious", "place", "name", "other")
 _EMOTIONS = ("anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise")
 _JSON = re.compile(r"\{.*?\}", re.DOTALL)
 
@@ -30,6 +32,7 @@ class Settings:
     min_sexual_score: float  # classifier score from which a line counts as sexual
     clean_below: float  # a line is clean when every rude score is below this
     profane_above: float  # and clearly profane when one reaches this
+    min_heard: float = 0.7  # the share of a subtitle line's words that must be heard to trust it
 
 
 @dataclass(frozen=True)
@@ -70,8 +73,8 @@ def _quote(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
 
 
-def _dialogue(lines: Sequence[Line], index: int) -> str:
-    before, after = neighbours(lines, index)
+def _dialogue(lines: Sequence[Line], index: int, shown: Callable[[int], bool] = lambda i: True) -> str:
+    before, after = neighbours(lines, index, shown)
     parts = [f"   {_quote(before)}"] if before else []
     parts.append(f">> {_quote(lines[index].text)}")
     if after:
@@ -79,9 +82,11 @@ def _dialogue(lines: Sequence[Line], index: int) -> str:
     return "\n".join(parts)
 
 
-def sense_question(lines: Sequence[Line], index: int, word: str) -> str:
+def sense_question(
+    lines: Sequence[Line], index: int, word: str, shown: Callable[[int], bool] = lambda i: True
+) -> str:
     return (
-        f"Dialogue:\n{_dialogue(lines, index)}\n\n"
+        f"Dialogue:\n{_dialogue(lines, index, shown)}\n\n"
         f"How is the word {_quote(word)} used in the line marked >>? Reply with "
         '{"use": ..., "reason": ..., "emotion": ...} where:\n'
         '- "use" is "profane" for a swear word, an insult, a curse, a sexual reference or an '
@@ -97,6 +102,16 @@ def sexual_question(lines: Sequence[Line], index: int) -> str:
         f"Dialogue:\n{_dialogue(lines, index)}\n\n"
         "Is the line marked >> sexual in nature, including innuendo? Reply with "
         '{"sexual": true} or {"sexual": false}.'
+    )
+
+
+def substitute_question(lines: Sequence[Line], index: int, word: str, candidates: Sequence[str]) -> str:
+    options = ", ".join(_quote(c) for c in candidates)
+    return (
+        f"Dialogue:\n{_dialogue(lines, index)}\n\n"
+        f"The word {_quote(word)} in the line marked >> is to be replaced by a milder one, said in the "
+        f"same voice. Which of these keeps the line natural and its meaning: {options}? Reply with "
+        '{"substitute": ...} naming one of them, or {"substitute": null} if none fits.'
     )
 
 
@@ -118,6 +133,8 @@ def parse_answer(text: str) -> dict[str, Any]:
             answer["emotion"] = data["emotion"]
         if isinstance(data.get("sexual"), bool):
             answer["sexual"] = data["sexual"]
+        if "substitute" in data and (data["substitute"] is None or isinstance(data["substitute"], str)):
+            answer["substitute"] = data["substitute"]  # checked against the offered substitutes by the caller
         return answer
     return {}
 
@@ -203,6 +220,7 @@ def _verdict(
     sexual: set[int],
     judge: Judge | None,
     settings: Settings,
+    trusted: Callable[[int], bool],
 ) -> Verdict:
     index = line_for(detection, lines)
     line = lines[index] if index is not None else Line(detection.start, detection.end, detection.heard)
@@ -228,11 +246,16 @@ def _verdict(
         return verdict("profane", "classifier")
     if judge is None:
         return verdict("unsure", "not judged")  # the classifier alone never calls a use harmless
-    answer = parse_answer(judge.ask(sense_question(lines, index, word)))
+    if not trusted(index):
+        # Text that was never said, such as a note written for the judge, must not decide (§17.9).
+        return verdict("unsure", "the subtitles differ from what is heard")
+    answer = parse_answer(judge.ask(sense_question(lines, index, word, trusted)))
     emotion = answer.get("emotion")
     if answer.get("use") == "harmless":
+        if answer.get("reason") not in _HARMLESS_REASONS:
+            return verdict("unsure", "the judge contradicted itself", emotion, True)
         if rude < settings.clean_below:
-            return verdict("harmless", answer.get("reason", "judge"), emotion, True)
+            return verdict("harmless", answer["reason"], emotion, True)
         return verdict("unsure", "the judge and the classifier disagree", emotion, True)
     if answer.get("use") == "profane":
         return verdict("profane", answer.get("reason", "judge"), emotion, True)
@@ -248,10 +271,67 @@ def analyse_context(
     phrases: rules.Phrases,
     triggers: rules.Phrases,
     settings: Settings,
+    heard: Sequence[Word] | None = None,
 ) -> ContextResult:
-    """Verdicts for the detections, and the lines that look sexual."""
+    """Verdicts for the detections, and the lines that look sexual. `heard` are the words heard in
+    the audio: a subtitle line is trusted to show a use as harmless, or to be shown to the judge
+    next to one, only if most of its words were heard (None: trust every line)."""
+
+    @cache
+    def trusted(index: int) -> bool:
+        line = lines[index]
+        return heard is None or line.cue is None or heard_share(line, heard) >= settings.min_heard
+
     scores = _score_lines(classifier, lines, _masked_lines(detections, lines, settings))
     sexual = _sexual_lines(lines, scores, judge, phrases, triggers, settings)
     certain = {s.index for s in sexual if s.certain}
-    verdicts = [_verdict(d, lines, scores, certain, judge, settings) for d in detections]
+    verdicts = [_verdict(d, lines, scores, certain, judge, settings, trusted) for d in detections]
     return ContextResult(verdicts, sexual, list(lines), scores)
+
+
+EXTREME_DELIVERY = ("shouted", "whispered", "tearful")  # hard to say again convincingly (§17.6)
+
+
+@dataclass(frozen=True)
+class Choice:
+    substitute: str | None  # None: the word is muted
+    reason: str
+
+
+def choose_substitutes(
+    detections: Sequence[Detection],
+    result: ContextResult,
+    table: Mapping[str, Sequence[str]],
+    judge: Judge | None,
+) -> list[Choice]:
+    """For each detection, the substitute to say in its place, or why there is none (DESIGN.md §17.6):
+    the use must be profane, its line not sexual and its delivery not extreme; the judge then picks
+    from the term's substitutes, or, without a judge, a term with a single substitute uses it."""
+    by_term = {term.casefold(): list(candidates) for term, candidates in table.items() if candidates}
+    choices = []
+    for detection, verdict in zip(detections, result.verdicts, strict=True):
+        candidates = by_term.get(detection.term.casefold())
+        if not candidates:
+            choices.append(Choice(None, "no substitute for this term"))
+        elif verdict.use != "profane":
+            choices.append(Choice(None, f"the use is {verdict.use}"))
+        elif verdict.reason == "sexual line":
+            choices.append(Choice(None, "a sexual line"))
+        elif verdict.delivery in EXTREME_DELIVERY:
+            choices.append(Choice(None, f"{verdict.delivery} delivery"))
+        elif judge is None or verdict.line is None:
+            if len(candidates) == 1:
+                choices.append(Choice(candidates[0], "the only substitute"))
+            else:
+                choices.append(Choice(None, "several substitutes, and no judge to choose"))
+        else:
+            word = detection.heard.strip(" ,.!?;:\"'") or detection.term
+            question = substitute_question(result.lines, verdict.line, word, candidates)
+            picked = parse_answer(judge.ask(question)).get("substitute")
+            match = next(
+                (c for c in candidates if isinstance(picked, str) and c.casefold() == picked.casefold()), None
+            )
+            choices.append(
+                Choice(match, "judge") if match else Choice(None, "no substitute fits, the judge says")
+            )
+    return choices
