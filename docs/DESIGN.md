@@ -33,6 +33,7 @@ ffmpeg     →  mute 01:13:03.29–01:13:03.98 · re-encode the audio track · c
 - DRM-protected or encrypted media.
 - Editing image-based subtitles (PGS, VobSub) or burned-in text.
 - Non-English word lists out of the box. The design allows them (§15).
+- Judging context: whether a listed word is meant harmlessly, or a line is sexual without any listed word. §17 designs this for after v1.
 
 ## 3. Command-line interface
 
@@ -130,6 +131,7 @@ That file is deep-merged over the packaged defaults (`defaults.toml`, which is t
 | `[subtitles]`, `.opensubtitles` | Source order, languages, preference for hearing-impaired tracks, credentials |
 | `[output]` | Output path, overwrite, codecs, other audio and subtitle streams, report and EDL |
 | `[cache]`, `[tools]` | Cache location and size, FFmpeg and ffprobe paths |
+| `[context]`, `[replace]` (planned, §17.8) | Context verdicts, ambiguous terms, sexual-content lines; substitutes for voice replacement |
 
 A minimal config needs only the word list:
 
@@ -822,12 +824,17 @@ Running the workflow by hand publishes to TestPyPI instead, for a trial.
 | M3 Online subtitles | OpenSubtitles client, hash, ranking, subtitle cache, untrusted sync with tracking and fps snapping, optional ffsubsync | Out-of-sync and wrong-fps fixtures are corrected, and quota errors fall back cleanly. |
 | M4 Complete v1 | Output subtitle censoring, review SRT, `render --report`, `other_audio_streams`, folder batch mode, span-based transcript cache | The v1 feature set is complete, and defaults are tuned on the evaluation set. |
 | M5 Polish | WhisperX backend, edge refinement, packaging and release, docs | Published to PyPI. |
+| M6 Context report (§17) | `[context]` extra; raw cue text; rules, classifier and judge; verdicts per detection and flagged sexual lines in the report and review subtitles; `sexual` category (off); labelled line set and scoring script | Verdicts appear in reports without changing any output, and their precision is measured on the labelled set. |
+| M7 Context actions (§17) | Opt-in `context.harmless = "keep"` and `context.sexual = "mute"`, with windows for flagged lines | Each action meets its precision target on the labelled set and on real films before it can be turned on. |
+| M8 Voice replacement (§16, stretch) | Substitution map, choice of substitute and delivery (§17.6), dialogue isolation, voice generation, PCM renderer | A replaced word passes the check in §16 step 6, and anything that fails is muted. |
 
 M0 to M5 are implemented:
 
 - M4's defaults were checked on a synthetic evaluation set, which changed `pad_after_ms` and fixed the sync fit (Appendix C). Tuning them on real film clips is still to do.
 - M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
 - M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
+
+M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action.
 
 ## 14. Alternatives considered
 
@@ -856,6 +863,8 @@ M0 to M5 are implemented:
 5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
 6. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
 7. An interactive review UI (`vbr review`, with ffplay previews)?
+8. The `sexual` category (§17.5): which terms, and should it be on by default? Explicit terms are as clear-cut as the `strong` category, but turning the category on changes what every existing config mutes.
+9. Which judge model (§17.3): a 4-billion-parameter model is noticeably better than a 1.5-billion one but takes about 28 s per question on a CPU. Should the judge default to off on machines without a GPU?
 
 ## 16. Stretch goal: voice-matched word replacement
 
@@ -863,12 +872,12 @@ Instead of silence, the censored word could be replaced by a different word spok
 
 **How it could work**
 
-1. **Substitution map.** The config maps terms to replacements, e.g. `hell = "heck"`, `damn = "darn"`. Words without a replacement are muted as in v1.
+1. **Substitution map.** The config maps terms to candidate replacements, e.g. `hell = ["heck"]`, `damn = ["darn"]`. The context layer (§17.6) picks the candidate that fits the line, or none. Words without a fitting replacement are muted as in v1.
 2. **Isolate the dialogue.** The word sits in a mix with music and effects. For 5.1 tracks, work on the centre channel, which carries most dialogue. For stereo, split off a dialogue stem with a source-separation model. Replace the word in that stem, then remix it with the untouched background.
 3. **Voice reference.** Take a few seconds of the same speaker from nearby lines. Speaker diarization (e.g. pyannote) finds lines spoken by the same voice.
 4. **Generate the word.** Use a zero-shot voice-cloning or speech-editing model, for example VoiceCraft (edits words inside an existing utterance), F5-TTS or XTTS-v2. Condition it on the surrounding words so pitch and prosody fit the line.
 5. **Fit and splice.** Time-stretch the generated word to the original word's duration (e.g. with Rubber Band), then splice it in with short crossfades. Splicing needs sample-level editing, so it would use a PCM renderer (decoded audio piped through Python) next to the FFmpeg one. The report gains a per-interval `replacement` field.
-6. **Fallback.** If generation fails, or a check scores it low, mute that word as in v1. The check could compare speaker embeddings and re-run ASR to confirm the new word is heard.
+6. **Fallback.** If generation fails, or a check scores it low, mute that word as in v1. The check could compare speaker embeddings and re-run ASR to confirm the new word is heard. Whether to try replacement at all is the mute-or-replace decision of §17.6: never on a sexual line, and not for shouted or whispered words.
 
 **Hard parts.**
 
@@ -878,6 +887,176 @@ Instead of silence, the censored word could be replaced by a different word spok
 - Licences: several of the strongest voice models are non-commercial.
 
 Voice cloning should stay local. The tool should never export voice models, and the feature is meant for personal viewing copies.
+
+## 17. Context analysis (design iteration)
+
+v1 decides by the word alone: a listed word is muted wherever it is heard. This section designs a layer that reads the dialogue around each detection, and the rest of the script, and records what it concludes. It serves five decisions. The first four concern listed words; the fifth reaches beyond the word list.
+
+1. **Censor or not.** Is a listed word used harmlessly? For example "the road to hell", "God bless you", or a farmer's ass.
+2. **Replacement word.** For voice replacement (§16), which substitute keeps the line's meaning and intensity? For example "freaking" for "fucking" used as an intensifier.
+3. **Voice emotion.** How should the substitute be delivered: shouted, whispered, surprised?
+4. **Mute or replace.** Would a substitute sound natural in this line, or is muting safer?
+5. **Sexual content.** Lines that are sexual in nature, with or without a listed word, from explicit talk to innuendo.
+
+**Decided with the user for this iteration:**
+
+- **Text only.** The signal is words: the transcript, the subtitles, and the sound descriptions in SDH subtitles (`[moaning]`, `[whispering]`). There is no model of emotion in the voice. The speech-editing models of §16 take delivery from the surrounding audio anyway.
+- **Local only.** Every model runs on the user's machine, from the model cache when offline (§10). No dialogue leaves the machine.
+- **Report-only first.** The first milestone adds verdicts to the report and the review subtitles, and changes nothing that is muted. Acting on verdicts comes later, opt-in, once they are measured.
+
+### 17.1 What a first test showed
+
+Before this design, two kinds of local model were tried on 20 hand-written lines (Appendix D). The findings shape it:
+
+- **A toxicity classifier works on intensity, not word sense.** Detoxify's unbiased model (`unitary/unbiased-toxic-roberta`, RoBERTa-base, Apache-2.0) separated "Go to hell!" (toxicity 0.97) from "the road to hell is paved with good intentions" (0.04). It flagged "Let's have sex." (`sexual_explicit` 0.89), and scored 1,500 lines in 18 s on four CPU threads. But it:
+  - scored "The farmer loaded his ass with firewood." toxic and sexual (0.97 and 0.93);
+  - scored "God bless you" and "Oh my God, look at that!" alike (0.001 each);
+  - missed innuendo and SDH sound descriptions such as `[moaning]` (all below 0.06).
+- **A small instruct model can judge word sense, but not reliably yet, and slowly on a CPU.**
+  - Qwen2.5-1.5B-Instruct called every use profane and never chose a substitute. It took about 9 s per question.
+  - Qwen3-4B-Instruct-2507 did better:
+    - it recognized one of the three harmless uses ("God bless you") and all five profane ones;
+    - it chose sensible substitutes, such as "freaking" for "fucking" as an intensifier;
+    - but it offered "freak" for a sexual "fuck", and found only one of three sexual lines that had no explicit words.
+
+    It took about 28 s per question on four CPU threads.
+  - Both models erred toward "profane", the safe side.
+- **Combining helps.** The classifier got the "hell" idiom right, which the judge missed, and the judge got "God bless you" right, which the classifier could not tell apart.
+
+So neither kind of model alone is good enough to change what is muted. That supports report-only first, and it makes three things part of the design:
+
+- combining signals;
+- bounding how often the slow model runs;
+- building a labelled set before any action ships.
+
+### 17.2 Lines
+
+The unit of analysis is a **line**: a subtitle cue, or a Whisper segment where there are no subtitles.
+
+- **Subtitles give the whole script for free.** Every line of the film can be scored even in `hybrid` and `targeted` mode, where most of the audio is never transcribed.
+- **Raw cue text is kept.** Cue cleaning (§6.5) removes sound descriptions and speaker labels, which are signals here (`[moaning]`, `[shouting]`, `[whispers]`), so the raw text is kept next to the cleaned text.
+- **Without subtitles**, `full` mode has transcribed everything, and its segments are the lines.
+- **A detection's context** is the line it falls in, plus one line either side: a sentence often spans two cues.
+- **Times** come from the sync model (§6.6) for cues, and from the transcript for segments.
+
+### 17.3 Signals
+
+Three sources, cheapest first:
+
+1. **Rules.**
+   - Sound descriptions that suggest sexual content (`[moaning]`, `[panting]`, `[kissing]`) or a delivery (`[shouting]`, `[whispering]`, `[sobbing]`).
+   - Exclamation marks and capitals, for intensity.
+   - A list of trigger words (`bed`, `naked`, `sleep with`, …), used like `lexicon.hints` (§4.3). A trigger word never mutes anything; it selects lines for a closer look.
+2. **Classifier (tier 1), every line.** A text classifier scores each line for profanity and explicit sexual content: toxicity, obscene, insult and `sexual_explicit` in Detoxify's unbiased model. It is fast enough for a whole film on a CPU (§17.1). Its scores rank lines and settle the clear cases. They are never the only reason to call a use harmless.
+3. **Judge (tier 2), few lines.** A small local instruct model answers fixed questions about one line and its neighbours, as a JSON object with fixed fields:
+   - the sense of one listed word (profane or harmless, with a reason);
+   - whether the line is sexual, including innuendo;
+   - the emotion and its intensity;
+   - which of the configured substitutes fits, if any (M8).
+
+   Decoding is greedy, and answers are cached by model, question version and line text. The judge only ever picks from fixed options, and never writes text that reaches the audio. It runs only where it can change a verdict:
+   - on detections of terms marked ambiguous (`hell`, `god`, `ass`, `damn`, `bitch`, …) whose line is not already clearly profane by tier 1;
+   - on lines that a rule or a moderate tier-1 sexual score selected.
+
+   That is usually tens of questions per film. With a 4-billion-parameter judge at the CPU speeds of §17.1, that is up to a quarter of an hour. A GPU should take far less, but that is not measured yet.
+
+**Candidates.**
+
+| Role | Candidates |
+|---|---|
+| Classifier | `unitary/unbiased-toxic-roberta` (Apache-2.0) |
+| Emotion classifier | `j-hartmann/emotion-english-distilroberta-base`: seven emotions, but its model card names no licence, so that must be settled before it can ship |
+| Judge | Qwen3-4B-Instruct-2507 and Qwen2.5-1.5B-Instruct (Apache-2.0), SmolLM2-1.7B-Instruct (Apache-2.0), Phi-3.5-mini-instruct (MIT) |
+
+M6 picks among them on the labelled set (§17.7).
+
+**Runtime.** M6 uses Hugging Face transformers on PyTorch, in a `[context]` extra like `[align]`. CTranslate2, already installed with faster-whisper, runs RoBERTa encoders and Qwen, Phi and Llama models; a classifier's head is then one small matrix product on top of the encoder. A later step could drop PyTorch by converting the chosen models once and publishing the converted weights, which their Apache-2.0 and MIT licences allow.
+
+### 17.4 Verdicts
+
+**Per detection:** a `context` object in the report.
+
+- **`use`:** `"profane"`, `"harmless"` or `"unsure"`, with a reason (`"place"`, `"religious"`, `"literal"`, `"name"`) and the scores behind it.
+- **`emotion`:** a label and an intensity. They come from the judge and the rules: a sound description such as `[shouting]` outranks the model.
+- **`action`:** `"mute"`, `"keep"` or `"replace"`, with a `replacement` from §17.6. In report-only mode, `action` is what the layer *would* do; the output does not change.
+
+The combination is deliberately one-sided, since letting a profane word through costs more than muting a harmless one:
+
+- `harmless` needs the judge to say so *and* tier 1 to find the line clean;
+- a line flagged sexual is never harmless;
+- disagreement means `unsure`;
+- `unsure` means mute.
+
+**Per line:** `context.lines`, listing the lines flagged sexual, with times, scores, the evidence (tier 1, judge, sound description) and whether they contain detections.
+
+### 17.5 Sexual content
+
+Two layers, as for profanity:
+
+- **Words.** A new built-in category `sexual` of explicit terms is muted word by word like any other category. It ships disabled until its list and default are reviewed (open question 8).
+- **Lines.** Explicit lines are flagged by tier 1. Innuendo is flagged by the judge, on lines selected by the rules; classifiers trained on web comments miss innuendo, as §17.1 showed. Innuendo has no single word to cut, so acting on a flagged line (M7) mutes the whole line:
+  - the planner adds a window for the line's cue (reason `context`);
+  - the mute covers the speech heard in that window.
+
+  Until then, flagged lines appear in the report and the review subtitles only.
+
+### 17.6 Mute or replace, and delivery (for §16)
+
+A word is replaced only when all of these hold; otherwise it is muted:
+
+1. its `use` is `profane`;
+2. its line is not sexual;
+3. the judge picks one of the substitutes configured for the term (`[replace]`, e.g. `"*fuck*" = ["freaking", "frick"]`) as fitting this sense. For example, "fucking" as an intensifier fits "freaking", while "fuck" as a verb fits nothing;
+4. the delivery is not extreme: a shouted, screamed or whispered word is hard to regenerate convincingly;
+5. §16's check on the generated audio passes.
+
+The emotion and intensity go to the voice model as a condition, where it accepts one.
+
+### 17.7 Evaluation
+
+The synthetic set of §11 has no context to judge. M6 adds a text-only set of labelled lines, written for the purpose, since film subtitles cannot be shared:
+
+- uses of each ambiguous listed word, labelled profane or harmless;
+- lines labelled sexual or not, including innuendo and sound descriptions;
+- the emotion and the fitting substitute where they matter.
+
+A script scores the layer on it, and users can run the same script on their own subtitle files locally. The metrics are:
+
+- **precision of `harmless`**, the costly error;
+- **recall of sexual lines**;
+- **the share of detections left `unsure`**;
+- **judge questions and time per film.**
+
+The thresholds, the choice of models, and whether any action ever becomes a default all come from this set and from real films.
+
+### 17.8 Configuration
+
+A sketch; the names may change in M6:
+
+```toml
+[context]
+enabled = false                 # needs the [context] extra
+classifier = "auto"             # tier 1
+judge = "auto"                  # tier 2; "" turns it off (rules and tier 1 only)
+ambiguous = ["hell", "god", "ass", "damn", "bitch"]   # terms whose sense the judge checks
+harmless = "report"             # "report"; later "keep": leave harmless uses unmuted
+sexual = "report"               # "report"; later "mute": mute flagged lines
+triggers = ["bed", "naked", "sleep with"]             # lines worth a sexual-content check
+
+[replace]                       # §16: substitutes the judge may choose from
+"hell" = ["heck"]
+"*fuck*" = ["freaking", "frick"]
+```
+
+`vbr render` ignores verdicts and mutes the report's intervals as they are. So even report-only mode is useful: a user who agrees that a use is harmless deletes its interval and renders.
+
+### 17.9 Risks
+
+- **Domain.** The models learned from web text, not film dialogue. Sarcasm, quotation, song lyrics and period language will fool them.
+- **Missing context.** Innuendo often depends on what is on screen, which this layer cannot see.
+- **Language.** The candidates are English. Multilingual variants exist but are weaker (open question 4).
+- **Bias.** Toxicity classifiers are known to over-score identity terms. That matters little for lines already holding a listed word, but it is one more reason tier 1 alone never decides.
+- **Size and speed.** The classifier is about 500 MB; a judge is 1.5–4 billion parameters, which is 3–8 GB in 16-bit precision. On a CPU the judge must stay rare; on a GPU it is cheap.
 
 ## Appendix A. Prototype measurements
 
@@ -925,6 +1104,9 @@ Before writing this design, the FFmpeg parts were prototyped to check the key as
 - FFmpeg filters (`asendcmd`, `volume`, `asetnsamples`, `amix`, `sine`, `pan`, timeline editing): <https://ffmpeg.org/ffmpeg-filters.html>
 - FFmpeg 7 deprecation of `-filter_complex_script` in favour of `-/filter_complex`: <https://patchwork.ffmpeg.org/project/ffmpeg/patch/20240117092233.8503-5-anton@khirnov.net/>
 - Kodi EDL format (action 1 = mute): <https://kodi.wiki/view/Edit_decision_list>
+- Detoxify (toxicity classifiers, including the unbiased model with `sexual_explicit`): <https://github.com/unitaryai/detoxify>, <https://huggingface.co/unitary/unbiased-toxic-roberta>
+- Candidate judges for §17: <https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507>, <https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct>, <https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct>, <https://huggingface.co/microsoft/Phi-3.5-mini-instruct>
+- CTranslate2 supported models (encoders and decoders): <https://opennmt.net/CTranslate2/guides/transformers.html>
 
 ## Appendix C. Evaluation on the synthetic set
 
@@ -998,3 +1180,48 @@ Reading the audio around the intervals by seeking added about 0.1 s per minute o
 7. **The sync check, fixed on the way (§6.6).** The first run rejected subtitles 1.7 s late under `hybrid` (timing error 0.53 s) and accepted them under `targeted` with a scale of 1.0026, when the truth was a plain offset. Anchor words that follow a pause were placed up to 2 s early, and the fit followed them to a scale no real mismatch produces. With both fixed, the same clip passes with errors of 0.05 and 0.09 s.
 
 **Not measured here.** Real soundtracks, accents and subtitles; the prompt setting (open question 1); `fade_ms` on real speech (open question 6); the dialogue check's threshold (§6.11); and GPU timings, with or without alignment. These need a set of real annotated clips and a GPU.
+
+## Appendix D. Context analysis: a first test
+
+**Setup.** Twenty hand-written lines, on the same 4-vCPU container as Appendix C, with PyTorch 2.8 on the CPU and transformers 4.57. The classifier ran in 32-bit floats and the judges in bfloat16. This is not a benchmark. It checks what each kind of model can and cannot do before §17 was designed.
+
+**Classifier.** `unitary/unbiased-toxic-roberta`, sigmoid scores per line:
+
+| Kind | Line | Toxicity | Obscene | Insult | Sexual explicit |
+|---|---|---|---|---|---|
+| harmless | The road to hell is paved with good intentions. | 0.037 | 0.003 | 0.003 | 0.000 |
+| harmless | In the painting, hell is shown as a lake of fire. | 0.032 | 0.001 | 0.002 | 0.000 |
+| harmless | God bless you, my child. | 0.001 | 0.000 | 0.000 | 0.000 |
+| harmless | Let us pray to God for guidance. | 0.001 | 0.000 | 0.000 | 0.000 |
+| harmless | The farmer loaded his ass with firewood. | 0.972 | 0.875 | 0.196 | 0.928 |
+| harmless | They built a dam across the river. | 0.001 | 0.000 | 0.000 | 0.000 |
+| profane | Go to hell! | 0.969 | 0.018 | 0.811 | 0.000 |
+| profane | What the hell are you doing? | 0.643 | 0.239 | 0.093 | 0.001 |
+| profane | Oh my God, look at that! | 0.001 | 0.000 | 0.000 | 0.000 |
+| profane | Get your ass over here. | 0.993 | 0.924 | 0.815 | 0.956 |
+| profane | Damn, that was close. | 0.944 | 0.986 | 0.113 | 0.034 |
+| profane | Shut the fuck up. | 0.996 | 0.926 | 0.978 | 0.032 |
+| sexual | I want to take you to bed tonight. | 0.059 | 0.001 | 0.011 | 0.001 |
+| sexual | [moaning] | 0.002 | 0.000 | 0.001 | 0.000 |
+| sexual | She wants to see my etchings, if you know what I mean. | 0.001 | 0.000 | 0.000 | 0.000 |
+| sexual | Let's have sex. | 0.832 | 0.028 | 0.012 | 0.888 |
+| sexual | Take off your clothes and get in the shower with me. | 0.035 | 0.002 | 0.005 | 0.001 |
+| neutral | The cat sat on the mat. | 0.002 | 0.000 | 0.001 | 0.000 |
+| neutral | We should get dinner sometime. | 0.001 | 0.000 | 0.000 | 0.000 |
+| neutral | Take off your coat and stay a while. | 0.003 | 0.000 | 0.001 | 0.000 |
+
+The table repeated to 1,500 lines, in batches of 64, took 17.6 s on four threads.
+
+**Judges.** Greedy decoding, with two kinds of question:
+
+- one question per detection, asking for four fields: the word's sense, whether the line is sexual, the emotion, and a substitute from given candidates;
+- one question per line, asking only whether it is sexual.
+
+| | Qwen2.5-1.5B-Instruct | Qwen3-4B-Instruct-2507 |
+|---|---|---|
+| Harmless uses recognized, of 3 (the "hell" idiom, "God bless you", the literal "ass") | 0 | 1 ("God bless you") |
+| Profane uses recognized, of 5 | 5 | 5 |
+| Substitute chosen from the candidates | never | every time: "heck", "gosh", "butt", "freaking"; also "freak" for a sexual "fuck" |
+| Sexual lines without explicit words found, of 3 | 2 | 1 |
+| Neutral lines kept, of 2 | 2 | 2 |
+| Time per detection question / line question | 9 s / 3 s | 28 s / 8 s |

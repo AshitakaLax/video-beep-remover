@@ -23,6 +23,8 @@ A file without usable subtitles falls back to transcribing the whole soundtrack,
 
 The defaults have been checked on a synthetic evaluation set only (see [Evaluate](#evaluate)); tuning them on real film clips is still to do. Changes are listed in the [changelog](https://github.com/AshitakaLax/video-beep-remover/blob/main/CHANGELOG.md).
 
+Next is context analysis, designed in [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration). Local models would read the dialogue around each listed word to tell harmless uses from profane ones, flag sexual lines with or without listed words, and prepare the choices voice replacement needs. At first, their verdicts go only into the report.
+
 ## Install
 
 You need Python 3.11+ and FFmpeg 5.1+ (`ffmpeg` and `ffprobe` on your `PATH`).
