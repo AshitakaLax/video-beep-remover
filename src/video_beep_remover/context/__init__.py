@@ -2,7 +2,7 @@
 the report and the review subtitles. Acting on them is opt-in (M7): context.harmless = "keep" leaves
 uses judged harmless unmuted, and context.sexual = "mute" mutes the lines flagged as sexual."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +10,13 @@ from video_beep_remover.config.schema import Config
 from video_beep_remover.context import rules
 from video_beep_remover.context.analyse import (
     QUESTIONS_VERSION,
+    Choice,
     ContextResult,
     Settings,
     SexualLine,
     Verdict,
     analyse_context,
+    choose_substitutes,
 )
 from video_beep_remover.context.lines import Line, build_lines, word_lines
 from video_beep_remover.context.models import (
@@ -29,6 +31,7 @@ from video_beep_remover.context.models import (
 from video_beep_remover.models import CensorInterval, Detection, Word
 
 __all__ = [
+    "Choice",
     "ContextLayer",
     "ContextResult",
     "Line",
@@ -145,6 +148,12 @@ class ContextLayer:
                 else 'no GPU: context.judge = "auto" runs the judge only on an NVIDIA GPU'
             )
         return result, section
+
+    def substitutes(
+        self, detections: Sequence[Detection], result: ContextResult, table: Mapping[str, Sequence[str]]
+    ) -> list[Choice]:
+        """The substitute to say in place of each detection, if any (DESIGN.md §17.6)."""
+        return choose_substitutes(detections, result, table, self.judge())
 
 
 def verdict_dict(verdict: Verdict, lines: Sequence[Line]) -> dict[str, Any]:

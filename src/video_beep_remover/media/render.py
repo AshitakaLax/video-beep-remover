@@ -1,11 +1,12 @@
-"""Write the cleaned file: mute spans with afade driven by a command file (DESIGN.md §6.11)."""
+"""Write the cleaned file: mute spans with afade driven by a command file (DESIGN.md §6.11), and add
+the changes that voice replacement made to a replaced word's span (§16)."""
 
 import logging
 import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -226,11 +227,22 @@ def disposition_value(stream: StreamInfo) -> str:
 
 
 @dataclass(frozen=True)
+class Splice:
+    """A change added to one audio stream over a span that is then not muted in it: a word said again
+    by voice replacement (DESIGN.md §16)."""
+
+    span: CensorInterval  # the word's muted span
+    path: Path  # float32, interleaved, at the stream's rate and channels
+    start: float  # media time of its first sample
+
+
+@dataclass(frozen=True)
 class RenderCommand:
     args: list[str]
     files: dict[str, str]  # file name (in the job directory) -> content
     encoders: dict[int, str]  # input stream index -> encoder, for re-encoded streams
     censored_positions: list[int]  # output audio positions (0:a:N) that were muted
+    spliced: dict[int, list[CensorInterval]] = field(default_factory=dict)  # position -> spans not muted
 
 
 def _tags(kind: str, position: int, stream: StreamInfo) -> list[str]:
@@ -255,14 +267,20 @@ def build_command(
     target: Path,
     subtitle_files: Mapping[int, Path] | None = None,
     tag: str | None = None,
+    splices: Mapping[int, Sequence[Splice]] | None = None,
 ) -> RenderCommand:
     """The FFmpeg command for the plan. `subtitle_files` holds the censored text of each subtitle
-    stream the plan censors (by input stream index); `tag` is written as the VBR_CENSORED tag."""
+    stream the plan censors (by input stream index); `tag` is written as the VBR_CENSORED tag;
+    `splices` are voice replacements to add to an audio stream (by input stream index), whose spans
+    that stream then does not mute."""
     suffix = target.suffix.lower()
     subtitle_files = subtitle_files or {}
+    splices = splices or {}
     files: dict[str, str] = {}
     graph: list[str] = []
     inputs: list[str] = ["-i", file_arg(info.path)]
+    count = 1  # inputs so far
+    spliced: dict[int, list[CensorInterval]] = {}
     maps: list[str] = []
     codec_args: list[str] = []
     meta_args: list[str] = []
@@ -273,18 +291,44 @@ def build_command(
         stream = action.stream
         if stream.kind == "subtitle" and action.action == "censor":
             inputs += ["-i", file_arg(subtitle_files[stream.index])]
-            maps += ["-map", f"{len(inputs) // 2 - 1}:0"]
+            maps += ["-map", f"{count}:0"]
+            count += 1
             codec_args += [f"-c:s:{subtitle_position}", subtitle_encoder(stream, suffix)]
             meta_args += _tags("s", subtitle_position, stream)
-        elif action.action == "censor" and intervals:
+        elif action.action == "censor" and (intervals or splices.get(stream.index)):
             label = f"mute{len(positions)}"
-            text, initial = command_file(intervals, label, fade)
-            files[f"{label}.cmd"] = text
-            frame = max(1, round((stream.sample_rate or 48_000) / FRAMES_PER_SECOND))
-            graph.append(
-                f"[0:{stream.index}]asetnsamples=n={frame}:p=0,asendcmd=f={label}.cmd,"
-                f"afade@{label}={initial}[out{label}]"
-            )
+            added = list(splices.get(stream.index, ()))
+            spans = [
+                i for i in intervals if not any(i.start < a.span.end and a.span.start < i.end for a in added)
+            ]
+            if spans:
+                text, initial = command_file(spans, label, fade)
+                files[f"{label}.cmd"] = text
+                frame = max(1, round((stream.sample_rate or 48_000) / FRAMES_PER_SECOND))
+                chain = (
+                    f"[0:{stream.index}]asetnsamples=n={frame}:p=0,asendcmd=f={label}.cmd,"
+                    f"afade@{label}={initial}"
+                )
+            else:
+                chain = f"[0:{stream.index}]anull"
+            if added:
+                rate = stream.sample_rate or 48_000
+                layout = ["-ch_layout", stream.channel_layout] if stream.channel_layout else []
+                mixed = [f"[pre{label}]"]
+                graph.append(f"{chain}[pre{label}]")
+                for number, change in enumerate(added):
+                    inputs += ["-f", "f32le", "-ar", str(rate), "-ac", str(stream.channels or 2), *layout]
+                    inputs += ["-i", file_arg(change.path)]
+                    delay = max(0, round((change.start - (stream.start_time or 0.0)) * rate))
+                    graph.append(f"[{count}:0]adelay=delays={delay}S:all=1[{label}d{number}]")
+                    mixed.append(f"[{label}d{number}]")
+                    count += 1
+                graph.append(
+                    f"{''.join(mixed)}amix=inputs={len(mixed)}:normalize=0:duration=first[out{label}]"
+                )
+                spliced[audio_position] = [a.span for a in added]
+            else:
+                graph.append(f"{chain}[out{label}]")
             maps += ["-map", f"[out{label}]"]
             encoder, bitrate = choose_encoder(
                 stream, suffix, ff.encoders, output.audio_codec, output.audio_bitrate
@@ -315,7 +359,9 @@ def build_command(
         # use_metadata_tags: MP4 keeps only its standard tags otherwise, and VBR_CENSORED is not one.
         args += ["-movflags", "+faststart+use_metadata_tags" if tag else "+faststart"]
     args.append(file_arg(target))
-    return RenderCommand(args=args, files=files, encoders=encoders, censored_positions=positions)
+    return RenderCommand(
+        args=args, files=files, encoders=encoders, censored_positions=positions, spliced=spliced
+    )
 
 
 def level_dbfs(samples: np.ndarray) -> float:
@@ -357,16 +403,21 @@ def verify_muted(
     *,
     shift: float = 0.0,
     workers: int = 4,
+    spliced: Mapping[int, Sequence[CensorInterval]] | None = None,
 ) -> tuple[int, list[str]]:
     """Decode the core of every muted span (the span minus its fades) and require silence. `shift` is
-    how much later the content sits in `path` than in the input (see timeline_shift).
+    how much later the content sits in `path` than in the input (see timeline_shift). `spliced` spans
+    are not muted in their stream (by output position): voice replacement put words there.
 
     FFmpeg ignores a filter command it rejects without an error, so this is what proves the mutes happened.
     Returns (spans checked, failures).
     """
     jobs = []
+    spliced = spliced or {}
     for position in positions:
         for interval in intervals:
+            if any(interval.start < s.end and s.start < interval.end for s in spliced.get(position, ())):
+                continue
             f = fade_for(interval, fade)
             start = interval.start + shift + f + VERIFY_MARGIN_S
             length = interval.end - f - VERIFY_MARGIN_S - start
@@ -413,6 +464,7 @@ def render(
     subtitle_files: Mapping[int, Path] | None = None,
     tag: str | None = None,
     on_progress: Callable[[float], None] | None = None,
+    splices: Mapping[int, Sequence[Splice]] | None = None,
 ) -> RenderResult:
     """Render to <name>.partial<ext>, verify every muted span, then rename. Nothing half-written survives."""
     spans = normalize_intervals(intervals, info.duration)
@@ -427,6 +479,7 @@ def render(
         target=partial,
         subtitle_files=subtitle_files,
         tag=tag,
+        splices=splices,
     )
     for name, text in command.files.items():
         (workdir / name).write_text(text, "utf-8")
@@ -434,7 +487,14 @@ def render(
         ff.run(command.args, cwd=workdir, on_progress=on_progress)
         shift = timeline_shift(ff, info, plan, partial)
         checked, failures = verify_muted(
-            ff, partial, command.censored_positions, spans, fade, shift=shift, workers=os.cpu_count() or 4
+            ff,
+            partial,
+            command.censored_positions,
+            spans,
+            fade,
+            shift=shift,
+            workers=os.cpu_count() or 4,
+            spliced=command.spliced,
         )
         if failures:
             shown = "\n  ".join(failures[:10])

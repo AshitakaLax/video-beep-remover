@@ -202,6 +202,55 @@ profane_above = 0.5                 # a line scoring this much is profane withou
 min_heard = 0.7                     # a subtitle line can show a use as harmless only if this share
                                     # of its words is heard: subtitles can hold text never said
 
+# ---------------------------------------------------------------------------
+# Voice replacement (DESIGN.md §16): experimental
+# ---------------------------------------------------------------------------
+# Instead of muting a listed word, say a milder one in its place, in the same voice: "What the hell"
+# becomes "What the heck". A word is replaced only when context analysis (which runs with it) calls
+# its use profane, its line is not sexual and it is not shouted or whispered, and a substitute below
+# fits: the judge picks one, or, without a judge, a term with a single substitute uses it. The new
+# word must then be heard, and sound like the speaker; anything else is muted as usual. Needs pip
+# install "video-beep-remover[voice]" and, in practice, an NVIDIA GPU: on a CPU each word takes
+# about a minute. The voice model's weights (F5-TTS) are licensed for non-commercial use only.
+[replace]
+enabled = false                     # or --replace on the command line
+model = "F5TTS_v1_Base"             # the voice editing model
+separation = "htdemucs"             # splits the dialogue from music and effects (Demucs)
+steps = 32                          # the voice model's sampling steps: 16 is faster and still usable
+voice_margin = 0.15                 # how much less like the speaker the new word may sound than the
+                                    # original did (cosine of speaker embeddings)
+
+# Substitutes for listed terms, as written in the word list. Set a term to [] to always mute it.
+[replace.substitutes]
+"*fuck*" = ["freaking", "frick", "fricking", "fudge"]
+"*shit*" = ["shoot", "shucks", "baloney", "crummy"]
+"bitch*" = ["witch"]
+"son of a bitch" = ["son of a gun"]
+"sonofabitch" = ["son of a gun"]
+"*asshole*" = ["jerk"]
+"bastard*" = ["rascal"]
+"dickhead*" = ["dummy"]
+"damn" = ["darn"]
+"damned" = ["darned"]
+"dammit" = ["darn it"]
+"damnit" = ["darn it"]
+"damn it" = ["darn it"]
+"hell" = ["heck"]
+"crap" = ["crud"]
+"crappy" = ["crummy"]
+"ass" = ["butt"]
+"asses" = ["butts"]
+"dumbass*" = ["dummy"]
+"jackass*" = ["jerk"]
+"smartass*" = ["smarty-pants"]
+"pissed" = ["ticked"]
+"goddamn*" = ["gosh darn"]
+"god damn*" = ["gosh darn"]
+"god dammit" = ["gosh darn it"]
+"jesus christ" = ["jeez"]
+"oh my [god]" = ["gosh"]
+"for christ's sake" = ["for crying out loud"]
+
 [cache]
 dir = "auto"                        # per-user cache dir
 max_size_gb = 5                     # transcripts beyond this are deleted, least recently used first

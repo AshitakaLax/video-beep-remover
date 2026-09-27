@@ -7,7 +7,7 @@ a sexual line is never harmless; anything else undecided is "unsure", which mute
 
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, Literal
@@ -105,6 +105,16 @@ def sexual_question(lines: Sequence[Line], index: int) -> str:
     )
 
 
+def substitute_question(lines: Sequence[Line], index: int, word: str, candidates: Sequence[str]) -> str:
+    options = ", ".join(_quote(c) for c in candidates)
+    return (
+        f"Dialogue:\n{_dialogue(lines, index)}\n\n"
+        f"The word {_quote(word)} in the line marked >> is to be replaced by a milder one, said in the "
+        f"same voice. Which of these keeps the line natural and its meaning: {options}? Reply with "
+        '{"substitute": ...} naming one of them, or {"substitute": null} if none fits.'
+    )
+
+
 def parse_answer(text: str) -> dict[str, Any]:
     """The first JSON object in a judge's answer, keeping only known fields with allowed values."""
     for match in _JSON.finditer(text):
@@ -123,6 +133,8 @@ def parse_answer(text: str) -> dict[str, Any]:
             answer["emotion"] = data["emotion"]
         if isinstance(data.get("sexual"), bool):
             answer["sexual"] = data["sexual"]
+        if "substitute" in data and (data["substitute"] is None or isinstance(data["substitute"], str)):
+            answer["substitute"] = data["substitute"]  # checked against the offered substitutes by the caller
         return answer
     return {}
 
@@ -275,3 +287,51 @@ def analyse_context(
     certain = {s.index for s in sexual if s.certain}
     verdicts = [_verdict(d, lines, scores, certain, judge, settings, trusted) for d in detections]
     return ContextResult(verdicts, sexual, list(lines), scores)
+
+
+EXTREME_DELIVERY = ("shouted", "whispered", "tearful")  # hard to say again convincingly (§17.6)
+
+
+@dataclass(frozen=True)
+class Choice:
+    substitute: str | None  # None: the word is muted
+    reason: str
+
+
+def choose_substitutes(
+    detections: Sequence[Detection],
+    result: ContextResult,
+    table: Mapping[str, Sequence[str]],
+    judge: Judge | None,
+) -> list[Choice]:
+    """For each detection, the substitute to say in its place, or why there is none (DESIGN.md §17.6):
+    the use must be profane, its line not sexual and its delivery not extreme; the judge then picks
+    from the term's substitutes, or, without a judge, a term with a single substitute uses it."""
+    by_term = {term.casefold(): list(candidates) for term, candidates in table.items() if candidates}
+    choices = []
+    for detection, verdict in zip(detections, result.verdicts, strict=True):
+        candidates = by_term.get(detection.term.casefold())
+        if not candidates:
+            choices.append(Choice(None, "no substitute for this term"))
+        elif verdict.use != "profane":
+            choices.append(Choice(None, f"the use is {verdict.use}"))
+        elif verdict.reason == "sexual line":
+            choices.append(Choice(None, "a sexual line"))
+        elif verdict.delivery in EXTREME_DELIVERY:
+            choices.append(Choice(None, f"{verdict.delivery} delivery"))
+        elif judge is None or verdict.line is None:
+            if len(candidates) == 1:
+                choices.append(Choice(candidates[0], "the only substitute"))
+            else:
+                choices.append(Choice(None, "several substitutes, and no judge to choose"))
+        else:
+            word = detection.heard.strip(" ,.!?;:\"'") or detection.term
+            question = substitute_question(result.lines, verdict.line, word, candidates)
+            picked = parse_answer(judge.ask(question)).get("substitute")
+            match = next(
+                (c for c in candidates if isinstance(picked, str) and c.casefold() == picked.casefold()), None
+            )
+            choices.append(
+                Choice(match, "judge") if match else Choice(None, "no substitute fits, the judge says")
+            )
+    return choices

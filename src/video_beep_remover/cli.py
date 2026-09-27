@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+import os
 import tempfile
 from collections.abc import Iterator
 from enum import Enum, StrEnum
@@ -103,12 +104,15 @@ class ConsoleUI:
 
 
 def _setup_logging(verbose: bool) -> None:
+    if not verbose:
+        # huggingface_hub sets its own level when first used, and prints through a handler of its own.
+        os.environ.setdefault("HF_HUB_VERBOSITY", "error")
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
     # Model downloads log an "unauthenticated requests" warning that is only noise for this tool.
-    for noisy in ("faster_whisper", "whisperx", "httpx", "urllib3", "huggingface_hub"):
+    for noisy in ("faster_whisper", "whisperx", "httpx", "urllib3", "huggingface_hub", "speechbrain"):
         logging.getLogger(noisy).setLevel(logging.INFO if verbose else logging.ERROR)
 
 
@@ -136,6 +140,8 @@ def _overrides(**flags: Any) -> dict[str, Any]:
         overrides["offline"] = True
     if flags.get("context"):
         overrides["context.enabled"] = True
+    if flags.get("replace"):
+        overrides["replace.enabled"] = True
     return overrides
 
 
@@ -143,16 +149,18 @@ def _summarize(result: FileResult) -> str:
     name = result.input.name
     if result.status == "skipped":
         return f"{name}: skipped ({'; '.join(result.notes)})"
+    replaced = f", {result.replaced} replaced" if result.replaced else ""
     if result.status == "scanned":
         return (
-            f"{name}: {result.detections} listed words, {result.intervals} spans to mute ({result.strategy})"
+            f"{name}: {result.detections} listed words, {result.intervals} spans to mute{replaced} "
+            f"({result.strategy})"
         )
     if result.status == "clean":
         return f"{name}: nothing to mute, no output written"
     if result.status == "copied":
         return f"{name}: nothing to mute, copied → {result.output} ({result.strategy})"
     how = "from the report" if result.strategy == "report" else result.strategy
-    return f"{name}: muted {result.intervals} spans → {result.output} ({how})"
+    return f"{name}: muted {result.intervals} spans{replaced} → {result.output} ({how})"
 
 
 def _print_result(ui: ConsoleUI, result: FileResult) -> None:
@@ -247,6 +255,14 @@ ContextOpt = Annotated[
         "verdicts to the report (needs the [context] extra; acting on them is set in [context]).",
     ),
 ]
+ReplaceOpt = Annotated[
+    bool,
+    typer.Option(
+        "--replace",
+        help="Say a milder word in the speaker's voice instead of muting, where one fits (experimental; "
+        "needs the [voice] extra, and a GPU in practice).",
+    ),
+]
 OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")]
 OverwriteOpt = Annotated[bool, typer.Option("--overwrite", help="Replace existing outputs.")]
 KeepTempOpt = Annotated[bool, typer.Option("--keep-temp", help="Keep temporary files for debugging.")]
@@ -274,6 +290,7 @@ def clean(
     edl: EdlOpt = False,
     review_srt: ReviewOpt = False,
     context: ContextOpt = False,
+    replace: ReplaceOpt = False,
     overwrite: OverwriteOpt = False,
     skip_existing: Annotated[
         bool, typer.Option("--skip-existing", help="Skip inputs whose output exists.")
@@ -311,6 +328,7 @@ def clean(
         audio_stream=audio_stream,
         recursive=recursive,
         context=context,
+        replace=replace,
     )
 
 
@@ -331,6 +349,7 @@ def scan(
     edl: EdlOpt = False,
     review_srt: ReviewOpt = False,
     context: ContextOpt = False,
+    replace: ReplaceOpt = False,
     overwrite: Annotated[
         bool, typer.Option("--overwrite", help="Replace an existing EDL or review subtitles.")
     ] = False,
@@ -363,6 +382,7 @@ def scan(
         audio_stream=audio_stream,
         recursive=recursive,
         context=context,
+        replace=replace,
     )
 
 
@@ -685,6 +705,7 @@ def doctor(config: ConfigOpt = None) -> None:
         row("faster-whisper", False, "not installed: pip install faster-whisper")
     row(*_whisperx_status(cfg))
     row(*_context_status(cfg))
+    row(*_voice_status(cfg))
 
     row(*_opensubtitles_status(cfg))
     from video_beep_remover.subtitles.ffsubsync import ffsubsync_command
@@ -765,6 +786,26 @@ def _context_status(cfg: Config) -> tuple[str, bool | None, str]:
     if missing:
         details += f"; not downloaded yet: {', '.join(missing)} (the first run downloads them)"
     return name, (False if missing and cfg.offline and enabled else True if enabled else None), details
+
+
+def _voice_status(cfg: Config) -> tuple[str, bool | None, str]:
+    """doctor's row for voice replacement (DESIGN.md §16): its extra and its models."""
+    from importlib.util import find_spec
+
+    name = "voice replacement"
+    missing = [m for m in ("torch", "torchaudio", "f5_tts", "demucs", "speechbrain") if find_spec(m) is None]
+    enabled = cfg.replace.enabled
+    if missing:
+        if not enabled:
+            return name, None, "off; optional: pip install 'video-beep-remover[voice]', then --replace"
+        return (
+            name,
+            False,
+            f"replace.enabled, but {', '.join(missing)} missing: pip install 'video-beep-remover[voice]'",
+        )
+    details = f"{'on' if enabled else 'off (--replace turns it on)'}; voice model {cfg.replace.model}"
+    details += f", separation {cfg.replace.separation}; the voice model's weights are non-commercial"
+    return name, True if enabled else None, details
 
 
 def _opensubtitles_status(cfg: Config) -> tuple[str, bool | None, str]:

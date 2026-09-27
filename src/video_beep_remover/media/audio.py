@@ -1,6 +1,7 @@
 """Decode audio for speech recognition: 16 kHz mono float32 on the media timeline (DESIGN.md §6.2)."""
 
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -8,6 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
+from video_beep_remover.media.probe import StreamInfo
 
 SAMPLE_RATE = 16_000
 # Pads a late-starting track with silence so that sample 0 is exactly the requested time.
@@ -32,6 +34,46 @@ def read_window(ff: FFmpeg, path: Path, stream_index: int, start: float, duratio
     """Decode a short window into memory; sample 0 is `start`."""
     data = ff.capture([*_decode_args(path, stream_index, start, duration), "pipe:1"])
     return np.frombuffer(data, dtype=np.float32).copy()
+
+
+def read_pcm_windows(
+    ff: FFmpeg, path: Path, stream: StreamInfo, spans: Sequence[tuple[float, float]]
+) -> list[npt.NDArray[np.float32]]:
+    """Windows of an audio stream (media time) at its own rate, every channel kept: channels × samples.
+    They are cut by sample count in one pass from the stream's start, stopping after the last one:
+    seeking lands a few samples off in containers with coarse timestamps such as Matroska, and voice
+    replacement subtracts the old voice sample-exactly (DESIGN.md §16). The renderer counts samples the
+    same way."""
+    rate, channels = stream.sample_rate or 48_000, stream.channels or 1
+    offset = stream.start_time or 0.0
+    ranges = [(max(0, round((a - offset) * rate)), max(0, round((b - offset) * rate))) for a, b in spans]
+    windows = [np.zeros((channels, max(0, b - a)), dtype=np.float32) for a, b in ranges]
+    last = max((b for _, b in ranges), default=0)
+    command = [
+        ff.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", file_arg(path),
+        "-map", f"0:{stream.index}", "-f", "f32le", "pipe:1",
+    ]  # fmt: skip
+    frame = 4 * channels
+    position = 0  # samples read so far
+    pending = b""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        assert process.stdout is not None
+        try:
+            while position < last:
+                data = pending + process.stdout.read(frame * rate)
+                if len(data) < frame:
+                    break
+                whole = len(data) // frame * frame
+                block = np.frombuffer(data[:whole], dtype=np.float32).reshape(-1, channels).T
+                pending = data[whole:]
+                for (a, b), window in zip(ranges, windows, strict=True):
+                    first, stop = max(a, position), min(b, position + block.shape[1])
+                    if first < stop:
+                        window[:, first - a : stop - a] = block[:, first - position : stop - position]
+                position += block.shape[1]
+        finally:
+            process.kill()  # the rest of the track is not needed
+    return windows
 
 
 def decode_track(

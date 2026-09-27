@@ -45,6 +45,8 @@ dependencies = [
 gpu = ["nvidia-cublas-cu12; sys_platform == 'linux'", "nvidia-cudnn-cu12==9.*; sys_platform == 'linux'"]
 align = ["whisperx>=3.8.1"]  # transcription.backend = "whisperx": forced alignment, with PyTorch
 context = ["torch>=2.2", "transformers>=4.56"]  # context analysis (DESIGN.md §17): local classifier and judge
+# voice replacement (DESIGN.md §16): F5-TTS (its weights are CC BY-NC 4.0), Demucs and SpeechBrain
+voice = ["torch>=2.2", "torchaudio>=2.2", "f5-tts>=1.1", "demucs>=4.0", "speechbrain>=1.0"]
 sync = ["ffsubsync>=0.4.25"]  # re-times subtitles that fail the sync check
 dev = [
   "hypothesis>=6",
@@ -102,5 +104,8 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["faster_whisper.*", "ctranslate2.*", "whisperx.*", "nltk.*", "torch.*", "torchaudio.*", "transformers.*"]
+module = [
+  "faster_whisper.*", "ctranslate2.*", "whisperx.*", "nltk.*", "torch.*", "torchaudio.*", "transformers.*",
+  "demucs.*", "f5_tts.*", "speechbrain.*",
+]
 ignore_missing_imports = true

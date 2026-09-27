@@ -77,6 +77,8 @@ $ vbr clean "The Movie (2019).mkv"
 | `--language CODE`, `--audio-stream N` | `analysis.language`, `.audio_stream` | |
 | `--dry-run` | n/a | The same as `vbr scan`. |
 | `--report PATH`, `--edl`, `--review-srt` | `output.report`, `output.edl`, `output.review_srt` | |
+| `--context` | `context.enabled` | Context analysis (§17). |
+| `--replace` | `replace.enabled` | Voice replacement (§16); context analysis runs with it. |
 | `--overwrite`, `--skip-existing` | `output.overwrite` | `--skip-existing` is meant for batch runs. |
 | `--keep-temp`, `-v`, `-q` | n/a | Debugging and verbosity. |
 
@@ -218,6 +220,7 @@ src/video_beep_remover/
 ├── context/               # context analysis (§17): lines, rules, classifier and judge, verdicts
 ├── pipeline.py            # per-file stages, strategy fallbacks, report, timings; vbr render
 ├── guided.py              # subtitle-guided analysis: targeted and hybrid (§6.3-6.9)
+├── voice/                 # voice replacement (§16): the sentence, separation, the voice model, the check
 ├── models.py              # dataclasses shared by all stages (§5.3)
 ├── languages.py           # language codes in configs, container tags and file names
 ├── ui.py                  # progress reporting interface
@@ -768,6 +771,11 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - targeted detections must fall within 100 ms of full-mode ones;
   - when WhisperX is installed, the `whisperx` backend must find the same words, never narrower than Whisper's own times.
 - **Context analysis** (§17). Unit tests run the layer with stand-in models, so CI needs no PyTorch. They cover lines, rules, the combination of verdicts, answer parsing and the judge's cache. A pipeline test checks that verdicts reach the report and the review subtitles, and that the muted spans do not change. With the M7 actions on, it checks that a harmless use is kept, that a sexual line is muted from its first heard word to its last, and that `vbr render` keeps the review cues. `scripts/evaluate_context.py` scores the real models on `scripts/data/context_lines.jsonl`, a set of 71 labelled lines, and on `scripts/data/context_crafted.jsonl`, lines crafted to fool them (Appendix D).
+- **Voice replacement** (§16). Unit tests cover the choice of substitute, the sentence and its new text, the dialogue channels and the change. A pipeline test runs it with real FFmpeg and stand-in models: a tone stands in for speech, the stand-in voice model says the word again as a second tone, and the stand-in speech recognition hears that tone as the substitute. It checks that:
+  - the new word replaces the old one in the analysed stream, sample-exactly, and nothing else changes;
+  - a second audio stream, the EDL and `vbr render` mute the span;
+  - a word that fails the check is muted;
+  - a term set to no substitutes is always muted.
 - **Evaluation set.** 20–30 annotated clips across genres, accents, music-heavy scenes and TV and film subtitles. Each clip has ground-truth profanity timestamps. The metrics are:
   - recall (primary)
   - precision
@@ -800,6 +808,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 - `[gpu]`: the CUDA 12 cuBLAS and cuDNN 9 wheels that faster-whisper documents, on Linux. vbr loads them itself (§6.8), so no `LD_LIBRARY_PATH` is needed.
 - `[align]`: whisperx 3.8.1 or later (the first with offline model loading), which brings PyTorch.
 - `[context]`: PyTorch and transformers, for context analysis (§17)
+- `[voice]`: PyTorch, F5-TTS, Demucs and SpeechBrain, for voice replacement (§16)
 - `[sync]`: ffsubsync
 - `[dev]`: pytest, hypothesis, respx, ruff, mypy
 - later, with the subliminal adapter (§6.3): `[providers]`
@@ -837,7 +846,7 @@ M0 to M5 are implemented:
 - M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
 - M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
 
-M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only. Appendix D measures it on 71 labelled lines. M7's actions are implemented, off by default and experimental. They meet their targets on the labelled set and on crafted lines (Appendix D.3), after a defence against prompt injection that the crafted lines showed was needed. Measuring them on real films is still to do.
+M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only. Appendix D measures it on 71 labelled lines. M7's actions are implemented, off by default and experimental. They meet their targets on the labelled set and on crafted lines (Appendix D.3), after a defence against prompt injection that the crafted lines showed was needed. Measuring them on real films is still to do. M8, voice replacement (§16), is implemented, off by default and experimental. On a test clip, a word it replaced passed the check, and every word it could not replace was muted (Appendix E).
 
 ## 14. Alternatives considered
 
@@ -859,6 +868,7 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 - **The `sexual` category** (§17.5) holds phrases of a sexual nature and ships off; context analysis reports the lines they occur in either way.
 - **The judge** (§17.3) runs by default only on an NVIDIA GPU (`context.judge = "auto"`).
 - **Acting on verdicts** (M7) is opt-in and experimental (`context.harmless`, `context.sexual`) until it is measured on real films.
+- **Voice replacement** (M8) uses F5-TTS, whose weights are licensed for non-commercial use, with Demucs and ECAPA (§16). It is opt-in and experimental.
 
 **Still open**
 
@@ -870,28 +880,54 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 6. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
 7. An interactive review UI (`vbr review`, with ffplay previews)?
 8. Which judge model (§17.3)? On the labelled set, Qwen3-4B-Instruct recognizes 10 of 16 harmless uses without calling any profane use harmless, but finds only 3 of the 10 sexual lines it is asked about (Appendix D). A larger or newer model on a GPU may do better; the labelled set decides.
+9. Which voice model (§16)? F5-TTS edits speech in place, but its weights are non-commercial. A permissively licensed model that can edit a word inside a sentence would suit the tool better. Real films decide the quality bar, and whether replacement is worth its speed on a GPU.
 
-## 16. Stretch goal: voice-matched word replacement
+## 16. Voice-matched word replacement (M8, experimental)
 
-Instead of silence, the censored word could be replaced by a different word spoken in the same voice, e.g. "hell" → "heck", so the line still sounds natural. This is future work outside v1. The v1 design keeps what it needs: word-level timings, the JSON report, and a renderer interface that can take a second implementation.
+Instead of silence, a listed word can be replaced by a milder one spoken in the same voice: "That was a damn fine cup of coffee" becomes "That was a darn fine cup of coffee". `--replace` turns it on, as does `[replace] enabled = true`; it needs the `[voice]` extra. It is off by default and experimental: every replaced word is checked, and anything that fails is muted as before.
 
-**How it could work**
+**How it works.** For each word:
 
-1. **Substitution map.** The config maps terms to candidate replacements, e.g. `hell = ["heck"]`, `damn = ["darn"]`. The context layer (§17.6) picks the candidate that fits the line, or none. Words without a fitting replacement are muted as in v1.
-2. **Isolate the dialogue.** The word sits in a mix with music and effects. For 5.1 tracks, work on the centre channel, which carries most dialogue. For stereo, split off a dialogue stem with a source-separation model. Replace the word in that stem, then remix it with the untouched background.
-3. **Voice reference.** Take a few seconds of the same speaker from nearby lines. Speaker diarization (e.g. pyannote) finds lines spoken by the same voice.
-4. **Generate the word.** Use a zero-shot voice-cloning or speech-editing model, for example VoiceCraft (edits words inside an existing utterance), F5-TTS or XTTS-v2. Condition it on the surrounding words so pitch and prosody fit the line.
-5. **Fit and splice.** Time-stretch the generated word to the original word's duration (e.g. with Rubber Band), then splice it in with short crossfades. Splicing needs sample-level editing, so it would use a PCM renderer (decoded audio piped through Python) next to the FFmpeg one. The report gains a per-interval `replacement` field.
-6. **Fallback.** If generation fails, or a check scores it low, mute that word as in v1. The check could compare speaker embeddings and re-run ASR to confirm the new word is heard. Whether to try replacement at all is the mute-or-replace decision of §17.6: never on a sexual line, and not for shouted or whispered words.
+1. **Choice (§17.6).** Context analysis runs with replacement. The use must be `profane`, its line not sexual, and its delivery not shouted, whispered or tearful. The judge then picks one of the term's substitutes from `[replace.substitutes]` (e.g. `"*fuck*" = ["freaking", "frick", "fricking", "fudge"]`). Without a judge, a term with a single substitute uses it. A word whose muted span holds another muted word stays muted.
+2. **The sentence.** The heard words around the word, up to a sentence end or a pause of a second, give the text to say, with the substitute in the word's place and in its case and punctuation. A word only estimated from subtitles has no heard sentence, and stays muted.
+3. **Reading the track.** The sentence's window is read at the stream's own rate with every channel. It is cut by sample count in one pass from the start of the stream, for every word of the file at once. Seeking lands a few samples off in Matroska, whose timestamps are in milliseconds, and the next steps subtract the old voice sample-exactly.
+4. **Isolating the dialogue.** The front-centre channel of a surround track, or the front pair otherwise, goes through Demucs (`htdemucs`), which returns the voice without music and effects.
+5. **Saying it again.** F5-TTS regenerates the word's muted span inside the separated voice. The span's mel frames are masked and filled in from the sentence's text, and the rest of the sentence conditions them. So the new word keeps the speaker's voice, pace and pitch, and the span keeps its length, which keeps lip sync as far as it can.
+6. **The change.** The change is the new voice minus the old, within the span, faded over 20 ms at each edge. It is spread over the dialogue channels as the old voice was. The renderer mixes it into the analysed stream (FFmpeg `amix` after an `adelay` by sample count) and does not mute that span there. The music and effects under the word stay.
+7. **The check.** The window with the change is transcribed again, with the analysis's own model and prompt:
+   - the substitute must be heard in the span, and no listed word;
+   - the new word must sound like the speaker about as much as the old one did. Their ECAPA speaker embeddings are compared with the rest of the sentence's, and the new word's cosine may be at most `voice_margin` (0.15) below the old word's.
 
-**Hard parts.**
+   A word that fails stays muted.
 
-- Separation artefacts in music-heavy scenes.
+**Everywhere else, the span stays muted:** in other audio streams, since the change is made for the analysed stream's layout; in the EDL; and in `vbr render`, which cannot replace words. The report's `intervals` still include the span, and `replacements` lists each attempt:
+
+- the word, the substitute, and whether it was replaced or why not;
+- what was heard in the span afterwards;
+- the two similarities.
+
+Each detection's `context` also gains `substitute` and `substitute_reason`. The review subtitles read `[replaced] damn → darn`.
+
+**Models.** All run locally, and none downloads until replacement is turned on.
+
+| Role | Model | Licence |
+|---|---|---|
+| Voice | F5-TTS `F5TTS_v1_Base` | code MIT, weights CC BY-NC 4.0 |
+| Separation | Demucs `htdemucs` | MIT |
+| Speaker similarity | SpeechBrain ECAPA-TDNN (`speechbrain/spkrec-ecapa-voxceleb`) | Apache-2.0 |
+
+The voice weights' non-commercial licence fits what the feature is for: personal viewing copies. The tool never exports voice models.
+
+**Why F5-TTS.** It edits speech in place (infilling), so the new word is conditioned on the audio around it, not just on a reference clip. Chatterbox (MIT) generates whole sentences only, and pins exact versions of PyTorch and transformers that conflict with the other extras.
+
+**Speed.** On the 4-vCPU container of Appendix E, a word took about 40 s with 32 sampling steps, most of it in F5-TTS; loading the models took another 15 s. A GPU is effectively required for a film.
+
+**Hard parts still open.**
+
+- Separation artefacts in music-heavy scenes, and words said over each other.
 - Lip movements that no longer match the word; fixing that would need video editing.
-- Model size and speed; a GPU is effectively required.
-- Licences: several of the strongest voice models are non-commercial.
-
-Voice cloning should stay local. The tool should never export voice models, and the feature is meant for personal viewing copies.
+- Languages: F5-TTS's base model speaks English and Chinese.
+- Licences: the strongest voice models are non-commercial (open question 9).
 
 ## 17. Context analysis (design iteration)
 
@@ -1015,15 +1051,15 @@ Two layers, as for profanity:
 
 ### 17.6 Mute or replace, and delivery (for §16)
 
-A word is replaced only when all of these hold; otherwise it is muted:
+A word is replaced only when all of these hold; otherwise it is muted (M8 implements them, §16):
 
 1. its `use` is `profane`;
 2. its line is not sexual;
-3. the judge picks one of the substitutes configured for the term (`[replace]`, e.g. `"*fuck*" = ["freaking", "frick"]`) as fitting this sense. For example, "fucking" as an intensifier fits "freaking", while "fuck" as a verb fits nothing;
-4. the delivery is not extreme: a shouted, screamed or whispered word is hard to regenerate convincingly;
+3. the judge picks one of the substitutes configured for the term (`[replace.substitutes]`, e.g. `"*fuck*" = ["freaking", "frick"]`) as fitting this sense. For example, "fucking" as an intensifier fits "freaking", while "fuck" as a verb fits nothing. Without a judge, a term with a single substitute uses it (`damn = ["darn"]`), and a term with several is muted;
+4. the delivery is not extreme: a shouted, whispered or tearful word is hard to regenerate convincingly;
 5. §16's check on the generated audio passes.
 
-The emotion and intensity go to the voice model as a condition, where it accepts one.
+F5-TTS takes no emotion as a condition. The sentence around the word carries its delivery instead, since the voice model fills the word in from it.
 
 ### 17.7 Evaluation
 
@@ -1336,3 +1372,43 @@ Masked, every one of these lines scored below 0.04 for rudeness, so the classifi
 The sexual lines were unaffected: "Let's have sex." stays certain whatever its note says, and the judge ignored a note asking it to flag "I'm going to bed, I'm exhausted.". The lines of D.2 are heard as written, so their numbers do not change.
 
 **Not covered.** Injections that are spoken aloud, since the audio is trusted; and a judge misled by the heard words alone, against which the classifier and the reason check are the only guards.
+
+## Appendix E. Voice replacement: a first run
+
+**Setup.** The same 4-vCPU container, CPU only, with PyTorch 2.8. The models were those of §16: F5-TTS `F5TTS_v1_Base` with 32 sampling steps, Demucs `htdemucs`, and ECAPA-TDNN. Whisper `small.en` did the detection and the check.
+
+The test clip lasts 17 s: stereo AAC in Matroska, with three lines over a soft chord bed. F5-TTS spoke the lines in the voice of its bundled English reference recording, which gave natural-sounding speech with known words:
+
+- "What the hell is going on over there?"
+- "That was a damn fine cup of coffee, detective."
+- "Get the fuck out of my orchard right now."
+
+**Without a judge** (`context.judge = ""`, the default on a CPU), one word was replaced:
+
+| Word | Outcome | Why | Similarity, new / old |
+|---|---|---|---|
+| damn | replaced by "darn" | the only substitute | 0.46 / 0.41 |
+| hell | muted | the use is unsure: "hell" can be harmless, and only the judge can say it is not | – |
+| fuck | muted | several substitutes, and no judge to choose | – |
+
+Whisper heard the output as "That was a darn fine cup of coffee". Replacing the word took 52 s, including about 15 s to load the models.
+
+**With the judge** (Qwen3-4B-Instruct), all three were replaced:
+
+| Word | Substitute, as the judge chose | Similarity, new / old |
+|---|---|---|
+| hell | heck | 0.24 / 0.38 |
+| damn | darn | 0.50 / 0.41 |
+| fuck | freaking | 0.58 / 0.38 |
+
+Whisper `small.en` and `base.en` both heard: "What the heck is going on over there? That was a darn fine cup of coffee, Detective. Get the freaking out of my orchard right now." Neither heard a listed word. The replacements took 171 s for the three words, and the context layer, with the judge, 49 s.
+
+**What it showed.**
+
+1. **It works end to end.** The new words were heard as meant, in place, with the rest of each sentence and the chord bed untouched: the renderer adds only the change, sample-exactly. The pipeline test checks that alignment to within 10⁻⁷.
+2. **The rules hold without a judge.** An ambiguous word is never replaced without the judge's verdict, and neither is a term that has several substitutes.
+3. **The judge's choice can be odd.** "Get the freaking out" is understandable, but "frick" fits better. A stronger judge (open question 8) may choose better.
+4. **The voice check was close for one word.** "heck" passed with 0.006 to spare. Single-word speaker embeddings are noisy, which is why the check compares the new word with the old one rather than with a fixed threshold. Real voices must set `voice_margin`.
+5. **The old word leaves a trace.** In a probe on the same kind of chord bed, Demucs left about 9 % of the voice in the background, so a faint trace of the old word stays under the new one. Whisper did not hear it; a listening test on real films is still to do.
+
+**Not measured here.** Real films, GPU speed, 5.1 tracks, music-heavy scenes, and how natural the words sound to a person: nobody listened, only Whisper.

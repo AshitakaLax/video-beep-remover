@@ -23,7 +23,7 @@ A file without usable subtitles falls back to transcribing the whole soundtrack,
 
 The defaults have been checked on a synthetic evaluation set only (see [Evaluate](#evaluate)); tuning them on real film clips is still to do. Changes are listed in the [changelog](https://github.com/AshitakaLax/video-beep-remover/blob/main/CHANGELOG.md).
 
-A first version of context analysis (M6 and M7, [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration)) is in: see [Context analysis](#context-analysis-preview). By default it only reports; acting on its verdicts is opt-in and experimental.
+A first version of context analysis (M6 and M7, [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration)) is in: see [Context analysis](#context-analysis-preview). By default it only reports; acting on its verdicts is opt-in and experimental. So is [voice replacement](#voice-replacement-experimental) (M8), which says a milder word in the speaker's voice instead of muting.
 
 ## Install
 
@@ -44,6 +44,7 @@ Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the
 | `align` | [WhisperX](https://github.com/m-bain/whisperX) forced alignment, for tighter word edges (see [Word edges](#word-edges)). It brings PyTorch, a large download. |
 | `sync` | [ffsubsync](https://github.com/smacke/ffsubsync), to re-time subtitles that are badly out of sync. |
 | `context` | PyTorch and transformers, for [context analysis](#context-analysis-preview). On Linux without a GPU, install the CPU build of PyTorch first to save gigabytes. |
+| `voice` | F5-TTS, Demucs and SpeechBrain, for [voice replacement](#voice-replacement-experimental). A large install; F5-TTS's model weights are licensed for non-commercial use only. |
 
 ## Use
 
@@ -72,6 +73,7 @@ Useful options:
 - `--model large-v3-turbo` picks a Whisper model, and `--device cpu` forces the CPU.
 - `--audio-stream N` picks the dialogue track by its ffprobe index.
 - `--review-srt` also writes `.review.srt`: one subtitle per muted span naming the word, to spot-check the result in a player.
+- `--context` adds context analysis to the report ([preview](#context-analysis-preview)), and `--replace` says a milder word instead of muting ([experimental](#voice-replacement-experimental)).
 - `--overwrite` or `--skip-existing` decide what happens when outputs already exist.
 
 Run `vbr clean --help` for everything.
@@ -129,6 +131,25 @@ $ vbr scan movie.mkv --context --review-srt
   Both are measured only on a small labelled set so far, so vbr warns when they are on. Check what they did in the review subtitles (`--review-srt`): `[kept] hell (probably harmless: place)`, `[muted] sexual line (…)`.
 
 On a labelled set of 71 lines, with the judge, it recognized 10 of 16 harmless uses and called no profane use harmless. It flagged explicit lines, but found little innuendo. [Appendix D of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-d-context-analysis-measurements) has the numbers, and `scripts/evaluate_context.py` measures your own lines (see [Evaluate](#evaluate)).
+
+## Voice replacement (experimental)
+
+`--replace` says a milder word in place of a listed one, in the speaker's own voice, instead of muting it: "That was a damn fine cup of coffee" becomes "That was a darn fine cup of coffee".
+
+```console
+$ pipx install --force "video-beep-remover[voice]"
+$ vbr clean movie.mkv --replace --review-srt
+```
+
+For each word:
+
+1. **Is there a fitting substitute?** Context analysis runs with it. The use must be profane (so an ambiguous word needs the judge), its line not sexual, and the word not shouted or whispered. The substitutes come from `[replace.substitutes]` in the config, such as `hell = ["heck"]` or `"*fuck*" = ["freaking", "frick", "fricking", "fudge"]`. The judge picks one, or, without a judge, a term with a single substitute uses it.
+2. **Say it again.** The dialogue is separated from music and effects ([Demucs](https://github.com/adefossez/demucs)). Then [F5-TTS](https://github.com/SWivid/F5-TTS) speaks the word's span again inside the sentence, which keeps the voice, pace and timing. The music and effects under the word stay.
+3. **Check it.** Whisper must hear the substitute, and no listed word; the new word must sound like the speaker about as much as the old one did. Anything that fails is muted as usual.
+
+The span stays muted in other audio tracks, in the EDL and in `vbr render`. The review subtitles show `[replaced] damn → darn`, and the report lists every attempt with its outcome.
+
+It is experimental and slow on a CPU: about 40 s a word, so a GPU is effectively required for a film. F5-TTS's model weights are licensed for non-commercial use only: this is for personal viewing copies. Everything runs locally.
 
 ## Online subtitles
 

@@ -46,5 +46,11 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 - A `sexual` word category of phrases of a sexual nature, off by default.
 - `scripts/evaluate_context.py`, a labelled set of 71 lines and a set of crafted lines, to measure the context layer.
 
+### Voice replacement (experimental)
+
+- `--replace` (`[voice]` extra) says a milder word in the speaker's voice instead of muting, where a substitute from `[replace.substitutes]` fits: "damn" becomes "darn". F5-TTS says the word again inside its sentence, over the dialogue that Demucs separates from the music and effects.
+- Every replaced word is checked: Whisper must hear the substitute and no listed word, and it must sound like the speaker. Anything else is muted as before. The span stays muted in other audio tracks, the EDL and `vbr render`.
+- F5-TTS's model weights are licensed for non-commercial use only.
+
 [Unreleased]: https://github.com/AshitakaLax/video-beep-remover/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/AshitakaLax/video-beep-remover/releases/tag/v0.1.0
