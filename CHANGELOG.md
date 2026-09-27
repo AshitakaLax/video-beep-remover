@@ -4,6 +4,15 @@ All notable changes to video-beep-remover. The format follows [Keep a Changelog]
 
 ## [Unreleased]
 
+### Added
+
+- Context analysis, report-only (`--context`, `[context]` extra, DESIGN.md §17):
+  - local models judge whether each ambiguous listed word is used harmlessly;
+  - lines that look sexual are listed, with their evidence;
+  - the verdicts go into the report and the review subtitles, and never change what is muted.
+- A `sexual` word category of phrases of a sexual nature, off by default.
+- `scripts/evaluate_context.py` and a labelled set of 71 lines, to measure the context layer.
+
 ## [0.1.0]
 
 The first release: the complete v1 of [the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md).

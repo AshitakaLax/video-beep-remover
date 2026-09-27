@@ -1,7 +1,11 @@
+import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import httpx
+import pytest
 import respx
 from typer.testing import CliRunner
 
@@ -112,6 +116,47 @@ def test_doctor_checks_the_opensubtitles_key(tmp_path: Path) -> None:
     assert ok is False and "rejected" in details
 
 
+def test_context_flag_turns_the_layer_on() -> None:
+    from video_beep_remover.cli import _overrides
+
+    assert _overrides(context=True) == {"context.enabled": True}
+    assert _overrides(context=False) == {}
+
+
+def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    from video_beep_remover.cli import _context_status
+
+    installed = {"torch": False, "transformers": False}
+    real = importlib.util.find_spec
+
+    def find_spec(name: str, *rest: Any) -> Any:
+        return (object() if installed[name] else None) if name in installed else real(name, *rest)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    downloaded: set[str] = set()
+    hub = SimpleNamespace(try_to_load_from_cache=lambda repo, name: "x" if repo in downloaded else None)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    cpu = {"transcription.device": "cpu"}
+    on = {**cpu, "context.enabled": True}
+
+    assert _context_status(_config(tmp_path, **cpu))[1] is None  # off, and not installed: nothing wrong
+    ok, details = _context_status(_config(tmp_path, **on))[1:]
+    assert ok is False and "video-beep-remover[context]" in details
+
+    installed.update(torch=True, transformers=True)
+    ok, details = _context_status(_config(tmp_path, **on))[1:]
+    assert ok is True and "no judge (no GPU)" in details
+    assert "not downloaded yet: unitary/unbiased-toxic-roberta" in details
+    judged = {**on, "context.judge": "Qwen/Qwen3-4B-Instruct-2507", "offline": True}
+    ok, details = _context_status(_config(tmp_path, **judged))[1:]
+    assert ok is False and "judge Qwen/Qwen3-4B-Instruct-2507" in details  # offline, nothing downloaded
+    downloaded.update({"unitary/unbiased-toxic-roberta", "Qwen/Qwen3-4B-Instruct-2507"})
+    ok, details = _context_status(_config(tmp_path, **judged))[1:]
+    assert ok is True and "not downloaded" not in details
+
+
 def test_cache_info_and_clear(tmp_path: Path) -> None:
     config = tmp_path / "vbr.toml"
     config.write_text(f'[cache]\ndir = "{(tmp_path / "c").as_posix()}"\n', "utf-8")
@@ -122,9 +167,12 @@ def test_cache_info_and_clear(tmp_path: Path) -> None:
     SubtitleCache(tmp_path / "c").store(5, b"x" * 2048)
     store = TranscriptCache(tmp_path / "c").store("abc-1", 1, "small.en", "k", 60.0)
     store.add_window(1.0, 5.0, Transcript(1.0, 5.0, (Word("hi", 2.0, 2.2),)))
+    (tmp_path / "c" / "context").mkdir()
+    (tmp_path / "c" / "context" / "judge-v1.jsonl").write_text('{"key": "k", "answer": "{}"}\n', "utf-8")
     info = runner.invoke(app, ["cache", "info", "-c", str(config)])
     assert info.exit_code == 0 and "subtitles: 1 files, 2 KiB" in info.output
     assert "transcripts: 1 files, 0.0 MiB of at most 5 GB" in info.output
+    assert "context judge answers: 1 files" in info.output
     only = runner.invoke(app, ["cache", "clear", "--transcripts", "-c", str(config)])
     assert (
         only.exit_code == 0 and "removed 1 transcript files" in only.output and "subtitle" not in only.output
@@ -132,3 +180,5 @@ def test_cache_info_and_clear(tmp_path: Path) -> None:
     cleared = runner.invoke(app, ["cache", "clear", "-c", str(config)])
     assert cleared.exit_code == 0 and "removed 1 downloaded subtitle files" in cleared.output
     assert "removed 0 transcript files" in cleared.output
+    assert "removed 1 files of context judge answers" in cleared.output
+    assert not list((tmp_path / "c" / "context").glob("*.jsonl"))

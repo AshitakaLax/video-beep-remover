@@ -1,0 +1,71 @@
+{"text": "The road to hell is paved with good intentions.", "term": "hell", "use": "harmless"}
+{"text": "In the painting, hell is shown as a lake of fire.", "term": "hell", "use": "harmless"}
+{"text": "Dante wrote about the nine circles of hell.", "term": "hell", "use": "harmless"}
+{"text": "The preacher spoke of heaven and hell for an hour.", "term": "hell", "use": "harmless"}
+{"text": "Go to hell!", "term": "hell", "use": "profane"}
+{"text": "What the hell are you doing?", "term": "hell", "use": "profane"}
+{"text": "Hell, I don't know.", "term": "hell", "use": "profane"}
+{"text": "Get the hell out of my house!", "term": "hell", "use": "profane"}
+{"text": "Like hell I will.", "term": "hell", "use": "profane"}
+{"text": "The souls of the damned cried out in the dark.", "term": "damned", "use": "harmless"}
+{"text": "The damned shall never see paradise, said the priest.", "term": "damned", "use": "harmless"}
+{"text": "Well, I'll be damned!", "term": "damned", "use": "profane"}
+{"text": "That damned dog ate my shoes again.", "term": "damned", "use": "profane"}
+{"text": "The farmer loaded his ass with firewood.", "term": "ass", "use": "harmless"}
+{"text": "Balaam's ass spoke to him on the road.", "term": "ass", "use": "harmless"}
+{"text": "He rode into Jerusalem on an ass.", "term": "ass", "use": "harmless"}
+{"text": "Get your ass over here.", "term": "ass", "use": "profane"}
+{"text": "Don't be such an ass.", "term": "ass", "use": "profane"}
+{"text": "Kiss my ass, Harold.", "term": "ass", "use": "profane"}
+{"text": "The old jackass brayed all night in the barn.", "term": "jackass*", "word": "jackass", "use": "harmless"}
+{"text": "You stupid jackass!", "term": "jackass*", "word": "jackass", "use": "profane"}
+{"text": "The bitch had a litter of six puppies.", "term": "bitch*", "word": "bitch", "use": "harmless"}
+{"text": "Our champion bitch won best in show.", "term": "bitch*", "word": "bitch", "use": "harmless"}
+{"text": "You lying bitch!", "term": "bitch*", "word": "bitch", "use": "profane"}
+{"text": "Life's a bitch, and then you die.", "term": "bitch*", "word": "bitch", "use": "profane"}
+{"text": "He was a bastard, the old king's unacknowledged son.", "term": "bastard*", "word": "bastard", "use": "harmless"}
+{"text": "Under the old law, a bastard could not inherit the title.", "term": "bastard*", "word": "bastard", "use": "harmless"}
+{"text": "You rotten bastard!", "term": "bastard*", "word": "bastard", "use": "profane"}
+{"text": "That bastard stole my car.", "term": "bastard*", "word": "bastard", "use": "profane"}
+{"text": "Jesus Christ is risen today.", "term": "jesus christ", "word": "Jesus Christ", "use": "harmless"}
+{"text": "We pray in the name of Jesus Christ.", "term": "jesus christ", "word": "Jesus Christ", "use": "harmless"}
+{"text": "Jesus Christ, what a mess!", "term": "jesus christ", "word": "Jesus Christ", "use": "profane"}
+{"text": "Jesus Christ, you scared me half to death!", "term": "jesus christ", "word": "Jesus Christ", "use": "profane"}
+{"text": "Did you sleep with him?", "sexual": true}
+{"text": "She slept with her boss to get the promotion.", "sexual": true}
+{"text": "I'm not going to sleep with you.", "sexual": true}
+{"text": "I sleep with the window open in summer.", "sexual": false}
+{"text": "The kids slept with the lights on.", "sexual": false}
+{"text": "He still sleeps with a teddy bear.", "sexual": false}
+{"text": "They hooked up after the party.", "sexual": true}
+{"text": "Can you hook up the printer for me?", "sexual": false}
+{"text": "Hook up the trailer before it gets dark.", "sexual": false}
+{"text": "He went down on one knee and proposed.", "sexual": false}
+{"text": "Take off your clothes and get into bed with me.", "sexual": true}
+{"text": "Take off your clothes, they're soaking wet.", "sexual": false}
+{"text": "Let's have sex.", "sexual": true}
+{"text": "We made love all night.", "sexual": true}
+{"text": "I want to take you to bed tonight.", "sexual": true}
+{"text": "She wants to see my etchings, if you know what I mean.", "sexual": true}
+{"text": "Why don't you come upstairs and see my bedroom?", "sexual": true}
+{"text": "Your place or mine?", "sexual": true}
+{"text": "Let's get naked.", "sexual": true}
+{"text": "He's an animal in bed.", "sexual": true}
+{"text": "Stay the night with me.", "sexual": true}
+{"text": "Take it off. All of it.", "sexual": true}
+{"text": "She lost her virginity at the lake house.", "sexual": true}
+{"text": "", "sounds": ["moaning"], "sexual": true}
+{"text": "", "sounds": ["panting and moaning"], "sexual": true}
+{"text": "", "sounds": ["bedsprings creaking"], "sexual": true}
+{"text": "The cat sat on the mat.", "sexual": false}
+{"text": "We should get dinner sometime.", "sexual": false}
+{"text": "Take off your coat and stay a while.", "sexual": false}
+{"text": "I'm going to bed, I'm exhausted.", "sexual": false}
+{"text": "Come upstairs, dinner's ready!", "sexual": false}
+{"text": "The stars are visible to the naked eye.", "sexual": false}
+{"text": "She kissed her grandmother goodbye at the station.", "sexual": false}
+{"text": "My grandfather was a lover of old books.", "sexual": false}
+{"text": "Stay the night, the roads are flooded.", "sexual": false}
+{"text": "", "sounds": ["door slams"], "sexual": false}
+{"text": "", "sounds": ["laughing"], "sexual": false}
+{"text": "", "sounds": ["panting after running"], "sexual": false}

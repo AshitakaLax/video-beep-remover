@@ -154,7 +154,7 @@ def test_phrases_never_span_separate_windows() -> None:
     windows = [Window(0.0, 10.0), Window(20.0, 30.0)]
     transcripts = [words(("son", 8, 8.2), ("of", 8.3, 8.4), ("a", 8.5, 8.6)), words(("bitch", 21, 21.3))]
     detections, heard = detect_in_windows(LEXICON, windows, transcripts, duration=100.0)
-    assert detections == [] and heard == 4
+    assert detections == [] and [w.text for w in heard] == ["son", "of", "a", "bitch"]
 
 
 def detection(start: float, end: float, term: str = "hell", confidence: float = 0.9) -> Detection:

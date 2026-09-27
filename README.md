@@ -23,7 +23,7 @@ A file without usable subtitles falls back to transcribing the whole soundtrack,
 
 The defaults have been checked on a synthetic evaluation set only (see [Evaluate](#evaluate)); tuning them on real film clips is still to do. Changes are listed in the [changelog](https://github.com/AshitakaLax/video-beep-remover/blob/main/CHANGELOG.md).
 
-Next is context analysis, designed in [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration). Local models would read the dialogue around each listed word to tell harmless uses from profane ones, flag sexual lines with or without listed words, and prepare the choices voice replacement needs. At first, their verdicts go only into the report.
+A first version of context analysis (M6, [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration)) is in: see [Context analysis](#context-analysis-preview). It is report-only for now.
 
 ## Install
 
@@ -43,6 +43,7 @@ Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the
 | `gpu` | The cuBLAS and cuDNN libraries that Whisper needs on NVIDIA GPUs, on Linux. vbr loads them itself, so there is no `LD_LIBRARY_PATH` to set. The NVIDIA driver is still needed. |
 | `align` | [WhisperX](https://github.com/m-bain/whisperX) forced alignment, for tighter word edges (see [Word edges](#word-edges)). It brings PyTorch, a large download. |
 | `sync` | [ffsubsync](https://github.com/smacke/ffsubsync), to re-time subtitles that are badly out of sync. |
+| `context` | PyTorch and transformers, for [context analysis](#context-analysis-preview). On Linux without a GPU, install the CPU build of PyTorch first to save gigabytes. |
 
 ## Use
 
@@ -101,6 +102,29 @@ Whisper's word times are approximate, so each muted span is padded: 120 ms befor
 - **WhisperX** (`transcription.backend = "whisperx"`, with the `align` extra). After Whisper transcribes, a wav2vec2 model aligns each word to the audio. On the evaluation set, word ends then came within 50 ms of the truth, where Whisper's came up to 230 ms early. Aligned starts came up to 200 ms late, though, so vbr keeps the earlier of the two starts and the later of the two ends: alignment only ever widens a word. With the default padding, that mutes a little more around each word. `pad_after_ms = 120` still fully muted every word the default did. On a CPU, `hybrid` took 18 % longer, plus a few seconds to load PyTorch. English, French, German, Spanish, Italian and 36 more languages have an alignment model; for others, name one with `transcription.align_model`.
 - **Edge refinement** (`censor.refine_edges = true`). Each edge of a muted span moves outward, by up to 80 ms, to the quietest 10 ms nearby, so a fade doesn't cut a syllable in half. On the evaluation set it made no difference with the default padding. With `pad_after_ms = 120`, it raised the share of fully muted words from 69 % to 88 %.
 
+## Context analysis (preview)
+
+`--context` asks local models to read the dialogue around each listed word, and the whole script, and adds their verdicts to the report and the review subtitles. **It never changes what is muted**; the verdicts are there for you to check, and for later versions to act on once they are measured.
+
+```console
+$ pipx install --force "video-beep-remover[context]"   # adds PyTorch and transformers
+$ vbr scan movie.mkv --context --review-srt
+```
+
+- **Harmless uses.** Each listed word gets a verdict: `profane`, `harmless` (e.g. "the road to hell", a farmer's ass) or `unsure`. Only words listed in `context.ambiguous` are checked; the rest are profane by definition. A use is called harmless only when a small language model (the *judge*) says so *and* a toxicity classifier finds the line clean. Anything unsure counts as profane.
+- **Sexual lines.** Lines that look sexual are listed, with their evidence:
+  - a classifier score for explicit lines;
+  - phrases from the `sexual` word category, such as "have sex" and "sleep with";
+  - SDH sound descriptions such as `[moaning]`;
+  - the judge, for innuendo.
+
+  Phrases with an innocent sense too ("hook up the printer") only make a line *possibly* sexual on their own.
+- **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
+- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU, where it needs about 8 GB of memory next to Whisper's. On a CPU it takes about 28 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless.
+- **Privacy.** Everything runs locally, and the models download once.
+
+`scripts/evaluate_context.py` measures it on labelled lines (see [Evaluate](#evaluate)); [Appendix D of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-d-context-analysis-a-first-test) has the first numbers.
+
 ## Online subtitles
 
 OpenSubtitles.com is searched only when no local subtitles are usable. It needs your own free API key: create an account on [opensubtitles.com](https://www.opensubtitles.com), register an API consumer, and put the key in the environment:
@@ -153,6 +177,8 @@ $ python scripts/evaluate.py /tmp/vbr-eval --set censor.pad_after_ms=200 --cache
 ```
 
 Synthetic speech is far cleaner than a film's soundtrack, so this set catches regressions and systematic effects but can't tune the defaults for real films. On it, every strategy mutes every word it detects, with no false positives; `hybrid` fully mutes 94 % of the listed words, and what it misses are words the subtitles softened into ordinary words. It also showed that Whisper places word ends up to 230 ms early, which is why `censor.pad_after_ms` is 200. Details are in [Appendix C of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-c-evaluation-on-the-synthetic-set).
+
+`scripts/evaluate_context.py` scores [context analysis](#context-analysis-preview) on labelled lines, such as the 71 in `scripts/data/context_lines.jsonl` (the script's docstring has the format). It reports how many harmless uses are recognized, whether a profane use is ever called harmless, and how many sexual lines are flagged. `--no-judge` runs the rules and the classifier alone.
 
 ## License
 

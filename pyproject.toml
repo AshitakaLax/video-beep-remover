@@ -44,6 +44,7 @@ dependencies = [
 # cuBLAS for CUDA 12 and cuDNN 9, which faster-whisper needs on NVIDIA GPUs; vbr loads them itself
 gpu = ["nvidia-cublas-cu12; sys_platform == 'linux'", "nvidia-cudnn-cu12==9.*; sys_platform == 'linux'"]
 align = ["whisperx>=3.8.1"]  # transcription.backend = "whisperx": forced alignment, with PyTorch
+context = ["torch>=2.2", "transformers>=4.56"]  # context analysis (DESIGN.md §17): local classifier and judge
 sync = ["ffsubsync>=0.4.25"]  # re-times subtitles that fail the sync check
 dev = [
   "hypothesis>=6",
@@ -101,5 +102,5 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["faster_whisper.*", "ctranslate2.*", "whisperx.*", "nltk.*", "torch.*", "torchaudio.*"]
+module = ["faster_whisper.*", "ctranslate2.*", "whisperx.*", "nltk.*", "torch.*", "torchaudio.*", "transformers.*"]
 ignore_missing_imports = true

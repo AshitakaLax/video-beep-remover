@@ -17,11 +17,22 @@ from video_beep_remover.asr.cache import TranscriptCache, TranscriptStore, setti
 from video_beep_remover.asr.faster_whisper import (
     FasterWhisperTranscriber,
     ModelChoice,
+    cuda_available,
     resolve_anchor_model,
     resolve_model,
 )
 from video_beep_remover.asr.vad import Regions, SpeechDetector, silero_speech
 from video_beep_remover.config.loader import LoadedConfig, cache_root, config_hash
+from video_beep_remover.context import (
+    ContextLayer,
+    ModelFactory,
+    build_lines,
+    check_installed,
+    review_cues,
+    review_notes,
+    verdict_dict,
+    word_lines,
+)
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.detect.matcher import detect_in_words
@@ -40,14 +51,14 @@ from video_beep_remover.media.dialogue import same_dialogue
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import MediaInfo, StreamInfo, probe, select_audio_stream
 from video_beep_remover.media.render import CENSORED_TAG, RenderResult, StreamPlan, plan_streams, render
-from video_beep_remover.models import CensorInterval, Detection
+from video_beep_remover.models import CensorInterval, Detection, Word
 from video_beep_remover.report import (
     SCHEMA_VERSION,
     detection_dict,
     edl_text,
     interval_dict,
     read_report,
-    report_detections,
+    report_detection_items,
     report_intervals,
     review_srt,
     write_json,
@@ -58,6 +69,7 @@ from video_beep_remover.subtitles.online import OnlineSubtitles
 from video_beep_remover.subtitles.opensubtitles import OpenSubtitlesClient
 from video_beep_remover.subtitles.oshash import fingerprint, opensubtitles_hash
 from video_beep_remover.subtitles.output import censor_streams, write_censored_copy
+from video_beep_remover.subtitles.parse import parse_sounds
 from video_beep_remover.ui import UI, NullUI, Progress
 
 __all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOptions", "resolve_output"]
@@ -103,6 +115,8 @@ class Analysis:
     model: ModelChoice | None
     report: dict[str, Any]  # strategy-specific report sections
     from_cache: Literal["all", "some", "none"] | None = None  # transcripts; None: nothing to transcribe
+    subtitles: guided_analysis.SubtitleChoice | None = None  # the subtitles that guided the search
+    heard: list[Word] = field(default_factory=list)  # the words heard, in time order
 
 
 @dataclass
@@ -125,6 +139,8 @@ class Job:
     detections: list[Detection] = field(default_factory=list)
     subtitle: dict[str, Any] | None = None  # the report's "subtitle": what the analysis used
     report: dict[str, Any] | None = None  # None: no report is written (vbr render)
+    context: dict[str, Any] | None = None  # the report's "context" section (DESIGN.md §17)
+    verdicts: list[dict[str, Any] | None] = field(default_factory=list)  # one per detection
     render: bool = False
     rendered: RenderResult | None = None
     timings: dict[str, float] = field(default_factory=dict)
@@ -160,6 +176,11 @@ def _report_path(options: RunOptions, source: Path, output: Path | None, many: b
         return options.report
     base = output or source
     return base.with_name(f"{base.stem}.vbr.json")
+
+
+def _context_device(setting: str) -> str:
+    """The device the context models run on: transcription.device's."""
+    return ("cuda" if cuda_available() else "cpu") if setting == "auto" else setting
 
 
 class _Track:
@@ -209,6 +230,7 @@ class Pipeline:
         transcriber_factory: TranscriberFactory | None = None,
         speech_detector: SpeechDetector | None = None,
         opensubtitles: OpenSubtitlesClient | None = None,
+        context_models: tuple[ModelFactory, ModelFactory] | None = None,
     ) -> None:
         self.config = loaded.config
         self.ui: UI = ui or NullUI()
@@ -227,6 +249,8 @@ class Pipeline:
         self.tag = f"{__version__};{config_hash(self.config)}"  # VBR_CENSORED on every output
         self.transcript_cache = TranscriptCache(cache_root(self.config))
         self._scope: _CacheScope | None = None  # the file being analysed, for the transcript cache
+        self._context_models = context_models  # (classifier, judge) factories, for tests
+        self._context: ContextLayer | None = None
 
     def opensubtitles(self) -> OpenSubtitlesClient | None:
         """The OpenSubtitles client, when there is a key and the network may be used. One client
@@ -354,6 +378,7 @@ class Pipeline:
             self.model_choice("full"),
             report,
             "all" if cached else "none",
+            heard=list(words),
         )
 
     def _track_speech(self, track: _Track, audio: Audio | None) -> Callable[[Progress], Regions]:
@@ -421,7 +446,17 @@ class Pipeline:
         from_cache: Literal["all", "some", "none"] | None = None
         if total:
             from_cache = "all" if cached == total else "some" if cached or partly else "none"
-        return Analysis(requested, None, found.detections, found.words, found.model, found.report, from_cache)
+        return Analysis(
+            requested,
+            None,
+            found.detections,
+            found.words,
+            found.model,
+            found.report,
+            from_cache,
+            found.subtitles,
+            found.heard,
+        )
 
     def process(
         self, source: Path, options: RunOptions, *, many: bool = False, from_folder: bool = False
@@ -451,6 +486,8 @@ class Pipeline:
         started = time.monotonic()
         if options.subtitles is not None and not options.subtitles.is_file():
             raise UsageError(f"subtitle file not found: {options.subtitles}")
+        if cfg.context.enabled and self._context_models is None:
+            check_installed()  # the layer runs last: fail before the transcription, not after it
         output = None
         if not options.dry_run:
             checked = self._check_output(source, options, many)
@@ -533,6 +570,8 @@ class Pipeline:
             + (f" ({heard} heard, {estimated} from subtitles only)" if estimated else "")
             + f" → {len(intervals)} spans to mute"
         )
+        if cfg.context.enabled:
+            self._run_context(job, analysis, detections)
 
         model = analysis.model
         job.report = {
@@ -567,8 +606,12 @@ class Pipeline:
                 "from_cache": analysis.from_cache,
             },
             "categories": list(self.lexicon.categories),
-            "detections": [detection_dict(d) for d in detections],
+            "detections": [
+                detection_dict(d) | ({"context": v} if v is not None else {})
+                for d, v in zip(detections, job.verdicts or [None] * len(detections), strict=True)
+            ],
             "intervals": [interval_dict(i) for i in intervals],
+            **({"context": job.context} if job.context is not None else {}),
             "output": None,
             "timings": job.timings,
         }
@@ -713,7 +756,9 @@ class Pipeline:
             else:
                 spans = rendered.intervals if rendered else job.intervals
                 shift = rendered.timeline_shift if rendered else 0.0
-                write_text(review, review_srt(spans, job.detections, shift=shift))
+                notes = review_notes(job.verdicts)
+                extra = review_cues(job.context)
+                write_text(review, review_srt(spans, job.detections, shift=shift, notes=notes, extra=extra))
                 result.review = review
 
     def discard(self, job: Job) -> None:
@@ -725,6 +770,50 @@ class Pipeline:
             ui.info(f"kept temporary files in {job.workdir}")
         else:
             shutil.rmtree(job.workdir, ignore_errors=True)
+
+    def context_layer(self) -> ContextLayer:
+        """The context layer (DESIGN.md §17), created once: its models serve every file of a batch."""
+        if self._context is None:
+            device = _context_device(self.config.transcription.device)
+            classifier, judge = self._context_models or (None, None)
+            self._context = ContextLayer(
+                self.config,
+                device=device,
+                cache_dir=cache_root(self.config) / "context",
+                classifier_factory=classifier,
+                judge_factory=judge,
+            )
+        return self._context
+
+    def _run_context(self, job: Job, analysis: Analysis, detections: list[Detection]) -> None:
+        """Context verdicts for the report and the review subtitles; what is muted does not change."""
+        chosen = analysis.subtitles
+        if chosen is not None:
+            try:
+                sounds = parse_sounds(chosen.text, fps=job.info.frame_rate)
+            except SubtitleError:
+                sounds = []
+            lines = build_lines(chosen.cues, sounds, chosen.sync.model, analysis.heard)
+        else:
+            lines = word_lines(analysis.heard)
+        layer = self.context_layer()
+        with self.ui.status("Reading the dialogue in context"):
+            result, section = layer.run(detections, lines)
+        job.context = section
+        job.verdicts = [verdict_dict(v, result.lines) for v in result.verdicts]
+        counts = section["verdicts"]
+        certain = sum(item["certain"] for item in section["sexual_lines"])
+        self.ui.info(
+            f"Context (report only): {counts['profane']} profane, {counts['harmless']} probably harmless, "
+            f"{counts['unsure']} unsure · {certain} sexual lines"
+            + (
+                f" (+{len(section['sexual_lines']) - certain} possible)"
+                if len(section["sexual_lines"]) > certain
+                else ""
+            )
+            + ("" if layer.judge_name else " · no judge: " + section.get("judge_off", "off"))
+        )
+        job.lap("context")
 
     def render_report(
         self, source: Path, report: Path, options: RunOptions, *, force: bool = False
@@ -753,8 +842,10 @@ class Pipeline:
         ):
             requested = recorded
         stream = select_audio_stream(info, cfg.analysis.language, requested)
-        detections = report_detections(data)
+        items = report_detection_items(data)
+        detections = [detection for detection, _ in items]
         subtitle = data.get("subtitle")
+        context = data.get("context")
         job = Job(
             source=source,
             options=options,
@@ -771,6 +862,8 @@ class Pipeline:
             intervals=intervals,
             detections=detections,
             subtitle=subtitle if isinstance(subtitle, dict) else None,
+            context=context if isinstance(context, dict) else None,
+            verdicts=[v if isinstance(v := item.get("context"), dict) else None for _, item in items],
             render=True,
         )
         self.ui.info(

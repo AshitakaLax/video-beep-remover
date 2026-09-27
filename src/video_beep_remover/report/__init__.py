@@ -26,20 +26,36 @@ def srt_time(seconds: float) -> str:
 
 
 def review_srt(
-    intervals: Sequence[CensorInterval], detections: Sequence[Detection], *, shift: float = 0.0
+    intervals: Sequence[CensorInterval],
+    detections: Sequence[Detection],
+    *,
+    shift: float = 0.0,
+    notes: Sequence[str | None] = (),
+    extra: Sequence[tuple[float, float, str]] = (),
 ) -> str:
     """Subtitles with one cue per muted span, naming what was heard there, to spot-check a cleaned file
-    in a player. `shift` moves every cue (the output's timeline_shift)."""
-    blocks = []
-    for number, interval in enumerate(intervals, 1):
+    in a player. `shift` moves every cue (the output's timeline_shift). `notes` (one per detection) and
+    `extra` cues (start, end, text) carry the context layer's verdicts (DESIGN.md §17.4)."""
+    cues: list[tuple[float, float, str]] = []
+    for interval in intervals:
         heard = [
-            d.heard.strip() + _HOW.get(d.source, "")
-            for d in detections
+            d.heard.strip()
+            + _HOW.get(d.source, "")
+            + (f" ({notes[i]})" if i < len(notes) and notes[i] else "")
+            for i, d in enumerate(detections)
             if d.start < interval.end and interval.start < d.end
         ]
-        text = "[muted] " + ", ".join(dict.fromkeys(heard)) if heard else "[muted]"
-        start, end = srt_time(interval.start + shift), srt_time(interval.end + shift)
-        blocks.append(f"{number}\n{start} --> {end}\n{text}\n")
+        cues.append(
+            (
+                interval.start,
+                interval.end,
+                "[muted] " + ", ".join(dict.fromkeys(heard)) if heard else "[muted]",
+            )
+        )
+    cues += extra
+    blocks = []
+    for number, (start, end, text) in enumerate(sorted(cues, key=lambda c: (c[0], c[1])), 1):
+        blocks.append(f"{number}\n{srt_time(start + shift)} --> {srt_time(end + shift)}\n{text}\n")
     return "\n".join(blocks)
 
 
@@ -104,23 +120,27 @@ def report_intervals(data: dict[str, Any]) -> list[CensorInterval]:
 
 def report_detections(data: dict[str, Any]) -> list[Detection]:
     """The report's `detections`, as far as they are readable; they only label the review SRT."""
+    return [detection for detection, _ in report_detection_items(data)]
+
+
+def report_detection_items(data: dict[str, Any]) -> list[tuple[Detection, dict[str, Any]]]:
+    """The readable detections of a report, each with its entry (which may hold a context verdict)."""
     found = []
     for item in data.get("detections") or []:
         try:
             source = item.get("source")
             cue = item.get("cue")
-            found.append(
-                Detection(
-                    start=float(item["start"]),
-                    end=float(item["end"]),
-                    heard=str(item.get("heard") or ""),
-                    term=str(item.get("term") or ""),
-                    category=str(item.get("category") or ""),
-                    confidence=float(item.get("confidence") or 0.0),
-                    source=source if source in ("asr", "estimate", "cue") else "asr",
-                    cue=cue if isinstance(cue, int) else None,
-                )
+            detection = Detection(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                heard=str(item.get("heard") or ""),
+                term=str(item.get("term") or ""),
+                category=str(item.get("category") or ""),
+                confidence=float(item.get("confidence") or 0.0),
+                source=source if source in ("asr", "estimate", "cue") else "asr",
+                cue=cue if isinstance(cue, int) else None,
             )
         except (AttributeError, TypeError, KeyError, ValueError):
             continue
+        found.append((detection, item))
     return found

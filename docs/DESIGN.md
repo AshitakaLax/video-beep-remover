@@ -215,6 +215,7 @@ flowchart TD
 src/video_beep_remover/
 ├── cli.py                 # Typer app → RunOptions
 ├── batch.py               # folders: skipping vbr's outputs, rendering in the background
+├── context/               # context analysis (§17): lines, rules, classifier and judge, verdicts
 ├── pipeline.py            # per-file stages, strategy fallbacks, report, timings; vbr render
 ├── guided.py              # subtitle-guided analysis: targeted and hybrid (§6.3-6.9)
 ├── models.py              # dataclasses shared by all stages (§5.3)
@@ -766,6 +767,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - every strategy must find the words it can hear;
   - targeted detections must fall within 100 ms of full-mode ones;
   - when WhisperX is installed, the `whisperx` backend must find the same words, never narrower than Whisper's own times.
+- **Context analysis** (§17). Unit tests run the layer with stand-in models, so CI needs no PyTorch. They cover lines, rules, the combination of verdicts, answer parsing and the judge's cache. A pipeline test checks that verdicts reach the report and the review subtitles, and that the muted spans do not change. `scripts/evaluate_context.py` scores the real models on `scripts/data/context_lines.jsonl`, a set of 71 labelled lines (Appendix D).
 - **Evaluation set.** 20–30 annotated clips across genres, accents, music-heavy scenes and TV and film subtitles. Each clip has ground-truth profanity timestamps. The metrics are:
   - recall (primary)
   - precision
@@ -797,6 +799,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 
 - `[gpu]`: the CUDA 12 cuBLAS and cuDNN 9 wheels that faster-whisper documents, on Linux. vbr loads them itself (§6.8), so no `LD_LIBRARY_PATH` is needed.
 - `[align]`: whisperx 3.8.1 or later (the first with offline model loading), which brings PyTorch.
+- `[context]`: PyTorch and transformers, for context analysis (§17)
 - `[sync]`: ffsubsync
 - `[dev]`: pytest, hypothesis, respx, ruff, mypy
 - later, with the subliminal adapter (§6.3): `[providers]`
@@ -834,7 +837,7 @@ M0 to M5 are implemented:
 - M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
 - M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
 
-M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action.
+M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only.
 
 ## 14. Alternatives considered
 
@@ -853,6 +856,8 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 
 - **Default strategy:** `hybrid`. `targeted` remains available when speed matters more than recall (§7).
 - **OpenSubtitles API key:** each user registers their own free key. No key ships with the tool (§6.4).
+- **The `sexual` category** (§17.5) holds phrases of a sexual nature and ships off; context analysis reports the lines they occur in either way.
+- **The judge** (§17.3) runs by default only on an NVIDIA GPU (`context.judge = "auto"`).
 
 **Still open**
 
@@ -863,8 +868,7 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 5. Lyrics: separate vocals (e.g. with Demucs) before ASR in music-heavy windows?
 6. Default `fade_ms`: 10 ms removes clicks on test tones. The evaluation set should confirm it is inaudible on real speech.
 7. An interactive review UI (`vbr review`, with ffplay previews)?
-8. The `sexual` category (§17.5): which terms, and should it be on by default? Explicit terms are as clear-cut as the `strong` category, but turning the category on changes what every existing config mutes.
-9. Which judge model (§17.3): a 4-billion-parameter model is noticeably better than a 1.5-billion one but takes about 28 s per question on a CPU. Should the judge default to off on machines without a GPU?
+8. Which judge model (§17.3)? A 4-billion-parameter model is noticeably better than a 1.5-billion one, but judges harmless uses poorly and innuendo only partly (Appendix D). A larger or newer model on a GPU may do better; the labelled set decides.
 
 ## 16. Stretch goal: voice-matched word replacement
 
@@ -903,6 +907,8 @@ v1 decides by the word alone: a listed word is muted wherever it is heard. This 
 - **Text only.** The signal is words: the transcript, the subtitles, and the sound descriptions in SDH subtitles (`[moaning]`, `[whispering]`). There is no model of emotion in the voice. The speech-editing models of §16 take delivery from the surrounding audio anyway.
 - **Local only.** Every model runs on the user's machine, from the model cache when offline (§10). No dialogue leaves the machine.
 - **Report-only first.** The first milestone adds verdicts to the report and the review subtitles, and changes nothing that is muted. Acting on verdicts comes later, opt-in, once they are measured.
+- **The `sexual` category holds phrases of a sexual nature** ("have sex", "sleep with", "make love", …) rather than single words. It is off by default, since turning it on changes what every existing config mutes. Its phrases count as evidence for sexual lines either way (§17.5).
+- **No judge without a GPU by default.** `context.judge = "auto"` runs the judge only on an NVIDIA GPU; on a CPU, where it takes about 28 s per question, the layer uses the rules and the classifier alone. A judge can still be named explicitly.
 
 ### 17.1 What a first test showed
 
@@ -948,6 +954,8 @@ Three sources, cheapest first:
    - Exclamation marks and capitals, for intensity.
    - A list of trigger words (`bed`, `naked`, `sleep with`, …), used like `lexicon.hints` (§4.3). A trigger word never mutes anything; it selects lines for a closer look.
 2. **Classifier (tier 1), every line.** A text classifier scores each line for profanity and explicit sexual content: toxicity, obscene, insult and `sexual_explicit` in Detoxify's unbiased model. It is fast enough for a whole film on a CPU (§17.1). Its scores rank lines and settle the clear cases. They are never the only reason to call a use harmless.
+
+   It scores a word, not its sense: every line with "bitch", "bastard" or "damned" came out rude, even "The bitch had a litter of six puppies", and every line with "ass" came out sexual. So a line holding an ambiguous listed word is scored with that word masked (`The farmer loaded his [...] with firewood.`), and the rest of the line decides.
 3. **Judge (tier 2), few lines.** A small local instruct model answers fixed questions about one line and its neighbours, as a JSON object with fixed fields:
    - the sense of one listed word (profane or harmless, with a reason);
    - whether the line is sexual, including innuendo;
@@ -974,26 +982,27 @@ M6 picks among them on the labelled set (§17.7).
 
 ### 17.4 Verdicts
 
-**Per detection:** a `context` object in the report.
+**Per detection:** a `context` object in the report (§17.8 lists its fields).
 
-- **`use`:** `"profane"`, `"harmless"` or `"unsure"`, with a reason (`"place"`, `"religious"`, `"literal"`, `"name"`) and the scores behind it.
-- **`emotion`:** a label and an intensity. They come from the judge and the rules: a sound description such as `[shouting]` outranks the model.
-- **`action`:** `"mute"`, `"keep"` or `"replace"`, with a `replacement` from §17.6. In report-only mode, `action` is what the layer *would* do; the output does not change.
+- **`use`:** `"profane"`, `"harmless"` or `"unsure"`, with a reason (`"place"`, `"religious"`, `"literal"`, `"name"`, …) and the line's tier-1 scores.
+- **`emotion`, `delivery` and `intensity`:** the emotion comes from the judge. Delivery (shouted, whispered, tearful) and intensity come from the rules, and a sound description such as `[shouting]` outranks capitals.
+- **`action`:** `"mute"` or `"keep"`; later also `"replace"`, with a `replacement` from §17.6. In report-only mode, `action` is what the layer *would* do; the output does not change.
 
 The combination is deliberately one-sided, since letting a profane word through costs more than muting a harmless one:
 
 - `harmless` needs the judge to say so *and* tier 1 to find the line clean;
 - a line flagged sexual is never harmless;
+- a use is judged only in a line that shows the word, so subtitles that soften what is said ("Go to heck" for "Go to hell") leave it `unsure`;
 - disagreement means `unsure`;
 - `unsure` means mute.
 
-**Per line:** `context.lines`, listing the lines flagged sexual, with times, scores, the evidence (tier 1, judge, sound description) and whether they contain detections.
+**Per line:** `context.sexual_lines` lists the lines flagged sexual with their times, text, sounds, tier-1 score and evidence (tier 1, phrases, sound descriptions, judge), and whether the flag is certain.
 
 ### 17.5 Sexual content
 
 Two layers, as for profanity:
 
-- **Words.** A new built-in category `sexual` of explicit terms is muted word by word like any other category. It ships disabled until its list and default are reviewed (open question 8).
+- **Words.** A built-in category `sexual` holds phrases of a sexual nature. When a user turns it on, its phrases are muted like any other listed term. It ships off, and whether it is on or off, its phrases count as evidence for sexual lines. Several have innocent senses too ("I sleep with the window open", "hook up the printer"), so they are also listed in `context.ambiguous`: alone they make a line only *possibly* sexual, until the judge or the classifier agrees.
 - **Lines.** Explicit lines are flagged by tier 1. Innuendo is flagged by the judge, on lines selected by the rules; classifiers trained on web comments miss innuendo, as §17.1 showed. Innuendo has no single word to cut, so acting on a flagged line (M7) mutes the whole line:
   - the planner adds a window for the line's cue (reason `context`);
   - the mute covers the speech heard in that window.
@@ -1029,32 +1038,49 @@ A script scores the layer on it, and users can run the same script on their own 
 
 The thresholds, the choice of models, and whether any action ever becomes a default all come from this set and from real films.
 
-### 17.8 Configuration
+### 17.8 Configuration and outputs
 
-A sketch; the names may change in M6:
+`[context]` in the config, or `--context` on `vbr clean` and `vbr scan`:
 
 ```toml
 [context]
-enabled = false                 # needs the [context] extra
-classifier = "auto"             # tier 1
-judge = "auto"                  # tier 2; "" turns it off (rules and tier 1 only)
-ambiguous = ["hell", "god", "ass", "damn", "bitch"]   # terms whose sense the judge checks
-harmless = "report"             # "report"; later "keep": leave harmless uses unmuted
-sexual = "report"               # "report"; later "mute": mute flagged lines
-triggers = ["bed", "naked", "sleep with"]             # lines worth a sexual-content check
-
-[replace]                       # §16: substitutes the judge may choose from
-"hell" = ["heck"]
-"*fuck*" = ["freaking", "frick"]
+enabled = false                 # or --context; needs the [context] extra
+classifier = "unitary/unbiased-toxic-roberta"
+judge = "auto"                  # the default judge on an NVIDIA GPU, none on a CPU; "" never; or a model
+ambiguous = ["hell", "damned", "ass", "asses", "jackass*", "bitch*", "bastard*", "piss", "pissed",
+             "jesus christ", "sleep with", "hook up", "go down on", …]   # terms whose sense is checked
+triggers = ["bed", "naked", "nude", "undress*", "sexy", "seduc*", "virgin*", "lover*", …]
+min_sexual_score = 0.5          # classifier score from which a line counts as sexual
+clean_below = 0.3               # a use can be harmless only if its line scores below this
+profane_above = 0.5             # a line scoring this much is profane without asking the judge
 ```
 
-`vbr render` ignores verdicts and mutes the report's intervals as they are. So even report-only mode is useful: a user who agrees that a use is harmless deletes its interval and renders.
+**The report.**
+
+- Each detection gains a `context` object with these fields:
+  - `use`, `reason` and `action`;
+  - the `line` it was judged in, and that line's classifier `scores`;
+  - `emotion`, `delivery` and `intensity`;
+  - `judged`: whether the judge answered.
+- A top-level `context` section holds:
+  - the models;
+  - the number of lines scored;
+  - counts of each verdict;
+  - the judge's questions and seconds, or why it did not run;
+  - `sexual_lines`, each with its times, text, sounds, evidence and whether it is certain.
+
+**The review subtitles** (§6.12) annotate a muted word with its verdict, e.g. `[muted] hell (probably harmless: place)`. Flagged lines get cues of their own: `[sexual line] …` or `[possibly sexual] …`.
+
+`vbr render` ignores verdicts and mutes the report's intervals as they are, but it keeps the verdicts in the review subtitles. So even report-only mode is useful: a user who agrees that a use is harmless deletes its interval and renders.
+
+**Cache.** The judge's answers are kept under `<cache>/context/`, by model, question version and question. Re-running a file asks nothing again; the classifier is fast enough not to need a cache.
 
 ### 17.9 Risks
 
 - **Domain.** The models learned from web text, not film dialogue. Sarcasm, quotation, song lyrics and period language will fool them.
 - **Missing context.** Innuendo often depends on what is on screen, which this layer cannot see.
 - **Language.** The candidates are English. Multilingual variants exist but are weaker (open question 4).
+- **Prompt injection.** Subtitles, especially downloaded ones, are untrusted text, and they go into the judge's questions. So the questions quote the lines as JSON strings, the system prompt says quoted text is data, and only fixed fields with fixed values are read from an answer. To get a use called harmless, a crafted line would also have to read as clean to the classifier and show the word. In report-only mode, a verdict changes nothing that is muted anyway; acting on verdicts (M7) should wait until this has been tried against crafted lines.
 - **Bias.** Toxicity classifiers are known to over-score identity terms. That matters little for lines already holding a listed word, but it is one more reason tier 1 alone never decides.
 - **Size and speed.** The classifier is about 500 MB; a judge is 1.5–4 billion parameters, which is 3–8 GB in 16-bit precision. On a CPU the judge must stay rare; on a GPU it is cheap.
 
