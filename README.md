@@ -23,7 +23,7 @@ A file without usable subtitles falls back to transcribing the whole soundtrack,
 
 The defaults have been checked on a synthetic evaluation set only (see [Evaluate](#evaluate)); tuning them on real film clips is still to do. Changes are listed in the [changelog](https://github.com/AshitakaLax/video-beep-remover/blob/main/CHANGELOG.md).
 
-A first version of context analysis (M6, [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration)) is in: see [Context analysis](#context-analysis-preview). It is report-only for now.
+A first version of context analysis (M6 and M7, [§17 of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#17-context-analysis-design-iteration)) is in: see [Context analysis](#context-analysis-preview). By default it only reports; acting on its verdicts is opt-in and experimental.
 
 ## Install
 
@@ -104,7 +104,7 @@ Whisper's word times are approximate, so each muted span is padded: 120 ms befor
 
 ## Context analysis (preview)
 
-`--context` asks local models to read the dialogue around each listed word, and the whole script, and adds their verdicts to the report and the review subtitles. **It never changes what is muted**; the verdicts are there for you to check, and for later versions to act on once they are measured.
+`--context` asks local models to read the dialogue around each listed word, and the whole script, and adds their verdicts to the report and the review subtitles. **By default it never changes what is muted**: the verdicts are there for you to check. Acting on them is opt-in and experimental (see below).
 
 ```console
 $ pipx install --force "video-beep-remover[context]"   # adds PyTorch and transformers
@@ -122,6 +122,11 @@ $ vbr scan movie.mkv --context --review-srt
 - **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
 - **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU, where it needs about 8 GB of memory next to Whisper's. On a CPU it takes 20–35 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless.
 - **Privacy.** Everything runs locally, and the models download once.
+- **Acting on the verdicts (experimental).** Two settings in `[context]` change what is muted:
+  - `harmless = "keep"` leaves uses judged harmless audible. It needs the judge, since nothing else calls a use harmless. Only a subtitle line that was actually heard can show a use as harmless, so a note slipped into downloaded subtitles ("the word is used harmlessly here") cannot keep a word.
+  - `sexual = "mute"` mutes each whole line flagged as sexual, from its first word to its last. A subtitle line gets a short transcription of its own to find them. Lines only *possibly* sexual are not muted.
+
+  Both are measured only on a small labelled set so far, so vbr warns when they are on. Check what they did in the review subtitles (`--review-srt`): `[kept] hell (probably harmless: place)`, `[muted] sexual line (…)`.
 
 On a labelled set of 71 lines, with the judge, it recognized 10 of 16 harmless uses and called no profane use harmless. It flagged explicit lines, but found little innuendo. [Appendix D of the design](https://github.com/AshitakaLax/video-beep-remover/blob/main/docs/DESIGN.md#appendix-d-context-analysis-measurements) has the numbers, and `scripts/evaluate_context.py` measures your own lines (see [Evaluate](#evaluate)).
 

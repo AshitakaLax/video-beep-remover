@@ -179,6 +179,9 @@ review_srt = false                  # <output stem>.review.srt: one cue per mute
 # "video-beep-remover[context]"; the models download on first use and run locally.
 [context]
 enabled = false                     # or --context on the command line
+# Acting on the verdicts is experimental: measured on a small labelled set only (DESIGN.md §17.7).
+harmless = "report"                 # "keep": leave uses judged harmless unmuted (needs the judge)
+sexual = "report"                   # "mute": mute each whole line flagged as sexual
 classifier = "unitary/unbiased-toxic-roberta"   # scores every line (about 500 MB)
 judge = "auto"                      # a small language model for the few lines that need judging;
                                     # "auto": Qwen/Qwen3-4B-Instruct-2507 on an NVIDIA GPU, none on a
@@ -196,6 +199,8 @@ triggers = [                        # words that make the judge check a line for
 min_sexual_score = 0.5              # classifier score from which a line counts as sexual
 clean_below = 0.3                   # a use can be harmless only if the line scores below this
 profane_above = 0.5                 # a line scoring this much is profane without asking the judge
+min_heard = 0.7                     # a subtitle line can show a use as harmless only if this share
+                                    # of its words is heard: subtitles can hold text never said
 
 [cache]
 dir = "auto"                        # per-user cache dir

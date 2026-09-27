@@ -147,7 +147,12 @@ def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.Monke
 
     installed.update(torch=True, transformers=True)
     ok, details = _context_status(_config(tmp_path, **on))[1:]
-    assert ok is True and "no judge (no GPU)" in details
+    assert ok is True and "no judge (no GPU); report only" in details
+    acting = {**on, "context.harmless": "keep", "context.sexual": "mute"}
+    assert (
+        "keeps harmless uses and mutes sexual lines (experimental)"
+        in _context_status(_config(tmp_path, **acting))[2]
+    )
     assert "not downloaded yet: unitary/unbiased-toxic-roberta" in details
     judged = {**on, "context.judge": "Qwen/Qwen3-4B-Instruct-2507", "offline": True}
     ok, details = _context_status(_config(tmp_path, **judged))[1:]

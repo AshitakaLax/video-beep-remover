@@ -39,11 +39,12 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 
 ### Context analysis (preview)
 
-- `--context` (`[context]` extra) reads the dialogue in context with local models. It is report-only: its verdicts go into the report and the review subtitles, and never change what is muted.
+- `--context` (`[context]` extra) reads the dialogue in context with local models. By default it only reports: its verdicts go into the report and the review subtitles, and change nothing that is muted.
   - Each ambiguous listed word gets a verdict: profane, probably harmless ("the nine circles of hell"), or unsure.
   - Lines that look sexual are listed with their evidence: explicit wording, phrases, sound descriptions such as `[moaning]`, and innuendo the judge recognizes.
+- Opt-in, experimental actions on the verdicts: `context.harmless = "keep"` leaves uses judged harmless unmuted, and `context.sexual = "mute"` mutes whole lines flagged as sexual. Only subtitle lines that were heard in the audio can show a use as harmless, which defeats notes and answers written into subtitles to sway the judge.
 - A `sexual` word category of phrases of a sexual nature, off by default.
-- `scripts/evaluate_context.py` and a labelled set of 71 lines, to measure the context layer.
+- `scripts/evaluate_context.py`, a labelled set of 71 lines and a set of crafted lines, to measure the context layer.
 
 [Unreleased]: https://github.com/AshitakaLax/video-beep-remover/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/AshitakaLax/video-beep-remover/releases/tag/v0.1.0

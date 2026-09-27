@@ -125,3 +125,48 @@ def test_context_verdicts_are_reported_and_change_nothing_muted(tmp_path: Path) 
     again = pipeline.process(tmp_path / "movie.mkv", RunOptions(dry_run=True, report=tmp_path / "again.json"))
     assert again.report is not None
     assert json.loads(again.report.read_text("utf-8"))["context"]["judge_questions"] == 0
+
+
+def test_context_actions_keep_harmless_uses_and_mute_sexual_lines(tmp_path: Path) -> None:
+    make_clip(tmp_path / "movie.mkv", duration=DURATION)
+    (tmp_path / "movie.srt").unlink(missing_ok=True)
+    (tmp_path / "movie.en.srt").write_text(SUBTITLES, "utf-8")
+    _, plain, _ = scan(tmp_path)
+    overrides = {
+        "context.enabled": True,
+        "context.judge": "fake-judge",
+        "context.harmless": "keep",
+        "context.sexual": "mute",
+    }
+    pipeline, report, review = scan(tmp_path, **overrides)
+
+    context = report["context"]
+    assert (context["harmless"], context["sexual"], context["kept"]) == ("keep", "mute", 1)
+    moaning, line = context["sexual_lines"]
+    assert "muted" not in moaning  # only "possibly" sexual: a sound with nothing said
+    # No window covered the sexual line, which holds no listed word: it was transcribed on its own.
+    first, *_, last = say(LINES[4][2], LINES[4][0] + LEAD, LINES[4][1] - 0.3)
+    assert line["muted"] == {"start": round(first.start, 3), "end": round(last.end, 3), "from": "heard"}
+
+    # The harmless "hell" is no longer muted; the rude one is, and so is the sexual line, padded like a word.
+    rude = plain["intervals"][0]
+    assert report["intervals"][0] == rude and len(report["intervals"]) == 2
+    muted = report["intervals"][1]
+    assert muted["start"] == pytest.approx(first.start - 0.12, abs=1e-3)
+    assert muted["end"] == pytest.approx(last.end + 0.2, abs=1e-3)
+
+    assert "[kept] hell (probably harmless: place)" in review
+    assert '[muted] sexual line (phrase "sleep with" (ambiguous); judge)' in review
+    assert "[sexual line]" not in review  # the muted line needs no cue of its own
+    assert "[possibly sexual] sound [moaning]" in review
+
+    # vbr render reads the verdicts back from the report, and writes the same review cues.
+    rendered = pipeline.render_report(
+        tmp_path / "movie.mkv", tmp_path / "on.json", RunOptions(review_srt=True)
+    )
+    assert rendered.review is not None
+    assert cue_texts(rendered.review.read_text("utf-8")) == cue_texts(review)
+
+
+def cue_texts(subtitles: str) -> list[str]:
+    return [block.splitlines()[2] for block in subtitles.strip().split("\n\n")]

@@ -244,7 +244,7 @@ ContextOpt = Annotated[
     typer.Option(
         "--context",
         help="Also read each listed word and the script in context with local models, and add the "
-        "verdicts to the report (report only; needs the [context] extra).",
+        "verdicts to the report (needs the [context] extra; acting on them is set in [context]).",
     ),
 ]
 OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output file or directory.")]
@@ -756,6 +756,12 @@ def _context_status(cfg: Config) -> tuple[str, bool | None, str]:
     details += (
         f"judge {judge}" if judge else "no judge (no GPU)" if cfg.context.judge == "auto" else "no judge"
     )
+    actions = []
+    if cfg.context.harmless == "keep":
+        actions.append("keeps harmless uses")
+    if cfg.context.sexual == "mute":
+        actions.append("mutes sexual lines")
+    details += f"; {' and '.join(actions)} (experimental)" if actions else "; report only"
     if missing:
         details += f"; not downloaded yet: {', '.join(missing)} (the first run downloads them)"
     return name, (False if missing and cfg.offline and enabled else True if enabled else None), details

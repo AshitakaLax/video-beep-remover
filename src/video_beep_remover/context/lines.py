@@ -2,9 +2,11 @@
 and sentences of heard words where no cue covers the speech."""
 
 import bisect
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from video_beep_remover.detect.normalize import normalize_token, split_words
 from video_beep_remover.models import Cue, Detection, Sound, SyncModel, Word
 
 SENTENCE_GAP_S = 1.0  # a pause this long ends a sentence of heard words
@@ -105,8 +107,35 @@ def line_for(detection: Detection, lines: Sequence[Line]) -> int | None:
     return min(near)[1] if near else None
 
 
-def neighbours(lines: Sequence[Line], index: int) -> tuple[str, str]:
-    """The spoken lines just before and after a line: a sentence often spans two cues."""
-    before = next((lines[i].text for i in range(index - 1, -1, -1) if lines[i].text), "")
-    after = next((lines[i].text for i in range(index + 1, len(lines)) if lines[i].text), "")
-    return before, after
+def neighbours(
+    lines: Sequence[Line], index: int, shown: Callable[[int], bool] = lambda i: True
+) -> tuple[str, str]:
+    """The spoken lines just before and after a line, a sentence often spanning two cues; "" where
+    that line is not to be `shown`."""
+
+    def text(i: int | None) -> str:
+        return lines[i].text if i is not None and shown(i) else ""
+
+    before = next((i for i in range(index - 1, -1, -1) if lines[i].text), None)
+    after = next((i for i in range(index + 1, len(lines)) if lines[i].text), None)
+    return text(before), text(after)
+
+
+def _tokens(text: str) -> list[str]:
+    return [token for token in (normalize_token(raw) for raw, _, _ in split_words(text)) if token]
+
+
+def heard_share(line: Line, heard: Sequence[Word]) -> float:
+    """The share of a line's words that were heard around it. Subtitles can hold text that is never
+    said, such as a note written for a model, so only lines that were heard are trusted to decide
+    that a use is harmless (DESIGN.md §17.9)."""
+    said = Counter(_tokens(line.text))
+    if not said:
+        return 0.0
+    near = Counter(
+        token
+        for word in heard
+        if line.start - COVER_MARGIN_S <= (word.start + word.end) / 2 <= line.end + COVER_MARGIN_S
+        for token in _tokens(word.text)
+    )
+    return sum((said & near).values()) / sum(said.values())

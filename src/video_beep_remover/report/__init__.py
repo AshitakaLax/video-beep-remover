@@ -32,10 +32,12 @@ def review_srt(
     shift: float = 0.0,
     notes: Sequence[str | None] = (),
     extra: Sequence[tuple[float, float, str]] = (),
+    labels: Sequence[tuple[float, float, str]] = (),
 ) -> str:
     """Subtitles with one cue per muted span, naming what was heard there, to spot-check a cleaned file
-    in a player. `shift` moves every cue (the output's timeline_shift). `notes` (one per detection) and
-    `extra` cues (start, end, text) carry the context layer's verdicts (DESIGN.md §17.4)."""
+    in a player. `shift` moves every cue (the output's timeline_shift). The context layer's verdicts
+    (DESIGN.md §17.4) come as `notes` (one per detection), `labels` (start, end, text) for the spans
+    they overlap, and `extra` cues of their own (start, end, text)."""
     cues: list[tuple[float, float, str]] = []
     for interval in intervals:
         heard = [
@@ -45,6 +47,7 @@ def review_srt(
             for i, d in enumerate(detections)
             if d.start < interval.end and interval.start < d.end
         ]
+        heard += [text for start, end, text in labels if start < interval.end and interval.start < end]
         cues.append(
             (
                 interval.start,

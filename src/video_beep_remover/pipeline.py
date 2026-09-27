@@ -3,7 +3,7 @@
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,14 +25,18 @@ from video_beep_remover.asr.vad import Regions, SpeechDetector, silero_speech
 from video_beep_remover.config.loader import LoadedConfig, cache_root, config_hash
 from video_beep_remover.context import (
     ContextLayer,
+    Line,
     ModelFactory,
     build_lines,
     check_installed,
+    kept_cues,
     review_cues,
+    review_labels,
     review_notes,
     verdict_dict,
     word_lines,
 )
+from video_beep_remover.context.lines import COVER_MARGIN_S
 from video_beep_remover.detect.intervals import build_intervals
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.detect.matcher import detect_in_words
@@ -536,8 +540,17 @@ class Pipeline:
         try:
             analysis = self._analyse(source, info, stream, job.workdir, track, job.lap, job.options.subtitles)
             detections = analysis.detections
+            to_mute = detections
+            if cfg.context.enabled:
+
+                def audio_source() -> AudioSource:
+                    if track.audio is not None:
+                        return ArrayAudioSource(track.audio)
+                    return SeekingAudioSource(self.ff, source, stream.index)
+
+                to_mute = self._run_context(job, analysis, detections, audio_source)
             intervals = build_intervals(
-                detections,
+                to_mute,
                 duration=info.duration,
                 pad_before=cfg.censor.pad_before_ms / 1000,
                 pad_after=cfg.censor.pad_after_ms / 1000,
@@ -570,8 +583,6 @@ class Pipeline:
             + (f" ({heard} heard, {estimated} from subtitles only)" if estimated else "")
             + f" → {len(intervals)} spans to mute"
         )
-        if cfg.context.enabled:
-            self._run_context(job, analysis, detections)
 
         model = analysis.model
         job.report = {
@@ -757,8 +768,12 @@ class Pipeline:
                 spans = rendered.intervals if rendered else job.intervals
                 shift = rendered.timeline_shift if rendered else 0.0
                 notes = review_notes(job.verdicts)
-                extra = review_cues(job.context)
-                write_text(review, review_srt(spans, job.detections, shift=shift, notes=notes, extra=extra))
+                extra = review_cues(job.context, spans) + kept_cues(job.detections, job.verdicts, spans)
+                labels = review_labels(job.context)
+                write_text(
+                    review,
+                    review_srt(spans, job.detections, shift=shift, notes=notes, extra=extra, labels=labels),
+                )
                 result.review = review
 
     def discard(self, job: Job) -> None:
@@ -783,10 +798,26 @@ class Pipeline:
                 classifier_factory=classifier,
                 judge_factory=judge,
             )
+            settings = self.config.context
+            if settings.harmless == "keep" or settings.sexual == "mute":
+                self.ui.warn(
+                    "acting on context verdicts is experimental: it is measured on a small labelled set "
+                    "only (DESIGN.md §17.7); check the review subtitles (--review-srt)"
+                )
+            if settings.harmless == "keep" and self._context.judge_name is None:
+                self.ui.warn('context.harmless = "keep" keeps nothing without a judge (context.judge)')
         return self._context
 
-    def _run_context(self, job: Job, analysis: Analysis, detections: list[Detection]) -> None:
-        """Context verdicts for the report and the review subtitles; what is muted does not change."""
+    def _run_context(
+        self,
+        job: Job,
+        analysis: Analysis,
+        detections: list[Detection],
+        audio: Callable[[], AudioSource],
+    ) -> list[Detection]:
+        """Context verdicts for the report and the review subtitles (DESIGN.md §17). Returns what to mute:
+        the detections, less the uses kept as harmless (context.harmless = "keep"), plus a span for each
+        line flagged as sexual (context.sexual = "mute")."""
         chosen = analysis.subtitles
         if chosen is not None:
             try:
@@ -798,22 +829,92 @@ class Pipeline:
             lines = word_lines(analysis.heard)
         layer = self.context_layer()
         with self.ui.status("Reading the dialogue in context"):
-            result, section = layer.run(detections, lines)
+            result, section = layer.run(detections, lines, analysis.heard)
         job.context = section
         job.verdicts = [verdict_dict(v, result.lines) for v in result.verdicts]
+        settings = self.config.context
+        keep = settings.harmless == "keep"
+        to_mute = [
+            d for d, v in zip(detections, result.verdicts, strict=True) if not (keep and v.use == "harmless")
+        ]
+        actions = []
+        if keep:
+            section["kept"] = len(detections) - len(to_mute)
+            actions.append(f"{section['kept']} kept as harmless")
+        if settings.sexual == "mute":
+            flagged = [(i, s) for i, s in enumerate(result.sexual) if s.certain and s.line.text]
+            spans = self._line_spans([found.line for _, found in flagged], analysis, audio, job.info.duration)
+            for (i, found), (start, end, heard) in zip(flagged, spans, strict=True):
+                section["sexual_lines"][i]["muted"] = {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "from": "heard" if heard else "cue",
+                }
+                to_mute.append(
+                    Detection(
+                        start,
+                        end,
+                        found.line.text,
+                        "sexual line",
+                        "context",
+                        1.0,
+                        "asr" if heard else "cue",
+                        found.line.cue,
+                    )
+                )
+            actions.append(f"{len(flagged)} sexual lines muted")
         counts = section["verdicts"]
         certain = sum(item["certain"] for item in section["sexual_lines"])
         self.ui.info(
-            f"Context (report only): {counts['profane']} profane, {counts['harmless']} probably harmless, "
-            f"{counts['unsure']} unsure · {certain} sexual lines"
+            f"Context{'' if actions else ' (report only)'}: {counts['profane']} profane, "
+            f"{counts['harmless']} probably harmless, {counts['unsure']} unsure · {certain} sexual lines"
             + (
                 f" (+{len(section['sexual_lines']) - certain} possible)"
                 if len(section["sexual_lines"]) > certain
                 else ""
             )
+            + "".join(f" · {action}" for action in actions)
             + ("" if layer.judge_name else " · no judge: " + section.get("judge_off", "off"))
         )
         job.lap("context")
+        return to_mute
+
+    def _line_spans(
+        self,
+        lines: Sequence[Line],
+        analysis: Analysis,
+        audio: Callable[[], AudioSource],
+        duration: float,
+    ) -> list[tuple[float, float, bool]]:
+        """Where each line is spoken, from its first heard word to its last, and whether words were heard
+        there at all; a line nothing was heard in keeps its own span. A subtitle line is transcribed
+        again in a window of its own (DESIGN.md §17.5), so that all of it is heard: the analysis
+        only transcribed around listed words (the transcript cache serves what it already heard)."""
+        chosen = analysis.subtitles
+        cued = [i for i, line in enumerate(lines) if line.cue is not None]
+        heard: Sequence[Word] = analysis.heard
+        if cued and chosen is not None:
+            heard = guided_analysis.transcribe_spans(
+                self.guided_context(),
+                analysis.strategy,
+                audio(),
+                [(lines[i].start, lines[i].end) for i in cued],
+                chosen.sync.model,
+                duration,
+            )
+            heard = guided_analysis.merge_words(analysis.heard, heard)
+        spans = []
+        for line in lines:
+            words = [
+                w
+                for w in heard
+                if line.start - COVER_MARGIN_S <= (w.start + w.end) / 2 <= line.end + COVER_MARGIN_S
+            ]
+            if words:
+                spans.append((min(w.start for w in words), max(w.end for w in words), True))
+            else:
+                spans.append((line.start, line.end, False))
+        return spans
 
     def render_report(
         self, source: Path, report: Path, options: RunOptions, *, force: bool = False

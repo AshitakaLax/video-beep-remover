@@ -38,7 +38,7 @@ from video_beep_remover.errors import SubtitleError
 from video_beep_remover.media.audio import Audio, AudioSource
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import MediaInfo
-from video_beep_remover.models import Cue, Detection, Window, Word
+from video_beep_remover.models import Cue, Detection, SyncModel, Window, Word
 from video_beep_remover.subtitles import ffsubsync
 from video_beep_remover.subtitles.acquire import (
     OnlineSource,
@@ -406,6 +406,32 @@ def transcribe_windows(
         [(t.clean_start, t.clean_end) for _, t in pieces],
     )
     return detections, heard_words, (complete, partial)
+
+
+def transcribe_spans(
+    ctx: Context,
+    role: str,
+    audio: AudioSource,
+    spans: Sequence[tuple[float, float]],
+    sync: SyncModel,
+    duration: float,
+) -> list[Word]:
+    """The words heard around spans of the media timeline chosen after the analysis: the subtitle lines
+    that context analysis mutes (DESIGN.md §17.5). Each span gets a window like a flagged cue's, with
+    the reason "context"; what the cached transcripts cover is not transcribed again."""
+    settings = ctx.config.analysis.targeted
+    pad = search_padding(settings.window_padding_s, sync)
+    windows = plan_windows(
+        [Window(start - pad, end + pad, frozenset({"context"})) for start, end in spans],
+        duration=duration,
+        min_window=settings.min_window_s,
+        max_window=settings.max_window_s,
+        merge_gap=settings.merge_gap_s,
+    )
+    if not windows:
+        return []
+    _, heard, _ = transcribe_windows(ctx, role, audio, windows, duration, "Transcribing flagged lines")
+    return heard
 
 
 def merge_words(first: Sequence[Word], second: Sequence[Word]) -> list[Word]:

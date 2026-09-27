@@ -7,19 +7,21 @@ a sexual line is never harmless; anything else undecided is "unsure", which mute
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any, Literal
 
 from video_beep_remover.context import rules
-from video_beep_remover.context.lines import Line, line_for, neighbours
+from video_beep_remover.context.lines import Line, heard_share, line_for, neighbours
 from video_beep_remover.context.models import LABELS, Classifier, Judge
-from video_beep_remover.models import Detection
+from video_beep_remover.models import Detection, Word
 
 QUESTIONS_VERSION = 1  # bump when a question changes, so cached answers are not reused
 Use = Literal["profane", "harmless", "unsure"]
 _RUDE = ("toxicity", "obscene", "insult")
 _REASONS = ("curse", "insult", "exclamation", "sexual", "literal", "religious", "place", "name", "other")
+_HARMLESS_REASONS = ("literal", "religious", "place", "name", "other")
 _EMOTIONS = ("anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise")
 _JSON = re.compile(r"\{.*?\}", re.DOTALL)
 
@@ -30,6 +32,7 @@ class Settings:
     min_sexual_score: float  # classifier score from which a line counts as sexual
     clean_below: float  # a line is clean when every rude score is below this
     profane_above: float  # and clearly profane when one reaches this
+    min_heard: float = 0.7  # the share of a subtitle line's words that must be heard to trust it
 
 
 @dataclass(frozen=True)
@@ -70,8 +73,8 @@ def _quote(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
 
 
-def _dialogue(lines: Sequence[Line], index: int) -> str:
-    before, after = neighbours(lines, index)
+def _dialogue(lines: Sequence[Line], index: int, shown: Callable[[int], bool] = lambda i: True) -> str:
+    before, after = neighbours(lines, index, shown)
     parts = [f"   {_quote(before)}"] if before else []
     parts.append(f">> {_quote(lines[index].text)}")
     if after:
@@ -79,9 +82,11 @@ def _dialogue(lines: Sequence[Line], index: int) -> str:
     return "\n".join(parts)
 
 
-def sense_question(lines: Sequence[Line], index: int, word: str) -> str:
+def sense_question(
+    lines: Sequence[Line], index: int, word: str, shown: Callable[[int], bool] = lambda i: True
+) -> str:
     return (
-        f"Dialogue:\n{_dialogue(lines, index)}\n\n"
+        f"Dialogue:\n{_dialogue(lines, index, shown)}\n\n"
         f"How is the word {_quote(word)} used in the line marked >>? Reply with "
         '{"use": ..., "reason": ..., "emotion": ...} where:\n'
         '- "use" is "profane" for a swear word, an insult, a curse, a sexual reference or an '
@@ -203,6 +208,7 @@ def _verdict(
     sexual: set[int],
     judge: Judge | None,
     settings: Settings,
+    trusted: Callable[[int], bool],
 ) -> Verdict:
     index = line_for(detection, lines)
     line = lines[index] if index is not None else Line(detection.start, detection.end, detection.heard)
@@ -228,11 +234,16 @@ def _verdict(
         return verdict("profane", "classifier")
     if judge is None:
         return verdict("unsure", "not judged")  # the classifier alone never calls a use harmless
-    answer = parse_answer(judge.ask(sense_question(lines, index, word)))
+    if not trusted(index):
+        # Text that was never said, such as a note written for the judge, must not decide (§17.9).
+        return verdict("unsure", "the subtitles differ from what is heard")
+    answer = parse_answer(judge.ask(sense_question(lines, index, word, trusted)))
     emotion = answer.get("emotion")
     if answer.get("use") == "harmless":
+        if answer.get("reason") not in _HARMLESS_REASONS:
+            return verdict("unsure", "the judge contradicted itself", emotion, True)
         if rude < settings.clean_below:
-            return verdict("harmless", answer.get("reason", "judge"), emotion, True)
+            return verdict("harmless", answer["reason"], emotion, True)
         return verdict("unsure", "the judge and the classifier disagree", emotion, True)
     if answer.get("use") == "profane":
         return verdict("profane", answer.get("reason", "judge"), emotion, True)
@@ -248,10 +259,19 @@ def analyse_context(
     phrases: rules.Phrases,
     triggers: rules.Phrases,
     settings: Settings,
+    heard: Sequence[Word] | None = None,
 ) -> ContextResult:
-    """Verdicts for the detections, and the lines that look sexual."""
+    """Verdicts for the detections, and the lines that look sexual. `heard` are the words heard in
+    the audio: a subtitle line is trusted to show a use as harmless, or to be shown to the judge
+    next to one, only if most of its words were heard (None: trust every line)."""
+
+    @cache
+    def trusted(index: int) -> bool:
+        line = lines[index]
+        return heard is None or line.cue is None or heard_share(line, heard) >= settings.min_heard
+
     scores = _score_lines(classifier, lines, _masked_lines(detections, lines, settings))
     sexual = _sexual_lines(lines, scores, judge, phrases, triggers, settings)
     certain = {s.index for s in sexual if s.certain}
-    verdicts = [_verdict(d, lines, scores, certain, judge, settings) for d in detections]
+    verdicts = [_verdict(d, lines, scores, certain, judge, settings, trusted) for d in detections]
     return ContextResult(verdicts, sexual, list(lines), scores)

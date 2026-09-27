@@ -132,6 +132,8 @@ _TRIGGERS = [
 
 class ContextConfig(_Model):
     enabled: bool = False
+    harmless: Literal["report", "keep"] = "report"  # "keep": leave uses judged harmless unmuted
+    sexual: Literal["report", "mute"] = "report"  # "mute": mute the lines flagged as sexual
     classifier: str = "unitary/unbiased-toxic-roberta"
     judge: str = "auto"  # "auto": the default judge on a CUDA GPU, none on a CPU; "": none
     ambiguous: list[str] = Field(default_factory=lambda: list(_AMBIGUOUS))
@@ -139,6 +141,7 @@ class ContextConfig(_Model):
     min_sexual_score: float = Field(0.5, ge=0, le=1)
     clean_below: float = Field(0.3, ge=0, le=1)
     profane_above: float = Field(0.5, ge=0, le=1)
+    min_heard: float = Field(0.7, ge=0, le=1)  # share of a subtitle line's words heard, to trust it
 
 
 class CacheConfig(_Model):
