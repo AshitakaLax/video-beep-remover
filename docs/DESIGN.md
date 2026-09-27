@@ -54,13 +54,15 @@ $ vbr clean "The Movie (2019).mkv"
 
 | Command | Purpose |
 |---|---|
-| `vbr clean INPUT...` | Detect and censor. Writes the cleaned file(s) and a report. Inputs can be files or folders (`--recursive`). |
+| `vbr clean INPUT...` | Detect and censor. Writes the cleaned file(s) and a report. |
 | `vbr scan INPUT...` | Detection only, the same as `clean --dry-run`. Writes the report and optional EDL, but no video. |
-| `vbr render INPUT --report FILE` | Render from a report, which may be hand-edited. Skips detection. A report made for a different file (size, hash or duration) is refused without `--force`. |
-| `vbr subs INPUT` | Show subtitle candidates, their scores and the sync check. `--save PATH` writes the chosen subtitles, converted to the format PATH names. Exits with 1 if no candidate is usable. |
+| `vbr render INPUT...` | Render from a report, which may be hand-edited. Skips detection. The report is the one `--report` names (a file, or a folder for several videos), or the one a scan or clean wrote next to the video; a video found in a folder without one is skipped. A report made for a different file (size, hash or duration) is refused without `--force`. |
+| `vbr subs INPUT...` | Show subtitle candidates, their scores and the sync check. `--save PATH` writes the chosen subtitles, converted to the format PATH names (with several videos, PATH is a folder and each is saved as `<video>.srt`). Exits with 1 if no candidate is usable (4 if only some of several videos have none). |
 | `vbr config init \| show \| check` | Write a starter config, print the effective merged config (secrets redacted), or validate it. |
 | `vbr doctor` | Check the FFmpeg version and encoders, CUDA, the model cache and the API credentials. |
 | `vbr cache info \| clear` | Inspect or clear the cache: downloaded subtitles and transcripts (§8.3). `clear --subtitles` or `--transcripts` clears one of them. |
+
+Every command that takes videos takes files, folders, or both; `-r, --recursive` searches subfolders. Folders are searched for the extensions in `media/probe.py` (`VIDEO_SUFFIXES`); a file named on the command line is processed whatever its extension. The output keeps the input's container. MKV and MP4 are covered by the tests: in an MP4, audio is re-encoded to AAC, subtitles stay `mov_text`, and the `VBR_CENSORED` tag needs `-movflags use_metadata_tags`.
 
 ### 3.3 Main options for `clean` and `scan`
 
@@ -68,6 +70,7 @@ $ vbr clean "The Movie (2019).mkv"
 |---|---|---|
 | `-c, --config PATH` | n/a | See §4.1 for discovery. |
 | `-o, --output PATH` | `output.path` | A file (single input) or a directory. |
+| `--backup`, `--in-place` | `output.mode = "backup"`, `"in_place"` | The cleaned file takes the original's place; `--backup` keeps the original at `output.backup_path` (§6.12). Also for `render`. |
 | `--strategy hybrid\|targeted\|full` | `analysis.strategy` | See §7. |
 | `--no-fallback` | `analysis.fallback_to_full = false` | Fail instead of transcribing everything. |
 | `--subtitles PATH` | n/a | Use this file and skip the search. It is treated as trusted. |
@@ -215,8 +218,10 @@ flowchart TD
 
 ```
 src/video_beep_remover/
-├── cli.py                 # Typer app → RunOptions
-├── batch.py               # folders: skipping vbr's outputs, rendering in the background
+├── cli/                   # Typer app → RunOptions: videos.py (clean, scan, render), subs.py, doctor.py,
+│                          #   configure.py, cache.py; options.py (shared options), console.py (output)
+├── batch.py               # files and folders: skipping vbr's outputs and backups, rendering in the background
+├── outputs.py             # where files go: output.path, --backup/--in-place, report, EDL, review SRT
 ├── context/               # context analysis (§17): lines, rules, classifier and judge, verdicts
 ├── pipeline.py            # per-file stages, strategy fallbacks, report, timings; vbr render
 ├── guided.py              # subtitle-guided analysis: targeted and hybrid (§6.3-6.9)
@@ -598,6 +603,14 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
 
 ### 6.12 Reports and other outputs
 
+**Where the cleaned file goes** (`outputs.py`). `output.mode` decides:
+
+- `"new"` (the default): a new file at `output.path` (`{stem}.clean{ext}` next to the input), or `-o`. The original is never changed.
+- `"backup"` (`--backup`): the input's own path. The input is kept, unmodified, at `output.backup_path` (`{stem}.orig{ext}`).
+- `"in_place"` (`--in-place`): the input's own path, with no backup.
+
+In every mode the renderer writes `<output stem>.partial<ext>`, verifies it, and only then renames it (§6.11). With a backup, the input is moved to the backup path just before that rename, and moved back if the rename fails. A failed run therefore leaves the input as it was. A file whose backup already exists is skipped: it was cleaned before, and the backup may be the only copy of the original. Folder runs never pick up backups, since a file named like another input's backup is skipped. `-o` cannot be combined with `--backup` or `--in-place`. With either of them, a subtitle file next to the video that guided the search is masked in place too, and `--backup` keeps it as `<backup stem>.<language>.srt`. The mode changes only where files go, not whether they are written (`output.when_clean` still decides that).
+
 **JSON report.** Written by default as `<output stem>.vbr.json`. It records every decision so a run can be audited or re-rendered:
 
 ```json
@@ -621,7 +634,8 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
                   "confidence": 0.94, "source": "asr", "cue": 812}],
   "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
   "intervals": [{"start": 4383.29, "end": 4383.98}],
-  "output": {"path": "The Movie (2019).clean.mkv", "muted_spans": [{"start": 4383.29, "end": 4383.98}],
+  "output": {"path": "The Movie (2019).clean.mkv", "backup": null,
+             "muted_spans": [{"start": 4383.29, "end": 4383.98}],
              "verified_spans": 44, "timeline_shift": 0.0,
              "audio_checks": [{"stream": 2, "same_dialogue": true, "correlation": 0.97, "lag": 0.0}],
              "subtitles": [{"stream": 4, "codec": "subrip", "language": "eng", "masked": 45}],
@@ -630,9 +644,9 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
 }
 ```
 
-`vbr render --report` mutes the report's `intervals` as they are (sorted, and merged where they overlap), so users can add, delete or adjust spans by hand. It reads `detections` only to label the review SRT, and `input` to refuse a report made for a different file (by size, OpenSubtitles hash or duration) unless `--force` is given. It writes the same outputs as `clean`, subtitles included, except the report itself, which it never rewrites.
+`vbr render` mutes the report's `intervals` as they are (sorted, and merged where they overlap), so users can add, delete or adjust spans by hand. It reads `detections` only to label the review SRT, and `input` to refuse a report made for a different file (by size, OpenSubtitles hash or duration) unless `--force` is given. It writes the same outputs as `clean`, subtitles included, except the report itself, which it never rewrites.
 
-**EDL** (`--edl`). A mute list in the Kodi and MPlayer format, written next to the input as `<input stem>.edl`. Each line is `start end 1`, where action 1 means mute:
+**EDL** (`--edl`). A mute list in the Kodi and MPlayer format, written next to the unmodified original as `<input stem>.edl` (with `--backup`, `<backup stem>.edl`). Each line is `start end 1`, where action 1 means mute:
 
 ```
 4383.29	4383.98	1
@@ -845,7 +859,7 @@ M0 to M5 are implemented:
 
 - M4's defaults were checked on a synthetic evaluation set, which changed `pad_after_ms` and fixed the sync fit (Appendix C). Tuning them on real film clips is still to do.
 - M5 measured the WhisperX backend and edge refinement on the same set. Both stay optional (Appendix C).
-- M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out.
+- M5's release workflow publishes to PyPI when a version tag is pushed (`docs/RELEASING.md`). Its "done when" is met once the first tag goes out. Publishing waits until the models have been evaluated on a GPU (§15).
 
 M6 to M8 follow the design iteration in §17. Its choices were made with the user: text-only signals, local models only, and verdicts in the report before any action. M6 is implemented, and report-only. Appendix D measures it on 71 labelled lines. M7's actions are implemented, off by default and experimental. They meet their targets on the labelled set and on crafted lines (Appendix D.3), after a defence against prompt injection that the crafted lines showed was needed. Measuring them on real films is still to do. M8, voice replacement (§16), is implemented, off by default and experimental. On a stereo and a 5.1 test clip, the words it replaced passed the check, and every word it could not replace was muted (Appendix E).
 
@@ -869,7 +883,9 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 - **The `sexual` category** (§17.5) holds phrases of a sexual nature and ships off; context analysis reports the lines they occur in either way.
 - **The judge** (§17.3) runs by default only on an NVIDIA GPU (`context.judge = "auto"`).
 - **Acting on verdicts** (M7) is opt-in and experimental (`context.harmless`, `context.sexual`) until it is measured on real films.
-- **Voice replacement** (M8) uses F5-TTS, whose weights are licensed for non-commercial use, with Demucs and ECAPA (§16). It is opt-in and experimental.
+- **Voice replacement** (M8) uses F5-TTS, whose weights are licensed for non-commercial use, with Demucs and ECAPA (§16). It is opt-in and experimental. The tool is for personal use, which the licence allows.
+- **Release.** Nothing is published or versioned yet: the next step is to evaluate the models on a GPU, and the open questions below wait for that evaluation.
+- **Replacing the originals** is opt-in, with or without a backup (`--backup`, `--in-place`; §6.12). By default the original is never changed.
 
 **Still open**
 

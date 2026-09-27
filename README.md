@@ -53,16 +53,19 @@ $ vbr clean "The Movie (2019).mkv"
   → The Movie (2019).clean.mkv        the copy with listed words muted
   → The Movie (2019).clean.vbr.json   what was found and muted, and when
 
-$ vbr scan "The Movie (2019).mkv" --edl   # detect only; writes a report and a mute list for Kodi/MPlayer
-$ vbr clean ~/Videos -r -o ~/Clean        # a whole folder, recursively
-$ vbr subs "The Movie (2019).mkv"         # which subtitles would guide the search, and are they in sync?
-$ vbr render "The Movie (2019).mkv" --report edited.vbr.json   # mute exactly the spans in a report
+$ vbr clean ~/Videos -r -o ~/Clean        # a whole folder, recursively, into another folder
+$ vbr clean ~/Videos -r --backup          # in place: Movie.mp4 is cleaned, Movie.orig.mp4 is the original
+$ vbr scan "The Movie (2019).mp4" --edl   # detect only; writes a report and a mute list for Kodi/MPlayer
+$ vbr subs ~/Videos                       # which subtitles would guide the search, and are they in sync?
+$ vbr render "The Movie (2019).mkv"       # mute exactly the spans in its (edited) report
 ```
+
+Every command that takes videos takes files, folders, or both (`-r` searches subfolders). MKV and MP4 are the tested containers; the others FFmpeg writes (MOV, WebM, TS, AVI…) are processed the same way. The cleaned file keeps its container: `.mp4` in, `.mp4` out.
 
 What the cleaned file contains:
 
 - **Audio.** The dialogue track has each listed word muted. Another track in the same language, such as a stereo downmix, gets the same mutes if its audio matches the dialogue track's around the muted words; tracks in other languages, commentaries and mismatched tracks are dropped, since they would still contain the words (`output.other_audio_streams`).
-- **Subtitles.** Listed words are masked in every text subtitle track (`f***`, or `****` or removed with `output.subtitle_mask`), keeping their styling and timing. Image-based subtitles (PGS, VobSub) are copied as they are, with a warning. When a subtitle file next to the video guided the search, a masked copy is written next to the output, e.g. `The Movie (2019).clean.en.srt`.
+- **Subtitles.** Listed words are masked in every text subtitle track (`f***`, or `****` or removed with `output.subtitle_mask`), keeping their styling and timing; in an MP4 they stay `mov_text` tracks. Image-based subtitles (PGS, VobSub) are copied as they are, with a warning. When a subtitle file next to the video guided the search, a masked copy is written next to the output, e.g. `The Movie (2019).clean.en.srt`.
 - **Everything else** (video, chapters, attachments, metadata) is copied untouched, and the file is tagged `VBR_CENSORED`, so later batch runs skip it.
 
 Useful options:
@@ -74,13 +77,21 @@ Useful options:
 - `--audio-stream N` picks the dialogue track by its ffprobe index.
 - `--review-srt` also writes `.review.srt`: one subtitle per muted span naming the word, to spot-check the result in a player.
 - `--context` adds context analysis to the report ([preview](#context-analysis-preview)), and `--replace` says a milder word instead of muting ([experimental](#voice-replacement-experimental)).
+- `--backup` or `--in-place` put the cleaned file in the original's place (see below).
 - `--overwrite` or `--skip-existing` decide what happens when outputs already exist.
 
 Run `vbr clean --help` for everything.
 
-**Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own outputs found there are skipped: files named like another input's output (`Movie.clean.mkv`) and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed. A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
+**Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own files found there are skipped: files named like another input's output (`Movie.clean.mkv`) or backup (`Movie.orig.mkv`), and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed. A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
 
-**Editing the result.** Every run writes a JSON report whose `intervals` list the muted spans. Edit them (add, remove or move spans) and run `vbr render VIDEO --report REPORT` to mute exactly those, without detecting anything. A report made for a different file is refused unless you add `--force`.
+**Replacing the originals.** By default the original is never changed: the cleaned copy is a new file next to it (`output.path`, or `-o`). Two flags put the cleaned file in the original's place instead, so a media library plays it without any change (`output.mode` sets either one for good):
+
+- `--backup` keeps the unmodified original as `Movie.orig.mp4` (`output.backup_path`). A file whose backup already exists was cleaned before and is skipped, so a backup is never overwritten.
+- `--in-place` keeps no backup.
+
+Either way, the new file is written and verified before the original is touched, so a failed run leaves it as it was. A subtitle file next to the video that guided the search is masked in place too (with `--backup`, kept as `Movie.orig.en.srt`). To clean a file again from scratch, for example with a new word list, move its backup back over it first.
+
+**Editing the result.** Every run writes a JSON report whose `intervals` list the muted spans. Edit them (add, remove or move spans) and run `vbr render VIDEO` to mute exactly those, without detecting anything: it reads the report that `vbr scan` or `vbr clean` wrote next to the video, or the one `--report` names. A report made for a different file is refused unless you add `--force`.
 
 ## How words are found
 
@@ -187,8 +198,10 @@ The word list supports whole words, `*` wildcards, phrases, `[bracketed]` target
 $ pip install -e ".[dev]"
 $ pytest                           # FFmpeg tests skip themselves when FFmpeg is missing
 $ VBR_RUN_ASR_TESTS=1 pytest       # also runs real Whisper on synthesized speech (needs espeak-ng)
-$ ruff check src tests && ruff format --check src tests && mypy
+$ ruff check . && ruff format --check . && python -m mypy
 ```
+
+[CLAUDE.md](https://github.com/AshitakaLax/video-beep-remover/blob/main/CLAUDE.md) is a short guide to the code for people and coding agents: where each part lives, the conventions, and the traps.
 
 ## Evaluate
 

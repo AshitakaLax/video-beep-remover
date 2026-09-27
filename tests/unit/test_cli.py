@@ -87,17 +87,17 @@ def _config(tmp_path: Path, **overrides: object) -> Config:
 
 @respx.mock
 def test_doctor_checks_the_opensubtitles_key(tmp_path: Path) -> None:
-    from video_beep_remover.cli import _opensubtitles_status
+    from video_beep_remover.cli.doctor import opensubtitles_status
     from video_beep_remover.subtitles.opensubtitles import API
 
-    assert _opensubtitles_status(_config(tmp_path))[1:] == (
+    assert opensubtitles_status(_config(tmp_path))[1:] == (
         None,
         "no API key: online subtitle search is skipped (set OPENSUBTITLES_API_KEY)",
     )
     key = {"subtitles.opensubtitles.api_key": "k"}
-    assert _opensubtitles_status(_config(tmp_path, offline=True, **key))[1] is None  # not checked offline
+    assert opensubtitles_status(_config(tmp_path, offline=True, **key))[1] is None  # not checked offline
     search = respx.get(f"{API}/subtitles").mock(return_value=httpx.Response(200, json={"data": []}))
-    assert _opensubtitles_status(_config(tmp_path, **key))[1:] == (True, "API key accepted")
+    assert opensubtitles_status(_config(tmp_path, **key))[1:] == (True, "API key accepted")
     assert search.calls.last.request.headers["Api-Key"] == "k"
     respx.post(f"{API}/login").mock(
         return_value=httpx.Response(200, json={"token": "t", "user": {"allowed_downloads": 20}})
@@ -107,27 +107,37 @@ def test_doctor_checks_the_opensubtitles_key(tmp_path: Path) -> None:
         **key,
         **{"subtitles.opensubtitles.username": "me", "subtitles.opensubtitles.password": "pw"},
     )
-    assert _opensubtitles_status(logged_in)[1:] == (
+    assert opensubtitles_status(logged_in)[1:] == (
         True,
         "API key accepted; logged in as me (20 downloads a day)",
     )
     search.mock(return_value=httpx.Response(403, json={"message": "You cannot consume this service"}))
-    ok, details = _opensubtitles_status(_config(tmp_path, **key))[1:]
+    ok, details = opensubtitles_status(_config(tmp_path, **key))[1:]
     assert ok is False and "rejected" in details
 
 
 def test_context_flag_turns_the_layer_on() -> None:
-    from video_beep_remover.cli import _overrides
+    from video_beep_remover.cli.options import overrides
 
-    assert _overrides(context=True) == {"context.enabled": True}
-    assert _overrides(context=False) == {}
-    assert _overrides(replace=True) == {"replace.enabled": True}
+    assert overrides(context=True) == {"context.enabled": True}
+    assert overrides(context=False) == {}
+    assert overrides(replace=True) == {"replace.enabled": True}
+
+
+def test_backup_and_in_place_set_the_output_mode() -> None:
+    from video_beep_remover.cli.options import overrides
+    from video_beep_remover.errors import UsageError
+
+    assert overrides(backup=True) == {"output.mode": "backup"}
+    assert overrides(in_place=True) == {"output.mode": "in_place"}
+    with pytest.raises(UsageError, match="cannot be combined"):
+        overrides(backup=True, in_place=True)
 
 
 def test_doctor_shows_voice_replacement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib.util
 
-    from video_beep_remover.cli import _voice_status
+    from video_beep_remover.cli.doctor import voice_status
 
     installed = {"torch": False, "torchaudio": False, "f5_tts": False, "demucs": False, "speechbrain": False}
     real = importlib.util.find_spec
@@ -136,18 +146,18 @@ def test_doctor_shows_voice_replacement(tmp_path: Path, monkeypatch: pytest.Monk
         return (object() if installed[name] else None) if name in installed else real(name, *rest)
 
     monkeypatch.setattr(importlib.util, "find_spec", find_spec)
-    assert _voice_status(_config(tmp_path))[1] is None  # off, and not installed: nothing wrong
-    ok, details = _voice_status(_config(tmp_path, **{"replace.enabled": True}))[1:]
+    assert voice_status(_config(tmp_path))[1] is None  # off, and not installed: nothing wrong
+    ok, details = voice_status(_config(tmp_path, **{"replace.enabled": True}))[1:]
     assert ok is False and "video-beep-remover[voice]" in details
     installed.update(dict.fromkeys(installed, True))
-    ok, details = _voice_status(_config(tmp_path, **{"replace.enabled": True}))[1:]
+    ok, details = voice_status(_config(tmp_path, **{"replace.enabled": True}))[1:]
     assert ok is True and "F5TTS_v1_Base" in details and "non-commercial" in details
 
 
 def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib.util
 
-    from video_beep_remover.cli import _context_status
+    from video_beep_remover.cli.doctor import context_status
 
     installed = {"torch": False, "transformers": False}
     real = importlib.util.find_spec
@@ -162,24 +172,24 @@ def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.Monke
     cpu = {"transcription.device": "cpu"}
     on = {**cpu, "context.enabled": True}
 
-    assert _context_status(_config(tmp_path, **cpu))[1] is None  # off, and not installed: nothing wrong
-    ok, details = _context_status(_config(tmp_path, **on))[1:]
+    assert context_status(_config(tmp_path, **cpu))[1] is None  # off, and not installed: nothing wrong
+    ok, details = context_status(_config(tmp_path, **on))[1:]
     assert ok is False and "video-beep-remover[context]" in details
 
     installed.update(torch=True, transformers=True)
-    ok, details = _context_status(_config(tmp_path, **on))[1:]
+    ok, details = context_status(_config(tmp_path, **on))[1:]
     assert ok is True and "no judge (no GPU); report only" in details
     acting = {**on, "context.harmless": "keep", "context.sexual": "mute"}
     assert (
         "keeps harmless uses and mutes sexual lines (experimental)"
-        in _context_status(_config(tmp_path, **acting))[2]
+        in context_status(_config(tmp_path, **acting))[2]
     )
     assert "not downloaded yet: unitary/unbiased-toxic-roberta" in details
     judged = {**on, "context.judge": "Qwen/Qwen3-4B-Instruct-2507", "offline": True}
-    ok, details = _context_status(_config(tmp_path, **judged))[1:]
+    ok, details = context_status(_config(tmp_path, **judged))[1:]
     assert ok is False and "judge Qwen/Qwen3-4B-Instruct-2507" in details  # offline, nothing downloaded
     downloaded.update({"unitary/unbiased-toxic-roberta", "Qwen/Qwen3-4B-Instruct-2507"})
-    ok, details = _context_status(_config(tmp_path, **judged))[1:]
+    ok, details = context_status(_config(tmp_path, **judged))[1:]
     assert ok is True and "not downloaded" not in details
 
 

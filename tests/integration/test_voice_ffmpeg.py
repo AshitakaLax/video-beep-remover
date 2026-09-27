@@ -88,6 +88,7 @@ def run(
     editor: Editor,
     tracks: Sequence[Track] = (Track(default=True), Track(title="Downmix")),  # the same dialogue twice
     audio_codec: str = "flac",
+    name: str = "movie.mkv",
     **overrides: Any,
 ) -> tuple[Pipeline, Any]:
     loaded = load_config(
@@ -104,7 +105,7 @@ def run(
         context_models=(lambda name, device: Classifier(), lambda name, device: None),
         voice_models=(Separator, lambda: editor, Encoder),
     )
-    source = make_clip(tmp_path / "movie.mkv", audio_codec=audio_codec, tracks=tracks)
+    source = make_clip(tmp_path / name, audio_codec=audio_codec, tracks=tracks)
     return pipeline, pipeline.process(source, RunOptions(review_srt=True, edl=True))
 
 
@@ -157,6 +158,15 @@ def test_a_surround_track_is_edited_in_its_front_centre(tmp_path: Path) -> None:
     # The music under the word stays.
     assert tone_gain(left, 2.2, frequency=MUSIC_HZ, window=0.1) == pytest.approx(1.0, abs=0.02)
     assert tone_gain(left, 2.2, frequency=NEW_WORD_HZ, window=0.1) < 0.01
+
+
+def test_a_word_is_said_again_in_an_mp4(tmp_path: Path) -> None:
+    # AAC in MP4, as most downloaded films are: the old tone cancels only at the exact sample.
+    _, result = run(tmp_path, Editor(), tracks=(Track(default=True),), audio_codec="aac", name="movie.mp4")
+    assert (result.status, result.replaced, result.output.name) == ("cleaned", 1, "movie.clean.mp4")
+    samples = decode(result.output)
+    assert tone_gain(samples, 2.2, window=0.1) < 0.01
+    assert tone_gain(samples, 2.2, frequency=NEW_WORD_HZ, window=0.1) == pytest.approx(1.0, abs=0.02)
 
 
 def test_a_word_that_fails_the_check_is_muted(tmp_path: Path) -> None:

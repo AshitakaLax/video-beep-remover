@@ -7,7 +7,7 @@ from video_beep_remover.asr.faster_whisper import resolve_anchor_model, resolve_
 from video_beep_remover.config.schema import Category, LexiconConfig, TranscriptionConfig
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.errors import ConfigError
-from video_beep_remover.pipeline import resolve_output
+from video_beep_remover.outputs import resolve_output
 
 MOVIE = Path("/videos/The Movie (2019).mkv")
 

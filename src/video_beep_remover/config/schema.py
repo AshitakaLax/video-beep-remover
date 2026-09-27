@@ -106,6 +106,8 @@ class SubtitlesConfig(_Model):
 
 class OutputConfig(_Model):
     path: str = "{stem}.clean{ext}"
+    mode: Literal["new", "backup", "in_place"] = "new"  # where the cleaned file goes (outputs.place)
+    backup_path: str = "{stem}.orig{ext}"  # where "backup" keeps the original
     overwrite: bool = False
     when_clean: Literal["copy", "skip"] = "copy"
     audio_codec: str = "auto"

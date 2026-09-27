@@ -65,6 +65,7 @@ from video_beep_remover.media.render import (
     render,
 )
 from video_beep_remover.models import CensorInterval, Detection, Word
+from video_beep_remover.outputs import Placement, edl_path, place, report_path, review_path
 from video_beep_remover.report import (
     SCHEMA_VERSION,
     detection_dict,
@@ -87,7 +88,7 @@ from video_beep_remover.ui import UI, NullUI, Progress
 from video_beep_remover.voice import Candidate, Replacement, Replacer, VoiceModels
 from video_beep_remover.voice import check_installed as check_voice_installed
 
-__all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOptions", "resolve_output"]
+__all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOptions"]
 
 Status = Literal["cleaned", "copied", "clean", "scanned", "skipped"]
 TranscriberFactory = Callable[[ModelChoice], Transcriber]
@@ -111,6 +112,7 @@ class FileResult:
     input: Path
     status: Status
     output: Path | None = None
+    backup: Path | None = None  # --backup: where the unmodified original is kept
     report: Path | None = None
     edl: Path | None = None
     review: Path | None = None  # the review subtitles
@@ -159,6 +161,7 @@ class Job:
     verdicts: list[dict[str, Any] | None] = field(default_factory=list)  # one per detection
     replacements: list[Replacement] = field(default_factory=list)  # voice replacement (DESIGN.md §16)
     render: bool = False
+    backup: Path | None = None  # --backup: where the original goes when the output takes its place
     rendered: RenderResult | None = None
     timings: dict[str, float] = field(default_factory=dict)
 
@@ -166,33 +169,6 @@ class Job:
         now = time.monotonic()
         self.timings[name] = round(self.timings.get(name, 0.0) + now - self.clock, 3)
         self.clock = now
-
-
-def resolve_output(source: Path, template: str, explicit: Path | None, *, many: bool) -> Path:
-    """Apply output.path ({stem}, {ext}, {dir}); -o may name a file or a directory.
-
-    An -o path without a file extension is a directory, even if it does not exist yet."""
-    try:
-        name = template.format(stem=source.stem, ext=source.suffix, dir=str(source.parent))
-    except (KeyError, IndexError, ValueError) as exc:
-        raise ConfigError(
-            f"output.path {template!r}: unknown placeholder {exc} (use {{stem}}, {{ext}}, {{dir}})"
-        ) from exc
-    candidate = Path(name).expanduser()
-    if explicit is not None:
-        if many or explicit.is_dir() or not explicit.suffix or str(explicit).endswith(("/", "\\")):
-            return explicit / candidate.name
-        return explicit
-    return candidate if candidate.is_absolute() else source.parent / candidate
-
-
-def _report_path(options: RunOptions, source: Path, output: Path | None, many: bool) -> Path:
-    if options.report is not None:
-        if many or options.report.is_dir():
-            return options.report / f"{source.stem}.vbr.json"
-        return options.report
-    base = output or source
-    return base.with_name(f"{base.stem}.vbr.json")
 
 
 def _context_device(setting: str) -> str:
@@ -486,16 +462,20 @@ class Pipeline:
         prepared = self.prepare(source, options, many=many, from_folder=from_folder)
         return prepared if isinstance(prepared, FileResult) else self.finish(prepared)
 
-    def _check_output(self, source: Path, options: RunOptions, many: bool) -> Path | FileResult:
-        """The output path, or a skipped result for --skip-existing."""
-        output = resolve_output(source, self.config.output.path, options.output, many=many)
-        if output.resolve() == source.resolve():
-            raise UsageError(f"the output would overwrite the input: {output}")
-        if output.exists() and not (options.overwrite or self.config.output.overwrite):
+    def _check_output(self, source: Path, options: RunOptions, many: bool) -> Placement | FileResult:
+        """Where the cleaned file goes (outputs.place), or a skipped result: for --skip-existing, or for
+        a file whose backup already exists, since a backup is never overwritten."""
+        placement = place(source, self.config.output, options.output, many=many)
+        output, backup = placement.output, placement.backup
+        if backup is not None and backup.exists():
+            note = f"cleaned before: its original is kept as {backup.name}"
+            return FileResult(source, "skipped", output=output, backup=backup, notes=[note])
+        exists = not placement.replaces_source and output.exists()
+        if exists and not (options.overwrite or self.config.output.overwrite):
             if options.skip_existing:
                 return FileResult(source, "skipped", output=output, notes=["output already exists"])
             raise UsageError(f"{output} already exists (use --overwrite or --skip-existing)")
-        return output
+        return placement
 
     def prepare(
         self, source: Path, options: RunOptions, *, many: bool = False, from_folder: bool = False
@@ -511,12 +491,12 @@ class Pipeline:
             check_installed()  # the layer runs last: fail before the transcription, not after it
         if cfg.replace.enabled and self._voice_models is None:
             check_voice_installed()
-        output = None
+        placement = None
         if not options.dry_run:
             checked = self._check_output(source, options, many)
             if isinstance(checked, FileResult):
                 return checked
-            output = checked
+            placement = checked
 
         info = probe(self.ff, source)
         tag = info.tags.get(CENSORED_TAG.lower())
@@ -536,9 +516,10 @@ class Pipeline:
             stream=stream,
             workdir=Path(tempfile.mkdtemp(prefix="vbr-")),
             result=FileResult(source, "scanned"),
-            output=output,
+            output=placement.output if placement else None,
             started=started,
             clock=started,
+            backup=placement.backup if placement else None,
         )
         job.lap("probe")
         try:
@@ -694,6 +675,7 @@ class Pipeline:
                 plan,
                 job.intervals,
                 output=job.output,
+                backup=job.backup,
                 fade=cfg.censor.fade_ms / 1000,
                 output_config=cfg.output,
                 workdir=job.workdir,
@@ -713,9 +695,11 @@ class Pipeline:
         result = job.result
         result.status = "cleaned" if job.intervals else "copied"
         result.output = job.output
+        result.backup = job.backup
         result.notes = list(plan.notes)
         output: dict[str, Any] = {
             "path": str(job.output),
+            "backup": str(job.backup) if job.backup else None,
             "encoders": {str(index): encoder for index, encoder in rendered.encoders.items()},
             "muted_spans": [interval_dict(i) for i in rendered.intervals],
             "verified_spans": rendered.verified_spans,
@@ -738,6 +722,7 @@ class Pipeline:
                     mask=cfg.output.subtitle_mask,
                     fps=job.info.frame_rate,
                     overwrite=job.options.overwrite or cfg.output.overwrite,
+                    backup=job.backup,
                 )
                 result.subtitle_copy = copy.path
                 output["subtitle_copy"] = {"source": str(path), "path": str(copy.path), "masked": copy.masked}
@@ -781,10 +766,10 @@ class Pipeline:
         overwrite = options.overwrite or cfg.output.overwrite
         job.timings["total"] = round(time.monotonic() - job.started, 3)
         if job.report is not None and (options.report is not None or cfg.output.report):
-            result.report = _report_path(options, job.source, job.output, job.many)
+            result.report = report_path(options.report, job.source, job.output, many=job.many)
             write_json(result.report, job.report)
         if options.edl or cfg.output.edl:
-            edl = job.source.with_suffix(".edl")
+            edl = edl_path(job.source, job.backup)
             if edl.exists() and not overwrite:
                 ui.warn(f"not overwriting existing {edl.name} (use --overwrite)")
             else:
@@ -793,7 +778,7 @@ class Pipeline:
         if options.review_srt or cfg.output.review_srt:
             rendered = job.rendered
             base = rendered.output if rendered else job.source
-            review = base.with_name(f"{base.stem}.review.srt")
+            review = review_path(base)
             if review.exists() and not overwrite and rendered is None:
                 ui.warn(f"not overwriting existing {review.name} (use --overwrite)")
             else:
@@ -1058,18 +1043,29 @@ class Pipeline:
         job.lap("replace")
 
     def render_report(
-        self, source: Path, report: Path, options: RunOptions, *, force: bool = False
+        self,
+        source: Path,
+        report: Path,
+        options: RunOptions,
+        *,
+        force: bool = False,
+        many: bool = False,
+        from_folder: bool = False,
     ) -> FileResult:
         """`vbr render`: mute the report's `intervals`, which may have been edited by hand, without
-        detecting anything. The report is only read, never rewritten."""
+        detecting anything. The report is only read, never rewritten. `from_folder`: as for prepare, a
+        file vbr already censored is skipped."""
         cfg = self.config
         started = time.monotonic()
         data = read_report(report)
         intervals = report_intervals(data)
-        checked = self._check_output(source, options, many=False)
+        checked = self._check_output(source, options, many)
         if isinstance(checked, FileResult):
             return checked
         info = probe(self.ff, source)
+        tag = info.tags.get(CENSORED_TAG.lower())
+        if tag is not None and from_folder:
+            return FileResult(source, "skipped", notes=[f"already censored by vbr ({CENSORED_TAG}={tag})"])
         mismatch = report_mismatch(data, info, source)
         if mismatch and not force:
             raise UsageError(
@@ -1096,14 +1092,15 @@ class Pipeline:
         job = Job(
             source=source,
             options=options,
-            many=False,
+            many=many,
             info=info,
             stream=stream,
             workdir=Path(tempfile.mkdtemp(prefix="vbr-")),
             result=FileResult(
                 source, "scanned", detections=len(detections), intervals=len(intervals), strategy="report"
             ),
-            output=checked,
+            output=checked.output,
+            backup=checked.backup,
             started=started,
             clock=started,
             intervals=intervals,

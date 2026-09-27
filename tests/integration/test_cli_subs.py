@@ -62,6 +62,15 @@ def test_subs_fails_when_nothing_is_usable(tmp_path: Path, heard: list[Word]) ->
     assert result.output.count("✘") == 2  # the embedded stream and the English sidecar
 
 
+def test_subs_goes_through_a_folder(tmp_path: Path, heard: list[Word]) -> None:
+    movie(tmp_path)
+    make_clip(tmp_path / "other.mp4", duration=2.0)  # no subtitles at all
+    result = runner.invoke(app, ["subs", str(tmp_path), "--no-sync", "--offline"])
+    assert result.exit_code == 4, result.output  # one of the two has none
+    assert result.output.index("movie.mkv") < result.output.index("other.mp4")
+    assert "movie.en.sdh.srt" in result.output and "no subtitle candidates found" in result.output
+
+
 def test_subtitles_option_needs_a_single_input(tmp_path: Path) -> None:
     first, second = make_clip(tmp_path / "a.mkv", duration=1.0), make_clip(tmp_path / "b.mkv", duration=1.0)
     subs = tmp_path / "x.srt"

@@ -1,6 +1,7 @@
 """Subtitles in the cleaned output (DESIGN.md §6.11): the file's own text subtitle streams, masked and
 muxed back in place, and a masked copy of the subtitle file the analysis used, next to the output."""
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -91,15 +92,27 @@ def write_censored_copy(
     mask: Mask,
     fps: float | None,
     overwrite: bool,
+    backup: Path | None = None,
 ) -> CensoredCopy:
     """A masked copy of `subtitle`, next to the output and named after it, so players load it with the
-    cleaned file. The original is never changed."""
+    cleaned file.
+
+    When the cleaned file took the video's place (--in-place, --backup), the copy takes the subtitle
+    file's place too. With --backup, `backup` is where the video's original went, and the subtitle file
+    is first kept next to it under the matching name ("Movie.en.srt" -> "Movie.orig.en.srt")."""
     target = censored_copy_path(subtitle, video, output, language)
-    if target.resolve() == subtitle.resolve():
+    in_place = target.resolve() == subtitle.resolve()
+    if in_place and output.resolve() != video.resolve():
         raise SubtitleError(f"the censored copy would overwrite {subtitle}")
-    if target.exists() and not overwrite:
+    if target.exists() and not (overwrite or in_place):
         raise SubtitleError(f"{target.name} already exists (use --overwrite)")
     done = censor_subtitles(read_subtitle_file(subtitle, language), lexicon, mask, fps=fps)
+    if in_place and backup is not None:
+        kept = censored_copy_path(subtitle, video, backup, language)
+        if kept.exists():
+            raise SubtitleError(f"{kept.name} already exists; {subtitle.name} was left as it is")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(subtitle, kept)
     tmp = target.with_name(f".{target.name}.tmp")
     tmp.write_text(done.text, "utf-8")
     tmp.replace(target)
