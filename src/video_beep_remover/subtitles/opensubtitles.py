@@ -73,30 +73,46 @@ def _message(response: httpx.Response) -> str:
     return response.reason_phrase
 
 
+def _json(response: httpx.Response, what: str) -> dict[str, Any]:
+    """The JSON object of a successful response; a proxy's or CDN's error page raises."""
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise OpenSubtitlesError(f"{what}: the answer is not JSON: {response.text.strip()[:100]!r}") from exc
+    if not isinstance(data, dict):
+        raise OpenSubtitlesError(f"{what}: unexpected answer {str(data)[:100]!r}")
+    return data
+
+
 def parse_results(data: Any) -> list[OnlineSubtitle]:
+    """The usable results of a search; malformed ones are skipped."""
+    items = data.get("data") if isinstance(data, dict) else None
     results = []
-    for item in (data or {}).get("data") or []:
-        attributes = item.get("attributes") or {}
-        files = attributes.get("files") or []
-        if len(files) != 1 or not isinstance(files[0].get("file_id"), int):
-            continue  # split over several CDs, or malformed
-        fps = attributes.get("fps")
-        results.append(
-            OnlineSubtitle(
-                file_id=files[0]["file_id"],
-                file_name=files[0].get("file_name"),
-                language=attributes.get("language"),
-                hearing_impaired=bool(attributes.get("hearing_impaired")),
-                foreign_parts_only=bool(attributes.get("foreign_parts_only")),
-                machine_translated=bool(
-                    attributes.get("machine_translated") or attributes.get("ai_translated")
-                ),
-                fps=float(fps) if isinstance(fps, int | float) and fps > 0 else None,
-                release=attributes.get("release") or None,
-                download_count=int(attributes.get("download_count") or 0),
-                moviehash_match=bool(attributes.get("moviehash_match")),
+    for item in items if isinstance(items, list) else []:
+        try:
+            attributes = item.get("attributes") or {}
+            files = attributes.get("files") or []
+            if len(files) != 1 or not isinstance(files[0].get("file_id"), int):
+                continue  # split over several CDs
+            fps = attributes.get("fps")
+            results.append(
+                OnlineSubtitle(
+                    file_id=files[0]["file_id"],
+                    file_name=files[0].get("file_name"),
+                    language=attributes.get("language"),
+                    hearing_impaired=bool(attributes.get("hearing_impaired")),
+                    foreign_parts_only=bool(attributes.get("foreign_parts_only")),
+                    machine_translated=bool(
+                        attributes.get("machine_translated") or attributes.get("ai_translated")
+                    ),
+                    fps=float(fps) if isinstance(fps, int | float) and fps > 0 else None,
+                    release=attributes.get("release") or None,
+                    download_count=int(attributes.get("download_count") or 0),
+                    moviehash_match=bool(attributes.get("moviehash_match")),
+                )
             )
-        )
+        except (AttributeError, TypeError, ValueError):
+            continue  # malformed
     return results
 
 
@@ -155,6 +171,8 @@ class OpenSubtitlesClient:
                     raise OpenSubtitlesError(f"cannot reach {httpx.URL(url).host}: {exc}") from exc
                 self._sleep(min(MAX_WAIT_S, 2.0**attempt))
                 continue
+            except httpx.HTTPError as exc:  # e.g. too many redirects: trying again would not help
+                raise OpenSubtitlesError(f"request to {httpx.URL(url).host} failed: {exc}") from exc
             if (response.status_code == 429 or response.status_code >= 500) and not last:
                 wait = _retry_after(response)
                 self._sleep(wait if wait is not None else min(MAX_WAIT_S, 2.0**attempt))
@@ -183,7 +201,7 @@ class OpenSubtitlesClient:
         response = self._api("POST", "/login", json={"username": self.username, "password": self.password})
         if response.status_code != 200:
             raise OpenSubtitlesError(f"login failed: {_message(response)}")
-        data = response.json()
+        data = _json(response, "login")
         self.token = data.get("token") or None
         self.user = data.get("user") if isinstance(data.get("user"), dict) else None
         base_url = data.get("base_url")
@@ -218,7 +236,7 @@ class OpenSubtitlesClient:
         response = self._api("GET", "/subtitles", params=ordered)
         if response.status_code != 200:
             raise OpenSubtitlesError(f"search failed: HTTP {response.status_code}: {_message(response)}")
-        return parse_results(response.json())
+        return parse_results(_json(response, "search"))
 
     def download(self, file_id: int) -> Download:
         """Download one subtitle file. Counts against the daily quota."""
@@ -241,13 +259,16 @@ class OpenSubtitlesClient:
             raise OpenSubtitlesError(f"download failed: HTTP {response.status_code}: {_message(response)}")
         content = bytearray()
         # The link points at the file itself; the API key is not sent there.
-        with self._http.stream("GET", str(data["link"]), headers={"Accept": "*/*"}) as stream:
-            if stream.status_code != 200:
-                raise OpenSubtitlesError(f"download failed: HTTP {stream.status_code} for the file")
-            for chunk in stream.iter_bytes():
-                content += chunk
-                if len(content) > MAX_DOWNLOAD_BYTES:
-                    raise OpenSubtitlesError("the subtitle file is larger than 5 MB; refusing it")
+        try:
+            with self._http.stream("GET", str(data["link"]), headers={"Accept": "*/*"}) as stream:
+                if stream.status_code != 200:
+                    raise OpenSubtitlesError(f"download failed: HTTP {stream.status_code} for the file")
+                for chunk in stream.iter_bytes():
+                    content += chunk
+                    if len(content) > MAX_DOWNLOAD_BYTES:
+                        raise OpenSubtitlesError("the subtitle file is larger than 5 MB; refusing it")
+        except httpx.HTTPError as exc:
+            raise OpenSubtitlesError(f"download failed: {exc}") from exc
         remaining = data.get("remaining")
         return Download(
             data=bytes(content),

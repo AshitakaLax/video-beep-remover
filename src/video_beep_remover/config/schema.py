@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _Model(BaseModel):
@@ -132,18 +132,39 @@ _TRIGGERS = [
 ]  # fmt: skip
 
 
+class ContextApiConfig(_Model):
+    """A judge behind an API (context.judge = "api", DESIGN.md §17.10)."""
+
+    provider: Literal["gemini", "jev", "openai"] = "gemini"  # "openai": any OpenAI-compatible chat API
+    url: str = ""  # "": the provider's
+    model: str = ""  # "": the provider's default
+    api_key: str = ""
+    reasoning_effort: str = "auto"  # "auto": Gemini thinks little ("none" on 2.5); "": never sent
+    timeout_s: float = Field(30, gt=0)
+
+
 class ContextConfig(_Model):
     enabled: bool = False
     harmless: Literal["report", "keep"] = "report"  # "keep": leave uses judged harmless unmuted
     sexual: Literal["report", "mute"] = "report"  # "mute": mute the lines flagged as sexual
     classifier: str = "unitary/unbiased-toxic-roberta"
-    judge: str = "auto"  # "auto": the default judge on a CUDA GPU, none on a CPU; "": none
+    judge: str = "auto"  # "auto": the default judge on a CUDA GPU, none on a CPU; "api"; "": none
+    api: ContextApiConfig = Field(default_factory=ContextApiConfig)
     ambiguous: list[str] = Field(default_factory=lambda: list(_AMBIGUOUS))
     triggers: list[str] = Field(default_factory=lambda: list(_TRIGGERS))
     min_sexual_score: float = Field(0.5, ge=0, le=1)
     clean_below: float = Field(0.3, ge=0, le=1)
     profane_above: float = Field(0.5, ge=0, le=1)
     min_heard: float = Field(0.7, ge=0, le=1)  # share of a subtitle line's words heard, to trust it
+
+    @model_validator(mode="after")
+    def _api_complete(self) -> "ContextConfig":
+        api = self.api
+        if self.judge == "api" and not api.api_key:
+            raise ValueError('judge = "api" needs context.api.api_key (e.g. "${VBR_JUDGE_API_KEY}")')
+        if self.judge == "api" and api.provider == "openai" and not (api.url and api.model):
+            raise ValueError('context.api.provider = "openai" needs context.api.url and context.api.model')
+        return self
 
 
 _SUBSTITUTES = {
@@ -189,6 +210,10 @@ class ReplaceConfig(_Model):
     )
 
 
+class ModelsConfig(_Model):
+    keep_loaded: bool = False  # true: keep every model in memory; false: one large model at a time
+
+
 class CacheConfig(_Model):
     dir: str = "auto"
     max_size_gb: float = Field(5, ge=0)
@@ -211,5 +236,6 @@ class Config(_Model):
     output: OutputConfig = Field(default_factory=OutputConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     replace: ReplaceConfig = Field(default_factory=ReplaceConfig)
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)

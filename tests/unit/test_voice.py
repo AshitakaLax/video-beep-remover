@@ -9,6 +9,7 @@ import pytest
 from helpers import say
 from video_beep_remover.context.analyse import ContextResult, Verdict, choose_substitutes
 from video_beep_remover.context.lines import Line
+from video_beep_remover.context.models import Question
 from video_beep_remover.errors import DependencyError
 from video_beep_remover.models import CensorInterval, Detection
 from video_beep_remover.report import review_srt
@@ -34,7 +35,8 @@ class Judge:
         self.answer = answer
         self.questions: list[str] = []
 
-    def ask(self, prompt: str) -> str:
+    def ask(self, question: Question) -> str:
+        prompt = question.text
         self.questions.append(prompt)
         return self.answer
 

@@ -148,3 +148,30 @@ def test_clean_a_folder_from_the_command_line(tmp_path: Path, monkeypatch: pytes
 
 
 runner = CliRunner()
+
+
+def test_an_unexpected_error_fails_only_its_own_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("a.mkv", "b.mkv", "c.mkv"):
+        make_clip(tmp_path / name, duration=3.0)
+    run = pipeline(tmp_path)
+    prepare, finish = run.prepare, run.finish
+
+    def failing_prepare(source: Path, *args: Any, **kwargs: Any) -> Any:
+        if source.name == "a.mkv":
+            raise KeyError("a bug")
+        return prepare(source, *args, **kwargs)
+
+    def failing_finish(job: Any, *args: Any, **kwargs: Any) -> Any:
+        if job.source.name == "b.mkv":  # rendered in the background, while c.mkv is analysed
+            raise PermissionError(13, "Permission denied")
+        return finish(job, *args, **kwargs)
+
+    monkeypatch.setattr(run, "prepare", failing_prepare)
+    monkeypatch.setattr(run, "finish", failing_finish)
+    outcomes: list[Outcome] = []
+    run_batch(run, collect_inputs([tmp_path], recursive=False), RunOptions(), outcomes.append)
+    assert [(o.path.name, o.result.status if o.result else str(o.error)) for o in outcomes] == [
+        ("a.mkv", "unexpected KeyError: 'a bug' (run with -v for the details)"),
+        ("b.mkv", "unexpected PermissionError: [Errno 13] Permission denied (run with -v for the details)"),
+        ("c.mkv", "cleaned"),
+    ]

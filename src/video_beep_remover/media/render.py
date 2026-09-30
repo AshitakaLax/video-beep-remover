@@ -1,6 +1,7 @@
 """Write the cleaned file: mute spans with afade driven by a command file (DESIGN.md §6.11), and add
 the changes that voice replacement made to a replaced word's span (§16)."""
 
+import contextlib
 import logging
 import math
 import os
@@ -14,8 +15,9 @@ from typing import Literal
 import numpy as np
 
 from video_beep_remover.config.schema import OutputConfig
-from video_beep_remover.errors import DependencyError, RenderError, VbrError
+from video_beep_remover.errors import DependencyError, RenderError
 from video_beep_remover.languages import lang_matches
+from video_beep_remover.media.audio import SAMPLE_RATE, Audio
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
 from video_beep_remover.media.probe import MediaInfo, StreamInfo, parse_probe
 from video_beep_remover.models import CensorInterval
@@ -27,6 +29,8 @@ MIN_GAP_S = 0.05  # closer spans are merged: the range between them must contain
 MIN_SPAN_S = 0.06  # shorter spans are lengthened, for the same reason
 VERIFY_MARGIN_S = 0.025  # distance kept from the fades when checking that a span is silent
 SILENCE_DBFS = -60.0
+SPLICE_MARGIN_S = 0.5  # heard around a replaced word when checking it in the output, so it is not cut
+MIN_DURATION_LOSS_S = 2.0  # an output this much shorter than the input (or 1 % shorter) was cut short
 MP4_LIKE = frozenset({".mp4", ".m4v", ".m4a", ".mov"})
 CENSORED_TAG = "VBR_CENSORED"  # "<version>;<config hash>" on every output, so later runs can skip it
 
@@ -370,7 +374,18 @@ def level_dbfs(samples: np.ndarray) -> float:
     return 20 * math.log10(rms + 1e-12)
 
 
-def timeline_shift(ff: FFmpeg, info: MediaInfo, plan: StreamPlan, rendered: Path) -> float:
+def check_output(info: MediaInfo, plan: StreamPlan, rendered: MediaInfo) -> str | None:
+    """Why the rendered file cannot take the place of the input, if it cannot: streams missing, or cut
+    short. Muted spans are checked on their own (verify_muted); this catches what they cannot see,
+    which matters most when the output replaces the original (--in-place)."""
+    if len(rendered.streams) < len(plan.actions):
+        return f"it has {len(rendered.streams)} streams, {len(plan.actions)} were written"
+    if rendered.duration < info.duration - max(MIN_DURATION_LOSS_S, 0.01 * info.duration):
+        return f"it is {rendered.duration:.1f} s long, the input {info.duration:.1f} s"
+    return None
+
+
+def timeline_shift(info: MediaInfo, plan: StreamPlan, rendered_info: MediaInfo) -> float:
     """How much later the content sits on the rendered file's timeline than on the input's, in seconds.
 
     Both timelines start at their file's earliest timestamp. Re-encoding can move that: an AAC
@@ -378,10 +393,6 @@ def timeline_shift(ff: FFmpeg, info: MediaInfo, plan: StreamPlan, rendered: Path
     and in Matroska it can make the new file start earlier than the old one did. FFmpeg shifts every
     stream alike, so a stream-copied one (usually the video) shows the shift. Returns 0 when there is
     no copied stream with a start time."""
-    try:
-        rendered_info = parse_probe(rendered, ff.probe(rendered))
-    except VbrError:
-        return 0.0
     for position, action in enumerate(plan.actions):
         stream = action.stream
         if action.action != "copy" or stream.start_time is None or stream.is_attached_picture:
@@ -443,6 +454,37 @@ def verify_muted(
     return len(jobs), failures
 
 
+SpliceCheck = Callable[[Audio, float, CensorInterval], "str | None"]
+
+
+def verify_splices(
+    ff: FFmpeg,
+    path: Path,
+    spliced: Mapping[int, Sequence[CensorInterval]],
+    check: SpliceCheck,
+    *,
+    shift: float = 0.0,
+) -> dict[CensorInterval, str]:
+    """Hear every replaced word in the rendered file, where no mute protects it, and return the spans
+    that fail `check`, with why. `check` hears 16 kHz mono audio that starts at a media time (on the
+    input's timeline) and says what is wrong in a span, or None. The replacement was checked before
+    rendering; this proves the renderer put it where the check heard it."""
+    failed: dict[CensorInterval, str] = {}
+    for position, spans in spliced.items():
+        for span in spans:
+            start = max(0.0, span.start - SPLICE_MARGIN_S)
+            length = span.end + SPLICE_MARGIN_S - start
+            data = ff.capture([
+                "-ss", f"{start + shift:.3f}", "-t", f"{length:.3f}", "-i", file_arg(path),
+                "-map", f"0:a:{position}", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1",
+            ])  # fmt: skip
+            audio = np.frombuffer(data, dtype=np.float32).copy()
+            problem = "no audio decoded" if audio.size == 0 else check(audio, start, span)
+            if problem is not None:
+                failed[span] = problem
+    return failed
+
+
 @dataclass(frozen=True)
 class RenderResult:
     output: Path
@@ -450,22 +492,48 @@ class RenderResult:
     intervals: tuple[CensorInterval, ...]
     verified_spans: int
     timeline_shift: float = 0.0  # the muted spans sit this much later in the output (see timeline_shift)
+    # Replaced words that failed verify_splices, and why: the output mutes them instead.
+    unspliced: tuple[tuple[CensorInterval, str], ...] = ()
+
+
+def _reason(exc: BaseException) -> str:
+    """Why a file operation failed; on Windows, usually another program holding the file open."""
+    return (exc.strerror if isinstance(exc, OSError) else None) or str(exc) or type(exc).__name__
 
 
 def _put_in_place(partial: Path, output: Path, backup: Path | None) -> None:
     """Rename the verified file to `output`, first moving what is there to `backup`, if given. If the
     rename fails, the original goes back."""
     if backup is None:
-        os.replace(partial, output)
+        try:
+            os.replace(partial, output)
+        except OSError as exc:
+            raise RenderError(f"could not write {output} ({_reason(exc)}); it was left as it is") from exc
         return
     if backup.exists():
         raise RenderError(f"{backup} already exists; the original was left as it is")
-    backup.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(output, backup)  # a rename, unless the backup is on another file system
+    try:
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(output, backup)  # a rename, unless the backup is on another file system
+    except OSError as exc:
+        if output.exists():  # a copy to another file system, cut short: it would pass for a backup
+            with contextlib.suppress(OSError):
+                backup.unlink(missing_ok=True)
+        raise RenderError(
+            f"could not move {output} to {backup} ({_reason(exc)}); it was left as it is"
+        ) from exc
     try:
         os.replace(partial, output)
-    except BaseException:
-        shutil.move(backup, output)
+    except BaseException as exc:
+        try:
+            shutil.move(backup, output)
+        except OSError as undo:
+            raise RenderError(
+                f"could not put the cleaned file at {output} ({_reason(exc)}), nor the original back "
+                f"({_reason(undo)}): the original is at {backup}"
+            ) from exc
+        if isinstance(exc, OSError):
+            raise RenderError(f"could not write {output} ({_reason(exc)}); it was left as it is") from exc
         raise
 
 
@@ -483,51 +551,77 @@ def render(
     tag: str | None = None,
     on_progress: Callable[[float], None] | None = None,
     splices: Mapping[int, Sequence[Splice]] | None = None,
+    check_splices: SpliceCheck | None = None,
     backup: Path | None = None,
 ) -> RenderResult:
-    """Render to <name>.partial<ext>, verify every muted span, then rename. Nothing half-written survives.
+    """Render to <name>.partial<ext>, verify it, then rename. Nothing half-written survives.
+
+    The output must have every stream and the input's length (check_output), and every muted span must
+    be silent (verify_muted). With `check_splices`, every replaced word is heard again (verify_splices);
+    one that fails is muted instead, and the file rendered again.
 
     `output` may be the input itself (--in-place, --backup): it is replaced only once the new file is
     verified. With `backup`, the input is first moved there, unmodified."""
     spans = normalize_intervals(intervals, info.duration)
     partial = output.with_name(f"{output.stem}.partial{output.suffix}")
-    command = build_command(
-        ff,
-        info,
-        plan,
-        spans,
-        fade=fade,
-        output=output_config,
-        target=partial,
-        subtitle_files=subtitle_files,
-        tag=tag,
-        splices=splices,
-    )
-    for name, text in command.files.items():
-        (workdir / name).write_text(text, "utf-8")
+    unspliced: dict[CensorInterval, str] = {}
     try:
-        ff.run(command.args, cwd=workdir, on_progress=on_progress)
-        shift = timeline_shift(ff, info, plan, partial)
-        checked, failures = verify_muted(
-            ff,
-            partial,
-            command.censored_positions,
-            spans,
-            fade,
-            shift=shift,
-            workers=os.cpu_count() or 4,
-            spliced=command.spliced,
-        )
-        if failures:
-            shown = "\n  ".join(failures[:10])
-            more = f"\n  … and {len(failures) - 10} more" if len(failures) > 10 else ""
-            raise RenderError(
-                f"verification failed: {len(failures)} of {checked} muted spans are not silent; "
-                f"the output was deleted.\n  {shown}{more}"
+        while True:
+            active = {
+                index: [s for s in added if s.span not in unspliced]
+                for index, added in (splices or {}).items()
+            }
+            command = build_command(
+                ff,
+                info,
+                plan,
+                spans,
+                fade=fade,
+                output=output_config,
+                target=partial,
+                subtitle_files=subtitle_files,
+                tag=tag,
+                splices=active,
             )
+            for name, text in command.files.items():
+                (workdir / name).write_text(text, "utf-8")
+            ff.run(command.args, cwd=workdir, on_progress=on_progress)
+            rendered = parse_probe(partial, ff.probe(partial))
+            problem = check_output(info, plan, rendered)
+            if problem:
+                raise RenderError(f"the rendered file is incomplete: {problem}; the output was deleted")
+            shift = timeline_shift(info, plan, rendered)
+            checked, failures = verify_muted(
+                ff,
+                partial,
+                command.censored_positions,
+                spans,
+                fade,
+                shift=shift,
+                workers=os.cpu_count() or 4,
+                spliced=command.spliced,
+            )
+            if failures:
+                shown = "\n  ".join(failures[:10])
+                more = f"\n  … and {len(failures) - 10} more" if len(failures) > 10 else ""
+                raise RenderError(
+                    f"verification failed: {len(failures)} of {checked} muted spans are not silent; "
+                    f"the output was deleted.\n  {shown}{more}"
+                )
+            failed = (
+                verify_splices(ff, partial, command.spliced, check_splices, shift=shift)
+                if check_splices is not None
+                else {}
+            )
+            if not failed:
+                break
+            # Each round mutes at least one more span, so this ends.
+            log.warning("replaced words that failed in the output, rendering again: %s", failed)
+            unspliced.update(failed)
         _put_in_place(partial, output, backup)
     except BaseException:
-        partial.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):  # on Windows, e.g. while a player still has it open
+            partial.unlink(missing_ok=True)
         raise
     log.debug("rendered %s, verified %d spans", output, checked)
     return RenderResult(
@@ -536,4 +630,5 @@ def render(
         intervals=tuple(spans),
         verified_spans=checked,
         timeline_shift=shift,
+        unspliced=tuple(unspliced.items()),
     )

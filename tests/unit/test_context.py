@@ -27,6 +27,7 @@ from video_beep_remover.context.models import (
     LABELS,
     CachedJudge,
     LocalJudge,
+    Question,
     ToxicityClassifier,
     _libraries,
 )
@@ -71,7 +72,8 @@ class Judge:
         self.answers = answers
         self.questions: list[str] = []
 
-    def ask(self, prompt: str) -> str:
+    def ask(self, question: Question) -> str:
+        prompt = question.text
         self.questions.append(prompt)
         line = next((part for part in prompt.splitlines() if part.startswith(">> ")), prompt)
         return next((answer for key, answer in self.answers.items() if key in line), "")
@@ -340,11 +342,12 @@ def test_the_judge_runs_by_default_only_on_a_gpu() -> None:
 def test_judge_answers_are_cached_on_disk(tmp_path: Path) -> None:
     judge = Judge({"x": '{"sexual": true}'})
     cached = CachedJudge(judge, tmp_path, version=1)
-    assert cached.ask("x?") == cached.ask("x?") == '{"sexual": true}'
+    question = Question("sexual", "x?", ">> x")
+    assert cached.ask(question) == cached.ask(question) == '{"sexual": true}'
     assert (cached.asked, len(judge.questions)) == (1, 1)
     again = CachedJudge(Judge({}), tmp_path, version=1)
-    assert again.ask("x?") == '{"sexual": true}' and again.asked == 0
-    assert CachedJudge(Judge({}), tmp_path, version=2).ask("x?") == ""  # a new question version
+    assert again.ask(question) == '{"sexual": true}' and again.asked == 0
+    assert CachedJudge(Judge({}), tmp_path, version=2).ask(question) == ""  # a new question version
 
 
 def test_the_layer_reports_verdicts_and_sexual_lines(tmp_path: Path) -> None:

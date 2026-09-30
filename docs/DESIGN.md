@@ -135,8 +135,9 @@ That file is deep-merged over the packaged defaults (`defaults.toml`, which is t
 | `[transcription]` | ASR backend, model, device, precision, batching, VAD, prompt |
 | `[subtitles]`, `.opensubtitles` | Source order, languages, preference for hearing-impaired tracks, credentials |
 | `[output]` | Output path, overwrite, codecs, other audio and subtitle streams, report and EDL |
+| `[models]` | Whether the models stay loaded together, or one at a time (§16) |
 | `[cache]`, `[tools]` | Cache location and size, FFmpeg and ffprobe paths |
-| `[context]`, `[replace]` (§17.8, §16) | Context analysis and its actions, ambiguous terms, sexual-content lines; voice replacement and its substitutes |
+| `[context]`, `.api`, `[replace]` (§17.8, §17.10, §16) | Context analysis and its actions, ambiguous terms, sexual-content lines, a judge behind an API; voice replacement and its substitutes |
 
 A minimal config needs only the word list:
 
@@ -569,7 +570,7 @@ ffmpeg -hide_banner -nostdin -y -i file:/abs/in.mkv -filter_complex_script graph
   -progress pipe:1 -nostats file:/abs/out.partial.mkv
 ```
 
-**Verifying the output.** FFmpeg ignores a filter command it rejects without any warning, and still exits with code 0. A generator bug or an unusual FFmpeg build could therefore produce an unmuted file silently. So after rendering, the tool decodes the core of every muted span from the output (the span minus its fades) using input seeking, which is cheap. Each core must be below −60 dBFS RMS. If any span fails, the output is deleted and the run exits with code 1. Re-encoding can move the output's timeline. An AAC encoder's priming packet sits before the first sample, and in Matroska it can make the new file start earlier than the old one: 21 ms at 48 kHz, 46 ms at 22.05 kHz. FFmpeg shifts every stream alike, so the check measures the shift on a stream-copied stream, usually the video, and looks that much later. The mutes themselves are unaffected, since the filter works on the input's timeline, and audio and video stay in sync. The report records the shift as `output.timeline_shift`. `vbr doctor` runs the same graph on a one-second synthetic tone, which catches an FFmpeg that can't run the graph before any real work starts.
+**Verifying the output.** FFmpeg ignores a filter command it rejects without any warning, and still exits with code 0. A generator bug or an unusual FFmpeg build could therefore produce an unmuted file silently. So after rendering, the tool decodes the core of every muted span from the output (the span minus its fades) using input seeking, which is cheap. Each core must be below −60 dBFS RMS. If any span fails, the output is deleted and the run exits with code 1. Re-encoding can move the output's timeline. An AAC encoder's priming packet sits before the first sample, and in Matroska it can make the new file start earlier than the old one: 21 ms at 48 kHz, 46 ms at 22.05 kHz. FFmpeg shifts every stream alike, so the check measures the shift on a stream-copied stream, usually the video, and looks that much later. The mutes themselves are unaffected, since the filter works on the input's timeline, and audio and video stay in sync. The report records the shift as `output.timeline_shift`. The output must also keep every stream the plan wrote, and the input's length to within 2 s or 1 %: a file cut short has silent spans too, and with `--in-place` it would take the original's place. `vbr doctor` runs the same graph on a one-second synthetic tone, which catches an FFmpeg that can't run the graph before any real work starts.
 
 Filtered streams lose their per-stream tags, so language, title and disposition are re-applied from the probe. MP4 and MOV outputs also get `-movflags +faststart`. Progress comes from `out_time_us` on the `-progress` pipe.
 
@@ -754,7 +755,9 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - every network-backed subtitle provider, including those behind the subliminal adapter
   - model downloads
 
-  A provider's own `enabled` switch turns off only that provider. `vbr subs` shows what would be sent.
+  - a judge behind an API (`context.judge = "api"`, §17.10)
+
+  A provider's own `enabled` switch turns off only that provider. `vbr subs` shows what would be sent. An API judge is sent the lines it is asked about, each with its neighbours, and nothing else: no audio, no file names. vbr warns which host they go to when the layer starts.
 - **Secrets** come only from `${ENV}` expansion. They are never logged, and `config show` redacts them. `config check` warns if a readable config file contains a literal password.
 - **Subprocesses** run with argument lists and never through a shell. Paths get the `file:` prefix.
 - **Downloaded subtitles** are untrusted input. The tool caps their size, detects the encoding and parses them as text only. Archives from other providers are read in memory with size limits and never extracted to arbitrary paths.
@@ -913,7 +916,7 @@ Instead of silence, a listed word can be replaced by a milder one spoken in the 
 
 1. **Choice (§17.6).** Context analysis runs with replacement. The use must be `profane`, its line not sexual, and its delivery not shouted, whispered or tearful. The judge then picks one of the term's substitutes from `[replace.substitutes]` (e.g. `"*fuck*" = ["freaking", "frick", "fricking", "fudge"]`). Without a judge, a term with a single substitute uses it. A word whose muted span holds another muted word stays muted.
 2. **The sentence.** The heard words around the word, up to a sentence end or a pause of a second, give the text to say, with the substitute in the word's place and in its case and punctuation. A word only estimated from subtitles has no heard sentence, and stays muted.
-3. **Reading the track.** The sentence's window is read at the stream's own rate with every channel. It is cut by sample count in one pass from the start of the stream, for every word of the file at once. Seeking lands a few samples off in Matroska, whose timestamps are in milliseconds, and the next steps subtract the old voice sample-exactly.
+3. **Reading the track.** The sentence's window is read at the stream's own rate with every channel. It is cut by sample count in one pass from the start of the stream, for every word of the file at once. Seeking lands a few samples off in Matroska, whose timestamps are in milliseconds, and the next steps subtract the old voice sample-exactly. A window the stream ends in, or that FFmpeg fails to fill, is cut short rather than padded with silence, and its word stays muted: the change would subtract a silent voice and leave the old word in place.
 4. **Isolating the dialogue.** The front-centre channel of a surround track, or the front pair otherwise, goes through Demucs (`htdemucs`), which returns the voice without music and effects.
 5. **Saying it again.** F5-TTS regenerates the word's muted span inside the separated voice. The span's mel frames are masked and filled in from the sentence's text, and the rest of the sentence conditions them. So the new word keeps the speaker's voice, pace and pitch, and the span keeps its length, which keeps lip sync as far as it can.
 6. **The change.** The change is the new voice minus the old, within the span, faded over 20 ms at each edge. It is spread over the dialogue channels as the old voice was. The renderer mixes it into the analysed stream (FFmpeg `amix` after an `adelay` by sample count) and does not mute that span there. The music and effects under the word stay.
@@ -921,7 +924,8 @@ Instead of silence, a listed word can be replaced by a milder one spoken in the 
    - the substitute must be heard in the span, and no listed word;
    - the new word must sound like the speaker about as much as the old one did. Their ECAPA speaker embeddings are compared with the rest of the sentence's, and the new word's cosine may be at most `voice_margin` (0.15) below the old word's.
 
-   A word that fails stays muted.
+   A word that fails stays muted, and so does one that a model fails on, for example when the GPU runs out of memory. A model that cannot be loaded at all stops the run.
+8. **The check of the output.** After rendering, every replaced word is decoded from the output with half a second either side and transcribed again. No listed word may be heard in its span. This proves the renderer added the change where the check heard it. A word that fails is muted instead, and the file rendered again; the report gives the reason. Since this uses the speech recognition model, a batch renders a file with replaced words in the foreground.
 
 **Everywhere else, the span stays muted:** in other audio streams, since the change is made for the analysed stream's layout; in the EDL; and in `vbr render`, which cannot replace words. The report's `intervals` still include the span, and `replacements` lists each attempt:
 
@@ -944,6 +948,8 @@ The voice weights' non-commercial licence fits what the feature is for: personal
 **Why F5-TTS.** It edits speech in place (infilling), so the new word is conditioned on the audio around it, not just on a reference clip. Chatterbox (MIT) generates whole sentences only, and pins exact versions of PyTorch and transformers that conflict with the other extras.
 
 **Speed.** On the 4-vCPU container of Appendix E, a word took about 40 s with 32 sampling steps, most of it in F5-TTS; loading the models took another 15 s. A GPU is effectively required for a film.
+
+**Memory.** Whisper, the context models, Demucs and F5-TTS each take one to several GB. Held together, they did not fit a laptop with a 6 GB GPU and 16 GB of system memory: system memory ran so low that runs were stopped. On Windows, what does not fit on the GPU spills into system memory. So by default (`models.keep_loaded = false`) only one of them is loaded at a time. Before one runs, the pipeline drops the others and returns their memory (`Pipeline.make_room`). Voice replacement runs each model over every word before the next starts: Demucs separates every word's sentence, F5-TTS says every word again, then Whisper and the speaker encoder check them all. A file then loads each model once, which costs a few seconds. `models.keep_loaded = true` keeps them all loaded, which is faster with plenty of GPU memory. The speaker encoder is small and always stays. The CUDA runtimes, once loaded, stay until the process ends. On that laptop (RTX 4050), a 42-minute episode with three replaced words then peaked at 2.4 GB of GPU memory, with none spilled, and 3.7 GB of system memory for the process.
 
 **Hard parts still open.**
 
@@ -1164,6 +1170,31 @@ min_heard = 0.7                 # a subtitle line can show a use as harmless onl
   With these, no crafted line got a profane use called harmless. Words that are actually spoken are trusted, so an injection would have to be said aloud.
 - **Bias.** Toxicity classifiers are known to over-score identity terms. That matters little for lines already holding a listed word, but it is one more reason tier 1 alone never decides.
 - **Size and speed.** The classifier is about 500 MB; a judge is 1.5–4 billion parameters, which is 3–8 GB in 16-bit precision. On a CPU the judge must stay rare; on a GPU it is cheap.
+
+### 17.10 A judge behind an API
+
+The judge needs about 8 GB of GPU memory (Qwen3-4B in bfloat16), and a 6 GB laptop GPU does not have it. Without a judge, every ambiguous word is unsure, so it is muted and never replaced. A judge's questions are few and small, a few dozen per film, so a service online can answer them instead: `context.judge = "api"` and `[context.api]`.
+
+- **Two kinds of service.** A chat model behind an OpenAI-compatible API (`provider = "gemini"` or `"openai"`) gets the same wording and system prompt as the local judge, with temperature 0, and answers with the same JSON object. Jev's decision API (`provider = "jev"`) takes a *state* and typed questions instead, and answers each with the option it chose and the probabilities of all of them. So each question is also kept as data (`Question`: its kind, the dialogue shown, the word and the candidates), and the Jev judge asks it as choices: the use, the reason and the emotion for a sense question, a yes or no for a sexual one, and the candidates plus "none" for a substitute. Its answer is written as the JSON object the other judges give, so the rest of the layer does not change.
+- **Gemini.** The default model is `gemini-3.5-flash-lite`, on the free tier. Gemini 1.5 is no longer offered, and 2.5 is closed to new keys (a 404 says so). Gemini 3 models cannot turn thinking off, so `reasoning_effort = "auto"` asks for "low" (and "none" on 2.5). On five test questions (the "hell" idiom, "What the hell", the farmer's ass, "Your place or mine?", and a substitute for "fuck"), Flash-Lite answered all five correctly, in under a second each. `gemini-3.8-flash` answered the four context questions correctly too, taking up to 9 s, but its free tier allows 5 requests a minute, so the fifth waited out its retries and failed. Gemini puts the wait in the body of a 429 (`retryDelay`), which vbr honours.
+- **Probabilities.** Jev is taken at its word on a use only when it gives it at least 0.7 (`MIN_PROBABILITY`); below that the use stays unsure. Jev's authors say it is weak on adversarial content, which subtitles can be (§17.9). The defences of §17.9 do not depend on the judge: only heard lines can show a use as harmless, and the classifier must agree.
+- **Failures.** Rate limits (429), server errors and network errors are retried four times, waiting 5, 10 and 20 s or what the service asks. A question still unanswered raises `JudgeError`: the use stays unsure, which mutes it, and nothing is cached for it. A rejected key (401, 403) or an unknown model (404) raises `DependencyError` and stops the run, since every question would fail the same way.
+- **Cache.** Answers are cached by judge name (`gemini:gemini-3.5-flash-lite`, `jev:jev-latest`) and question, as for a local judge, so re-running a file asks nothing again.
+- **Privacy.** The lines asked about leave the machine (§10). It is opt-in, `--offline` turns it off, and vbr warns which host they go to. On Gemini's free tier, Google may use what is sent to improve its products.
+
+**Measured.** `scripts/evaluate_context.py --judge api` on the sets of Appendix D.2 and D.3, with `gemini-3.5-flash-lite` on the free tier (the classifier on a laptop CPU), against Qwen3-4B with the word masked (the M6 column of D.2):
+
+| | Qwen3-4B, local | Gemini 3.5 Flash-Lite |
+|---|---|---|
+| Harmless uses called harmless, of 16 | 10 | 15 |
+| Profane uses called harmless, of 17 | 0 | 0 |
+| Uses left unsure, of 33 | 0 | 0 |
+| Sexual lines flagged certain / at all, of 19 | 7 / 13 | 14 / 17 |
+| Other lines flagged certain / at all, of 19 | 0 / 8 | 0 / 8 |
+| Crafted lines: profane uses called harmless, of 12 | 0 | 0 |
+| Judge questions; time | 51; 23 s each on a CPU | 51; 223 s in all, waits for the rate limit included |
+
+Gemini missed one harmless use, and recognized innuendo the local judge did not ("I want to take you to bed tonight", "Your place or mine?", "He's an animal in bed"). It still missed "She wants to see my etchings, if you know what I mean" and "Stay the night with me", which hold no trigger word, so no judge is asked about them. The eight *possible* flags on other lines come from the rules, not the judge. On the crafted lines, the defences of §17.9 left nine of the injected uses unsure, the classifier settled one, and the judge called the two plain ones profane.
 
 ## Appendix A. Prototype measurements
 

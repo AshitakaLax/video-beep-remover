@@ -13,8 +13,9 @@ track, and:
 A word that fails any step is muted, as it would have been without replacement. The span is muted in
 every other audio stream, in the EDL, and by `vbr render`, which cannot replace words."""
 
+import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from video_beep_remover.config.schema import ReplaceConfig
 from video_beep_remover.detect.lexicon import Lexicon
 from video_beep_remover.detect.matcher import detect_in_words
 from video_beep_remover.detect.normalize import normalize_token, split_words
+from video_beep_remover.errors import DependencyError
 from video_beep_remover.media.audio import Audio
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
 from video_beep_remover.media.probe import StreamInfo
@@ -42,6 +44,8 @@ from video_beep_remover.voice.models import (
 from video_beep_remover.voice.splice import FloatArray
 
 __all__ = ["Candidate", "Replacement", "Replacer", "VoiceModels", "check_installed"]
+
+log = logging.getLogger(__name__)
 
 MARGIN_S = 0.3  # of the track read before and after the sentence
 MIN_REFERENCE_S = 1.0  # of the speaker's voice outside the span, to compare the new word with
@@ -130,6 +134,17 @@ class VoiceModels:
             self._encoder = self._make_encoder()
         return self._encoder
 
+    def release(self, name: str) -> bool:
+        """Drop the separation model ("separator") or the voice model ("editor"), so its memory can be
+        freed; its next use loads it again. Returns whether it was loaded. The speaker encoder is small
+        and stays."""
+        loaded = False
+        if name == "separator":
+            loaded, self._separator = self._separator is not None, None
+        elif name == "editor":
+            loaded, self._editor = self._editor is not None, None
+        return loaded
+
 
 def _tokens(text: str) -> list[str]:
     return [t for t in (normalize_token(raw) for raw, _, _ in split_words(text)) if t]
@@ -146,6 +161,43 @@ def _cosine(a: FloatArray, b: FloatArray) -> float:
     return float(np.dot(a, b) / norm) if norm > 0 else 0.0
 
 
+def _muted(candidate: Candidate, reason: str, **found: Any) -> Replacement:
+    span = candidate.span
+    word = candidate.detection.heard.strip()
+    return Replacement(candidate.index, span[0], span[1], word, candidate.substitute, False, reason, **found)
+
+
+def _guarded(step: "Callable[[_Work, StreamInfo, Path], None]", item: "_Work", *args: Any) -> None:
+    """Run one stage for one word; a model that fails on it mutes the word. A model that cannot be
+    loaded at all (DependencyError) stops the run."""
+    try:
+        step(item, *args)
+    except DependencyError:
+        raise
+    except Exception as exc:
+        log.warning("voice replacement failed at %.2f s", item.candidate.span[0], exc_info=True)
+        item.result = _muted(item.candidate, f"voice replacement failed: {type(exc).__name__}: {exc}")
+
+
+@dataclass
+class _Work:
+    """One word on its way through the stages of Replacer.replace."""
+
+    candidate: Candidate
+    window: FloatArray  # channels × samples at the stream's rate
+    rows: list[int] = field(default_factory=list)  # the channels that carry dialogue
+    vocals: FloatArray | None = None  # the separated voice in those channels
+    edited: FloatArray | None = None  # the voice with the word said again
+    delta: FloatArray | None = None  # what to add to the window
+    result: Replacement | None = None  # once decided
+
+    @property
+    def local(self) -> tuple[float, float]:
+        """The word's span, in seconds into the window."""
+        start = self.candidate.window[0]
+        return self.candidate.span[0] - start, self.candidate.span[1] - start
+
+
 class Replacer:
     def __init__(
         self,
@@ -154,13 +206,17 @@ class Replacer:
         ff: FFmpeg,
         models: VoiceModels,
         transcribe: Callable[[Audio, float], Sequence[Word]],
+        make_room: Callable[[str], None] = lambda model: None,
     ) -> None:
-        """`transcribe` hears 16 kHz mono audio that starts at the given media time."""
+        """`transcribe` hears 16 kHz mono audio that starts at the given media time. `make_room` is
+        called with "separator" or "editor" before that model runs, so that the caller can free the
+        others (models.keep_loaded)."""
         self.config = config
         self.lexicon = lexicon
         self.ff = ff
         self.models = models
         self.transcribe = transcribe
+        self.make_room = make_room
 
     def plan(
         self,
@@ -187,29 +243,62 @@ class Replacer:
         return Candidate(index, detection, span, substitute, spoken, window)
 
     def replace(
-        self, candidate: "Candidate", window: FloatArray, stream: StreamInfo, workdir: Path
-    ) -> Replacement:
-        """Say the candidate's word again in `window` (the track over `candidate.window`, channels ×
-        samples at the stream's rate), or say why it stays muted."""
-        index, span, substitute = candidate.index, candidate.span, candidate.substitute
-        word = candidate.detection.heard.strip()
+        self,
+        candidates: Sequence[Candidate],
+        windows: Sequence[FloatArray],
+        stream: StreamInfo,
+        workdir: Path,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> list[Replacement]:
+        """Say each candidate's word again in its window (the track over `candidate.window`, channels ×
+        samples at the stream's rate), or say why it stays muted.
 
-        def muted(reason: str, **found: Any) -> Replacement:
-            return Replacement(index, span[0], span[1], word, substitute, False, reason, **found)
-
+        Each model runs over every word before the next one starts: the separation model, the voice
+        model, then the checks with speech recognition and the speaker encoder. So only one of the
+        large models needs to be in memory at a time (models.keep_loaded, DESIGN.md §16). A model that
+        fails on a word, e.g. out of GPU memory, mutes that word; one that cannot be loaded at all stops
+        the run. `on_progress` receives the steps done so far, three per candidate."""
         rate = stream.sample_rate or 48_000
-        start = candidate.window[0]
-        local = (span[0] - start, span[1] - start)
-        if window.shape[1] < round(local[1] * rate):
-            return muted("the audio around the word could not be read")
+        work = [_Work(c, w) for c, w in zip(candidates, windows, strict=True)]
+        for item in work:
+            if item.window.shape[1] < round(item.local[1] * rate):
+                item.result = _muted(item.candidate, "the audio around the word could not be read")
+        done = 0
+        stages = (("separator", self._separate), ("editor", self._edit), ("check", self._check))
+        for model, step in stages:
+            if model != "check" and any(item.result is None for item in work):
+                self.make_room(model)
+            for item in work:
+                if item.result is None:
+                    _guarded(step, item, stream, workdir)
+                done += 1
+                if on_progress is not None:
+                    on_progress(done)
+        results = [item.result for item in work]
+        assert all(result is not None for result in results)  # the check decides every word left
+        return [result for result in results if result is not None]
 
-        rows = splice.dialogue_channels(stream.channel_layout, window.shape[0])
-        vocals = self.models.separator().vocals(window[rows], rate)
-        voice = vocals.mean(axis=0)
-        edited = self.models.editor().edit(voice, rate, candidate.spoken.text, local)
-        delta = splice.change(window, vocals, edited, local, rate, rows)
+    def _separate(self, item: _Work, stream: StreamInfo, workdir: Path) -> None:
+        item.rows = splice.dialogue_channels(stream.channel_layout, item.window.shape[0])
+        item.vocals = self.models.separator().vocals(item.window[item.rows], stream.sample_rate or 48_000)
 
-        words = self.transcribe(self._to_16k(window + delta, rate, stream.channel_layout, workdir), start)
+    def _edit(self, item: _Work, stream: StreamInfo, workdir: Path) -> None:
+        assert item.vocals is not None
+        rate = stream.sample_rate or 48_000
+        voice = item.vocals.mean(axis=0)
+        item.edited = self.models.editor().edit(voice, rate, item.candidate.spoken.text, item.local)
+        item.delta = splice.change(item.window, item.vocals, item.edited, item.local, rate, item.rows)
+
+    def _check(self, item: _Work, stream: StreamInfo, workdir: Path) -> None:
+        assert item.vocals is not None and item.edited is not None and item.delta is not None
+        candidate, rate = item.candidate, stream.sample_rate or 48_000
+        span, substitute, start, local = candidate.span, candidate.substitute, candidate.window[0], item.local
+
+        def muted(reason: str, **found: Any) -> None:
+            item.result = _muted(candidate, reason, **found)
+
+        mixed = self._to_16k(item.window + item.delta, rate, stream.channel_layout, workdir)
+        words = self.transcribe(mixed, start)
         near = [w for w in words if span[0] <= (w.start + w.end) / 2 <= span[1]]  # the span is padded
         text = " ".join(w.text.strip() for w in near)
         leaked = [d for d in detect_in_words(self.lexicon, words) if d.start < span[1] and span[0] < d.end]
@@ -217,7 +306,7 @@ class Replacer:
             return muted(f"a listed word is still heard: {leaked[0].heard.strip()!r}", heard=text)
         if not _said(substitute, near):
             return muted(f"heard {text!r} instead of {substitute!r}", heard=text)
-        similarity, baseline = self._likeness(voice, edited, local, rate)
+        similarity, baseline = self._likeness(item.vocals.mean(axis=0), item.edited, local, rate)
         if similarity < baseline - self.config.voice_margin:
             return muted(
                 "the new word does not sound like the speaker",
@@ -227,12 +316,13 @@ class Replacer:
             )
 
         first, last = round(local[0] * rate), round(local[1] * rate)
-        path = workdir / f"replace-{index}.f32"
-        path.write_bytes(np.ascontiguousarray(delta[:, first:last].T, dtype=np.float32).tobytes())
-        return Replacement(
-            index, span[0], span[1], word, substitute, True, "replaced", text,
-            similarity, baseline, path, start + first / rate,
+        path = workdir / f"replace-{candidate.index}.f32"
+        path.write_bytes(np.ascontiguousarray(item.delta[:, first:last].T, dtype=np.float32).tobytes())
+        item.result = Replacement(
+            candidate.index, span[0], span[1], candidate.detection.heard.strip(), substitute, True,
+            "replaced", text, similarity, baseline, path, start + first / rate,
         )  # fmt: skip
+        item.vocals = item.edited = item.delta = None
 
     def _to_16k(self, audio: FloatArray, rate: int, layout: str | None, workdir: Path) -> Audio:
         """`audio` (channels × samples) as the analysis hears a track: FFmpeg's downmix at 16 kHz mono,

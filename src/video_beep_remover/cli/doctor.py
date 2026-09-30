@@ -137,8 +137,9 @@ def context_status(cfg: Config) -> tuple[str, bool | None, str]:
     device = cfg.transcription.device
     if device == "auto":
         device = "cuda" if cuda_available() else "cpu"
-    judge = judge_model(cfg.context.judge, device)
-    models = [cfg.context.classifier] + ([judge] if judge else [])
+    judge = judge_model(cfg.context.judge, device, cfg.context.api, offline=cfg.offline)
+    online = cfg.context.judge == "api"
+    models = [cfg.context.classifier] + ([judge] if judge and not online else [])
     try:
         from huggingface_hub import try_to_load_from_cache
 
@@ -146,9 +147,11 @@ def context_status(cfg: Config) -> tuple[str, bool | None, str]:
     except ImportError:
         missing = []
     details = f"{'on' if enabled else 'off (--context turns it on)'}; classifier {cfg.context.classifier}; "
-    details += (
-        f"judge {judge}" if judge else "no judge (no GPU)" if cfg.context.judge == "auto" else "no judge"
-    )
+    if judge:
+        details += f"judge {judge}" + (" (online: the lines it judges are sent to it)" if online else "")
+    else:
+        why = {"auto": " (no GPU)", "api": " (offline)"}.get(cfg.context.judge, "")
+        details += f"no judge{why}"
     actions = []
     if cfg.context.harmless == "keep":
         actions.append("keeps harmless uses")

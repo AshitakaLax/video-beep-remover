@@ -172,3 +172,38 @@ def test_failed_login_still_downloads() -> None:
     api = client(username="me", password="wrong")
     assert api.download(1).data == SRT
     assert api.token is None
+
+
+@respx.mock
+def test_an_error_page_instead_of_json_is_an_opensubtitles_error() -> None:
+    respx.get(f"{API}/subtitles").mock(return_value=httpx.Response(200, text="<html>Bad gateway</html>"))
+    with pytest.raises(OpenSubtitlesError, match="search: the answer is not JSON"):
+        client().search(languages=["en"], query="the movie")
+    respx.get(f"{API}/subtitles").mock(return_value=httpx.Response(200, json=["not", "an", "object"]))
+    with pytest.raises(OpenSubtitlesError, match="unexpected answer"):
+        client().search(languages=["en"], query="the movie")
+
+
+@respx.mock
+def test_malformed_search_results_are_skipped() -> None:
+    respx.get(f"{API}/subtitles").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": ["junk", {"attributes": {"files": "x"}}, result(2, download_count="many"), result(3)]
+            },
+        )
+    )
+    assert [r.file_id for r in client().search(languages=["en"], query="the movie")] == [3]
+
+
+@respx.mock
+def test_a_network_error_while_fetching_the_file_is_an_opensubtitles_error() -> None:
+    respx.post(f"{API}/download").mock(
+        return_value=httpx.Response(200, json={"link": "https://www.opensubtitles.com/download/abc/1.srt"})
+    )
+    respx.get("https://www.opensubtitles.com/download/abc/1.srt").mock(
+        side_effect=httpx.ConnectError("connection reset")
+    )
+    with pytest.raises(OpenSubtitlesError, match="download failed: connection reset"):
+        client().download(1)

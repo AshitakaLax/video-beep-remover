@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from video_beep_remover.config.schema import Config
+from video_beep_remover.config.schema import Config, ContextApiConfig
 from video_beep_remover.context import rules
 from video_beep_remover.context.analyse import (
     QUESTIONS_VERSION,
@@ -50,12 +50,19 @@ __all__ = [
 ModelFactory = Callable[[str, str], Any]  # (model name, device) -> a Classifier or a Judge
 
 
-def judge_model(setting: str, device: str) -> str | None:
-    """The judge to run: "auto" runs the default one only on a GPU, where it is fast."""
+def judge_model(
+    setting: str, device: str, api: ContextApiConfig | None = None, *, offline: bool = False
+) -> str | None:
+    """The judge to run: "auto" runs the default one only on a GPU, where it is fast; "api" the service
+    of context.api (DESIGN.md §17.10), except offline."""
     if not setting:
         return None
     if setting == "auto":
         return DEFAULT_JUDGE if device == "cuda" else None
+    if setting == "api":
+        from video_beep_remover.context.api import judge_name
+
+        return None if offline else judge_name(api or ContextApiConfig())
     return setting
 
 
@@ -87,14 +94,16 @@ class ContextLayer:
         self.sexual = settings.sexual
         self.classifier_name = settings.classifier
         self.judge_setting = settings.judge
-        self.judge_name = judge_model(settings.judge, device)
+        self.judge_name = judge_model(settings.judge, device, settings.api, offline=config.offline)
         self.cache_dir = cache_dir
         offline = config.offline
         self._classifier_factory = classifier_factory or (
             lambda name, where: ToxicityClassifier(name, device=where, offline=offline)
         )
         self._judge_factory = judge_factory or (
-            lambda name, where: LocalJudge(name, device=where, offline=offline)
+            (lambda name, where: _api_judge(settings.api))
+            if settings.judge == "api"
+            else (lambda name, where: LocalJudge(name, device=where, offline=offline))
         )
         self._classifier: Classifier | None = None
         self._judge: CachedJudge | None = None
@@ -111,6 +120,13 @@ class ContextLayer:
             model: Judge = self._judge_factory(self.judge_name, self.device)
             self._judge = CachedJudge(model, self.cache_dir, QUESTIONS_VERSION)
         return self._judge
+
+    def release(self) -> bool:
+        """Drop the classifier and the judge, so their memory can be freed; their next use loads them
+        again. Returns whether either was loaded."""
+        loaded = self._classifier is not None or self._judge is not None
+        self._classifier = self._judge = None
+        return loaded
 
     def run(
         self, detections: Sequence[Detection], lines: Sequence[Line], heard: Sequence[Word] | None = None
@@ -142,11 +158,13 @@ class ContextLayer:
             "sexual_lines": [_sexual_dict(s) for s in result.sexual],
         }
         if self.judge_name is None:
-            section["judge_off"] = (
-                'turned off (context.judge = "")'
-                if not self.judge_setting
-                else 'no GPU: context.judge = "auto" runs the judge only on an NVIDIA GPU'
-            )
+            if not self.judge_setting:
+                section["judge_off"] = 'turned off (context.judge = "")'
+            elif self.judge_setting == "api":
+                section["judge_off"] = 'offline: context.judge = "api" needs the network'
+            else:
+                section["judge_off"] = 'no GPU: context.judge = "auto" runs the judge only on an NVIDIA GPU'
+
         return result, section
 
     def substitutes(
@@ -154,6 +172,12 @@ class ContextLayer:
     ) -> list[Choice]:
         """The substitute to say in place of each detection, if any (DESIGN.md §17.6)."""
         return choose_substitutes(detections, result, table, self.judge())
+
+
+def _api_judge(api: ContextApiConfig) -> Any:
+    from video_beep_remover.context.api import api_judge
+
+    return api_judge(api)
 
 
 def verdict_dict(verdict: Verdict, lines: Sequence[Line]) -> dict[str, Any]:

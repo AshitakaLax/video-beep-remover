@@ -6,7 +6,7 @@ from typing import Annotated, Any
 
 import typer
 
-from video_beep_remover.batch import Input, Outcome, collect_inputs, run_batch, skip_outputs
+from video_beep_remover.batch import Input, Outcome, collect_inputs, run_batch, skip_outputs, unexpected
 from video_beep_remover.cli.app import app
 from video_beep_remover.cli.console import ConsoleUI, fail, print_result, setup_logging
 from video_beep_remover.cli.options import (
@@ -294,11 +294,12 @@ def render_command(
             )
         except DependencyError as exc:
             raise fail(exc) from exc  # would fail for every file
-        except VbrError as exc:
+        except Exception as caught:
+            error = caught if isinstance(caught, VbrError) else unexpected(item.path, caught)
             if not many:
-                raise fail(exc) from exc
+                raise fail(error) from caught
             failures += 1
-            ui.error(f"{item.path.name}: {exc}")
+            ui.error(f"{item.path.name}: {error}")
             continue
         print_result(ui, result)
     if failures:

@@ -43,7 +43,10 @@ def read_pcm_windows(
     They are cut by sample count in one pass from the stream's start, stopping after the last one:
     seeking lands a few samples off in containers with coarse timestamps such as Matroska, and voice
     replacement subtracts the old voice sample-exactly (DESIGN.md §16). The renderer counts samples the
-    same way."""
+    same way.
+
+    A window is cut short where the stream ended or FFmpeg failed before filling it: silence in its
+    place would be subtracted from a voice that is still there."""
     rate, channels = stream.sample_rate or 48_000, stream.channels or 1
     offset = stream.start_time or 0.0
     ranges = [(max(0, round((a - offset) * rate)), max(0, round((b - offset) * rate))) for a, b in spans]
@@ -73,7 +76,7 @@ def read_pcm_windows(
                 position += block.shape[1]
         finally:
             process.kill()  # the rest of the track is not needed
-    return windows
+    return [window[:, : max(0, min(b, position) - a)] for (a, b), window in zip(ranges, windows, strict=True)]
 
 
 def decode_track(

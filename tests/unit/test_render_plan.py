@@ -9,6 +9,7 @@ from video_beep_remover.media.ffmpeg import FFmpeg, FFmpegVersion
 from video_beep_remover.media.probe import MediaInfo, StreamInfo
 from video_beep_remover.media.render import (
     build_command,
+    check_output,
     choose_encoder,
     command_file,
     disposition_value,
@@ -238,3 +239,14 @@ def test_without_spans_everything_is_copied() -> None:
     assert command.files == {} and command.censored_positions == []
     assert "-filter_complex_script" not in command.args
     assert [command.args[i + 1] for i, a in enumerate(command.args) if a == "-map"] == ["0:0", "0:1"]
+
+
+def test_an_output_with_streams_missing_or_cut_short_is_refused() -> None:
+    source = info(stream(0, "video"), stream(1))
+    plan = plan_streams(source, source.streams[1], OutputConfig(), "en")
+    rendered = MediaInfo(Path("out.mkv"), "matroska", 99.5, 0.0, 1, source.streams)
+    assert check_output(source, plan, rendered) is None  # a little shorter: encoder padding, say
+    short = MediaInfo(Path("out.mkv"), "matroska", 60.0, 0.0, 1, source.streams)
+    assert check_output(source, plan, short) == "it is 60.0 s long, the input 100.0 s"
+    missing = MediaInfo(Path("out.mkv"), "matroska", 100.0, 0.0, 1, source.streams[:1])
+    assert check_output(source, plan, missing) == "it has 1 streams, 2 were written"

@@ -14,6 +14,7 @@ import contextlib
 import io
 import logging
 import os
+import sys
 import warnings
 from collections.abc import Callable, Iterator
 from importlib.util import find_spec
@@ -166,9 +167,12 @@ class F5Editor:
 
     def edit(self, voice: FloatArray, rate: int, text: str, span: tuple[float, float]) -> FloatArray:
         torch = self.torch
+        # The model's sample() puts the text on the device of `cond`, and its mel spectrogram moves
+        # itself to its input's device, so the audio must start on the model's device.
+        device = next(self.model.parameters()).device
         audio = _resample(
             self.torchaudio, torch.from_numpy(np.ascontiguousarray(voice))[None], rate, self.rate
-        )
+        ).to(device)
         level = float(audio.square().mean().sqrt())
         gain = self.RMS / level if 0 < level < self.RMS else 1.0
         with torch.inference_mode(), _quiet():
@@ -177,7 +181,7 @@ class F5Editor:
             first, last = max(0, first), min(mel.shape[1], max(last, first + 1))
             cond = mel.clone()
             cond[:, first:last] = 0
-            mask = torch.ones(1, mel.shape[1], dtype=torch.bool)
+            mask = torch.ones(1, mel.shape[1], dtype=torch.bool, device=device)
             mask[:, first:last] = False
             generated, _ = self.model.sample(
                 cond=cond,
@@ -204,9 +208,15 @@ class EcapaEncoder:
         try:
             with _quiet():
                 from speechbrain.inference.speaker import EncoderClassifier
+                from speechbrain.utils.fetching import LocalStrategy
 
+                # Windows allows symlinks only in Developer Mode or as an administrator.
+                strategy = LocalStrategy.COPY if sys.platform == "win32" else LocalStrategy.SYMLINK
                 self.model = EncoderClassifier.from_hparams(
-                    source=ENCODER, savedir=str(cache_dir / "ecapa"), run_opts={"device": device}
+                    source=ENCODER,
+                    savedir=str(cache_dir / "ecapa"),
+                    run_opts={"device": device},
+                    local_strategy=strategy,
                 )
         except Exception as exc:
             raise _failure("speaker encoder", ENCODER, offline, exc) from exc

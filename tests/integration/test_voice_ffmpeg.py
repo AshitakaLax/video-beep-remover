@@ -3,6 +3,7 @@ stands in for speech, and the stand-in voice model says a word again as a 1 kHz 
 stand-in speech recognition hears as the substitute."""
 
 import json
+import weakref
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,9 @@ from helpers import MUSIC_HZ, FakeTranscriber, StrictUI, Track, decode, make_cli
 from video_beep_remover.asr.base import Clip
 from video_beep_remover.config import load_config
 from video_beep_remover.context.models import LABELS
+from video_beep_remover.media.audio import read_pcm_windows
+from video_beep_remover.media.ffmpeg import FFmpeg
+from video_beep_remover.media.probe import probe, select_audio_stream
 from video_beep_remover.models import Word
 from video_beep_remover.pipeline import Pipeline, RunOptions
 
@@ -190,3 +194,111 @@ def test_replacement_waits_for_a_fitting_substitute(tmp_path: Path) -> None:
     assert report["replacements"] == []
     assert report["detections"][0]["context"]["substitute_reason"] == "no substitute for this term"
     assert tone_gain(decode(result.output), 2.2) < 0.01
+
+
+class BrokenEditor(Editor):
+    def edit(self, voice: Any, rate: int, text: str, span: tuple[float, float]) -> Any:
+        raise RuntimeError("CUDA out of memory")
+
+
+def test_a_voice_model_that_fails_on_a_word_mutes_it(tmp_path: Path) -> None:
+    _, result = run(tmp_path, BrokenEditor())
+    assert (result.status, result.replaced) == ("cleaned", 0)
+    assert tone_gain(decode(result.output), 2.2) < 0.01
+    report = json.loads((tmp_path / "movie.clean.vbr.json").read_text("utf-8"))
+    [replacement] = report["replacements"]
+    assert replacement["reason"] == "voice replacement failed: RuntimeError: CUDA out of memory"
+
+
+def test_a_replaced_word_that_fails_in_the_output_is_muted_instead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The replacement passed its check before rendering; the output is heard again, where a renderer
+    # that put the change in the wrong place would let the old word through.
+    heard: list[tuple[float, float, float]] = []
+
+    def old_word_heard(self: Pipeline, audio: Any, start: float, span: Any) -> str:
+        heard.append((start, span.start, span.end))
+        return "a listed word is heard in the output: 'damn'"
+
+    monkeypatch.setattr(Pipeline, "_check_splice", old_word_heard)
+    _, result = run(tmp_path, Editor())
+    assert heard == [(1.38, 1.88, 2.6)]  # the span, and half a second either side
+    assert (result.status, result.replaced) == ("cleaned", 0)
+    samples = decode(result.output)
+    assert tone_gain(samples, 2.2) < 0.01 and tone_gain(samples, 2.2, frequency=NEW_WORD_HZ) < 0.01
+    report = json.loads((tmp_path / "movie.clean.vbr.json").read_text("utf-8"))
+    [replacement] = report["replacements"]
+    assert (replacement["replaced"], replacement["reason"]) == (
+        False,
+        "a listed word is heard in the output: 'damn'",
+    )
+    assert report["output"]["verified_spans"] == 2  # muted, and checked, in both streams
+    assert "[muted] damn" in (tmp_path / "movie.clean.review.srt").read_text("utf-8")
+
+
+def test_windows_past_the_end_of_the_stream_are_cut_short(tmp_path: Path) -> None:
+    source = make_clip(tmp_path / "short.mkv", duration=3.0, audio_codec="flac")
+    ff = FFmpeg()
+    stream = select_audio_stream(probe(ff, source), "en")
+    whole, cut, beyond = read_pcm_windows(ff, source, stream, [(1.0, 2.0), (2.5, 4.0), (5.0, 6.0)])
+    assert whole.shape == (1, 48_000) and cut.shape == (1, 24_000) and beyond.shape == (1, 0)
+    assert tone_gain(whole[0], 0.5, window=0.1) == pytest.approx(1.0, abs=0.02)  # read, not left silent
+
+
+class Residency:
+    """Which stand-in models are alive, and which were alive together each time one loaded."""
+
+    def __init__(self) -> None:
+        self.alive: set[str] = set()
+        self.together: list[set[str]] = []
+
+    def track(self, name: str, model: Any) -> Any:
+        self.alive.add(name)
+        self.together.append(set(self.alive))
+        weakref.finalize(model, self.alive.discard, name)
+        return model
+
+
+@pytest.mark.parametrize(
+    ("keep_loaded", "together"),
+    [
+        # Transcription, context, separation, the voice model, then Whisper again for the checks.
+        (False, [{"whisper"}, {"context"}, {"separator"}, {"editor"}, {"whisper"}]),
+        (True, [{"whisper"}, {"whisper", "context"}, {"whisper", "context", "separator"},
+                {"whisper", "context", "separator", "editor"}]),
+    ],
+)  # fmt: skip
+def test_large_models_are_loaded_one_at_a_time(
+    tmp_path: Path, keep_loaded: bool, together: list[set[str]]
+) -> None:
+    residency = Residency()
+    loaded = load_config(
+        None,
+        env={},
+        cwd=tmp_path,
+        overrides={
+            "transcription.device": "cpu",
+            "replace.enabled": True,
+            "context.judge": "",
+            "models.keep_loaded": keep_loaded,
+        },
+    )
+    pipeline = Pipeline(
+        loaded,
+        ui=StrictUI(),
+        transcriber_factory=lambda choice: residency.track("whisper", Hearing(SPOKEN)),
+        context_models=(
+            lambda name, device: residency.track("context", Classifier()),
+            lambda name, device: None,
+        ),
+        voice_models=(
+            lambda: residency.track("separator", Separator()),
+            lambda: residency.track("editor", Editor()),
+            Encoder,
+        ),
+    )
+    source = make_clip(tmp_path / "movie.mkv", audio_codec="flac", tracks=(Track(default=True),))
+    result = pipeline.process(source, RunOptions())
+    assert (result.status, result.replaced) == ("cleaned", 1)
+    assert residency.together == together

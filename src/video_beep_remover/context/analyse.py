@@ -6,6 +6,7 @@ harmless one: a use is harmless only when the judge says so and the classifier f
 a sexual line is never harmless; anything else undecided is "unsure", which mutes."""
 
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -14,8 +15,10 @@ from typing import Any, Literal
 
 from video_beep_remover.context import rules
 from video_beep_remover.context.lines import Line, heard_share, line_for, neighbours
-from video_beep_remover.context.models import LABELS, Classifier, Judge
+from video_beep_remover.context.models import LABELS, Classifier, Judge, JudgeError, Question
 from video_beep_remover.models import Detection, Word
+
+log = logging.getLogger(__name__)
 
 QUESTIONS_VERSION = 1  # bump when a question changes, so cached answers are not reused
 Use = Literal["profane", "harmless", "unsure"]
@@ -84,9 +87,10 @@ def _dialogue(lines: Sequence[Line], index: int, shown: Callable[[int], bool] = 
 
 def sense_question(
     lines: Sequence[Line], index: int, word: str, shown: Callable[[int], bool] = lambda i: True
-) -> str:
-    return (
-        f"Dialogue:\n{_dialogue(lines, index, shown)}\n\n"
+) -> Question:
+    dialogue = _dialogue(lines, index, shown)
+    text = (
+        f"Dialogue:\n{dialogue}\n\n"
         f"How is the word {_quote(word)} used in the line marked >>? Reply with "
         '{"use": ..., "reason": ..., "emotion": ...} where:\n'
         '- "use" is "profane" for a swear word, an insult, a curse, a sexual reference or an '
@@ -95,24 +99,39 @@ def sense_question(
         f'- "reason" is one of {", ".join(_quote(r) for r in _REASONS)};\n'
         f'- "emotion" is the speaker\'s emotion, one of {", ".join(_quote(e) for e in _EMOTIONS)}.'
     )
+    return Question("sense", text, dialogue, word)
 
 
-def sexual_question(lines: Sequence[Line], index: int) -> str:
-    return (
-        f"Dialogue:\n{_dialogue(lines, index)}\n\n"
+def sexual_question(lines: Sequence[Line], index: int) -> Question:
+    dialogue = _dialogue(lines, index)
+    text = (
+        f"Dialogue:\n{dialogue}\n\n"
         "Is the line marked >> sexual in nature, including innuendo? Reply with "
         '{"sexual": true} or {"sexual": false}.'
     )
+    return Question("sexual", text, dialogue)
 
 
-def substitute_question(lines: Sequence[Line], index: int, word: str, candidates: Sequence[str]) -> str:
+def substitute_question(lines: Sequence[Line], index: int, word: str, candidates: Sequence[str]) -> Question:
+    dialogue = _dialogue(lines, index)
     options = ", ".join(_quote(c) for c in candidates)
-    return (
-        f"Dialogue:\n{_dialogue(lines, index)}\n\n"
+    text = (
+        f"Dialogue:\n{dialogue}\n\n"
         f"The word {_quote(word)} in the line marked >> is to be replaced by a milder one, said in the "
         f"same voice. Which of these keeps the line natural and its meaning: {options}? Reply with "
         '{"substitute": ...} naming one of them, or {"substitute": null} if none fits.'
     )
+    return Question("substitute", text, dialogue, word, tuple(candidates))
+
+
+def ask(judge: Judge, question: Question) -> dict[str, Any]:
+    """The judge's answer (parse_answer), or none when it could not answer: the use then stays unsure,
+    which mutes it."""
+    try:
+        return parse_answer(judge.ask(question))
+    except JudgeError as exc:
+        log.warning("the judge did not answer (%s question): %s", question.kind, exc)
+        return {}
 
 
 def parse_answer(text: str) -> dict[str, Any]:
@@ -204,7 +223,7 @@ def _sexual_lines(
             and line.text
             and not certain
             and worth_asking
-            and parse_answer(judge.ask(sexual_question(lines, index))).get("sexual") is True
+            and ask(judge, sexual_question(lines, index)).get("sexual") is True
         ):
             evidence.append("judge")
             certain = True
@@ -249,7 +268,7 @@ def _verdict(
     if not trusted(index):
         # Text that was never said, such as a note written for the judge, must not decide (§17.9).
         return verdict("unsure", "the subtitles differ from what is heard")
-    answer = parse_answer(judge.ask(sense_question(lines, index, word, trusted)))
+    answer = ask(judge, sense_question(lines, index, word, trusted))
     emotion = answer.get("emotion")
     if answer.get("use") == "harmless":
         if answer.get("reason") not in _HARMLESS_REASONS:
@@ -327,7 +346,7 @@ def choose_substitutes(
         else:
             word = detection.heard.strip(" ,.!?;:\"'") or detection.term
             question = substitute_question(result.lines, verdict.line, word, candidates)
-            picked = parse_answer(judge.ask(question)).get("substitute")
+            picked = ask(judge, question).get("substitute")
             match = next(
                 (c for c in candidates if isinstance(picked, str) and c.casefold() == picked.casefold()), None
             )

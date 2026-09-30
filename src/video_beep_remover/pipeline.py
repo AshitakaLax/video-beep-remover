@@ -12,7 +12,12 @@ One file goes through Pipeline in this order:
 batch.py calls prepare and finish separately, so that one file renders while the next is analysed.
 render_report (`vbr render`) takes a report's intervals straight to finish."""
 
+import contextlib
+import dataclasses
+import gc
+import logging
 import shutil
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -20,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+
+import httpx
 
 from video_beep_remover import __version__
 from video_beep_remover import guided as guided_analysis
@@ -102,6 +109,8 @@ from video_beep_remover.voice import check_installed as check_voice_installed
 
 __all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOptions"]
 
+log = logging.getLogger(__name__)
+
 Status = Literal["cleaned", "copied", "clean", "scanned", "skipped"]
 TranscriberFactory = Callable[[ModelChoice], Transcriber]
 
@@ -177,10 +186,24 @@ class Job:
     rendered: RenderResult | None = None
     timings: dict[str, float] = field(default_factory=dict)
 
+    @property
+    def spliced(self) -> bool:
+        """Whether rendering adds replaced words, which it then transcribes again: the render uses the
+        speech recognition model, so it must not overlap the next file's analysis (batch.py)."""
+        return self.render and any(r.replaced and r.delta is not None for r in self.replacements)
+
     def lap(self, name: str) -> None:
         now = time.monotonic()
         self.timings[name] = round(self.timings.get(name, 0.0) + now - self.clock, 3)
         self.clock = now
+
+
+def _free_memory() -> None:
+    """Return the memory of dropped models: Python's, and the GPU memory PyTorch keeps cached."""
+    gc.collect()
+    torch = sys.modules.get("torch")  # only if a model already imported it
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _context_device(setting: str) -> str:
@@ -308,9 +331,30 @@ class Pipeline:
             return resolve_anchor_model(settings, language=language)
         return resolve_model(settings, strategy=role, language=language)
 
+    def make_room(self, model: str) -> None:
+        """Before `model` runs ("whisper", "context", "separator" or "editor"), drop the other large
+        models, unless models.keep_loaded. Each of them can take one to several GB of GPU memory, and on
+        Windows what does not fit on the GPU spills into system memory; one at a time, the peak is the
+        largest of them rather than their sum. A dropped model is loaded again on its next use."""
+        if self.config.models.keep_loaded:
+            return
+        dropped = []
+        if model != "whisper" and self._transcribers:
+            self._transcribers.clear()
+            dropped.append("whisper")
+        if model != "context" and self._context is not None and self._context.release():
+            dropped.append("context")
+        for name in ("separator", "editor"):
+            if model != name and self._replacer is not None and self._replacer.models.release(name):
+                dropped.append(name)
+        if dropped:
+            log.debug("freed %s before %s runs", ", ".join(dropped), model)
+            _free_memory()
+
     def transcriber(self, role: str) -> tuple[ModelChoice, Transcriber]:
         """The model for a role, loaded on first use. Loading is announced on a line of its own rather
         than a live status, since it can happen while one is shown (e.g. during the sync check)."""
+        self.make_room("whisper")
         choice = self.model_choice(role)
         if choice not in self._transcribers:
             self.ui.info(f"Loading Whisper model {choice.describe()}")
@@ -585,10 +629,14 @@ class Pipeline:
         finally:
             self._scope = None
             track.release()
-            if not job.options.keep_temp:
-                track.path.unlink(missing_ok=True)  # the decoded track is not needed for rendering
-            if found is not None:
-                self.transcript_cache.evict(int(cfg.cache.max_size_gb * 1024**3))
+            # Neither may hide an error from the analysis. On Windows the track cannot be deleted
+            # while a view of it is still mapped; _cleanup deletes it with the rest of the job.
+            with contextlib.suppress(OSError):
+                if not job.options.keep_temp:
+                    track.path.unlink(missing_ok=True)  # the decoded track is not needed for rendering
+            with contextlib.suppress(OSError):  # e.g. another run deleting the same files
+                if found is not None:
+                    self.transcript_cache.evict(int(cfg.cache.max_size_gb * 1024**3))
         result.detections, result.intervals = len(detections), len(intervals)
         result.replaced = sum(r.replaced for r in job.replacements)
         result.strategy = analysis.strategy
@@ -661,6 +709,8 @@ class Pipeline:
             if job.render:
                 self._render(job, ui)
             self._write_outputs(job, ui)
+        except OSError as exc:  # a full disk, or a file another program holds open
+            raise VbrError(f"could not write {exc.filename or 'a file'}: {exc.strerror or exc}") from exc
         finally:
             self._cleanup(job, ui)
         return job.result
@@ -701,10 +751,13 @@ class Pipeline:
                         if r.replaced and r.delta is not None
                     ]
                 },
+                check_splices=self._check_splice if job.spliced else None,
             )
         job.lap("render")
         job.rendered = rendered
         result = job.result
+        if rendered.unspliced:
+            self._withdraw_replacements(job, dict(rendered.unspliced), ui)
         result.status = "cleaned" if job.intervals else "copied"
         result.output = job.output
         result.backup = job.backup
@@ -742,6 +795,27 @@ class Pipeline:
                 ui.warn(f"no censored copy of the subtitles {path.name}: {exc}")
         if job.report is not None:
             job.report["output"] = output
+
+    def _check_splice(self, audio: Audio, start: float, span: CensorInterval) -> str | None:
+        """Why a replaced word fails in the rendered file: a listed word is heard in its span."""
+        words = self._check_transcriber(audio, start)
+        found = detect_in_words(self.lexicon, words)
+        leaked = [d for d in found if d.start < span.end and span.start < d.end]
+        return f"a listed word is heard in the output: {leaked[0].heard.strip()!r}" if leaked else None
+
+    def _withdraw_replacements(self, job: Job, failed: dict[CensorInterval, str], ui: UI) -> None:
+        """Record that the renderer muted replaced words that failed in the output (verify_splices)."""
+        withdrawn = []
+        for replacement in job.replacements:
+            reason = failed.get(CensorInterval(replacement.start, replacement.end))
+            if replacement.replaced and reason is not None:
+                replacement = dataclasses.replace(replacement, replaced=False, reason=reason, delta=None)
+            withdrawn.append(replacement)
+        job.replacements = withdrawn
+        job.result.replaced = sum(r.replaced for r in withdrawn)
+        if job.report is not None and "replacements" in job.report:
+            job.report["replacements"] = [r.as_dict() for r in withdrawn]
+        ui.warn(f"{len(failed)} replaced words failed the check of the output and are muted instead")
 
     def _check_other_audio(self, job: Job, plan: StreamPlan) -> tuple[StreamPlan, list[dict[str, Any]]]:
         """other_audio_streams = "auto" gives a stream in the analysed language the same mutes; drop it
@@ -844,6 +918,14 @@ class Pipeline:
                     "acting on context verdicts is experimental: it is measured on a small labelled set "
                     "only (DESIGN.md §17.7); check the review subtitles (--review-srt)"
                 )
+            if settings.judge == "api" and self._context.judge_name is not None:
+                from video_beep_remover.context.api import endpoint
+
+                host = httpx.URL(endpoint(settings.api)[0]).host
+                self.ui.warn(
+                    f"the context judge is {self._context.judge_name}: each line it is asked about is "
+                    f"sent to {host}, with its neighbours"
+                )
             if settings.harmless == "keep" and self._context.judge_name is None:
                 self.ui.warn('context.harmless = "keep" keeps nothing without a judge (context.judge)')
         return self._context
@@ -868,6 +950,7 @@ class Pipeline:
         else:
             lines = word_lines(analysis.heard)
         layer = self.context_layer()
+        self.make_room("context")
         with self.ui.status("Reading the dialogue in context"):
             result, section = layer.run(detections, lines, analysis.heard)
         job.context = section
@@ -971,7 +1054,9 @@ class Pipeline:
                 editor=editor,
                 encoder=encoder,
             )
-            self._replacer = Replacer(cfg.replace, self.lexicon, self.ff, models, self._check_transcriber)
+            self._replacer = Replacer(
+                cfg.replace, self.lexicon, self.ff, models, self._check_transcriber, self.make_room
+            )
             self.ui.warn(
                 "voice replacement is experimental (DESIGN.md §16): check the review subtitles "
                 "(--review-srt); its voice model's weights are licensed for non-commercial use only"
@@ -997,7 +1082,9 @@ class Pipeline:
     ) -> None:
         """Say a milder word in place of each listed word the context layer lets through (DESIGN.md §16,
         §17.6). A word's span is replaced only if no other muted word shares it; any failure mutes it."""
-        choices = self.context_layer().substitutes(detections, context, self.config.replace.substitutes)
+        layer = self.context_layer()
+        self.make_room("context")  # the judge picks the substitutes
+        choices = layer.substitutes(detections, context, self.config.replace.substitutes)
         candidates = []
         for index, (detection, choice) in enumerate(zip(detections, choices, strict=True)):
             verdict = job.verdicts[index] if index < len(job.verdicts) else None
@@ -1034,16 +1121,13 @@ class Pipeline:
                     )
                 )
         todo = [c for c in planned if isinstance(c, Candidate)]
-        windows = iter(
-            read_pcm_windows(self.ff, job.source, job.stream, [c.window for c in todo]) if todo else []
-        )
-        done: list[Replacement] = []
-        with self.ui.progress("Replacing words", len(planned)) as update:
-            for count, item in enumerate(planned, 1):
-                if isinstance(item, Candidate):
-                    item = replacer.replace(item, next(windows), job.stream, job.workdir)
-                done.append(item)
-                update(count)
+        said_again: list[Replacement] = []
+        if todo:
+            windows = read_pcm_windows(self.ff, job.source, job.stream, [c.window for c in todo])
+            with self.ui.progress("Replacing words", 3 * len(todo)) as update:
+                said_again = replacer.replace(todo, windows, job.stream, job.workdir, on_progress=update)
+        results = iter(said_again)
+        done = [next(results) if isinstance(item, Candidate) else item for item in planned]
         job.replacements = done
         if candidates:
             replaced = sum(r.replaced for r in done)

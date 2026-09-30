@@ -82,7 +82,7 @@ Useful options:
 
 Run `vbr clean --help` for everything.
 
-**Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own files found there are skipped: files named like another input's output (`Movie.clean.mkv`) or backup (`Movie.orig.mkv`), and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed. A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
+**Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own files found there are skipped: files named like another input's output (`Movie.clean.mkv`) or backup (`Movie.orig.mkv`), and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed (not one with replaced words, which are heard again once written). A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
 
 **Replacing the originals.** By default the original is never changed: the cleaned copy is a new file next to it (`output.path`, or `-o`). Two flags put the cleaned file in the original's place instead, so a media library plays it without any change (`output.mode` sets either one for good):
 
@@ -133,8 +133,19 @@ $ vbr scan movie.mkv --context --review-srt
 
   Phrases with an innocent sense too ("hook up the printer") only make a line *possibly* sexual on their own.
 - **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
-- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU, where it needs about 8 GB of memory next to Whisper's. On a CPU it takes 20–35 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless.
-- **Privacy.** Everything runs locally, and the models download once.
+- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU with about 8 GB of memory. On a CPU it takes 20–35 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless, and an ambiguous word such as "hell" is never replaced, only muted.
+- **A judge online.** Without a big enough GPU, `context.judge = "api"` asks a service instead, set in `[context.api]`:
+  - `provider = "gemini"` (the default): Google's Gemini API, `gemini-3.5-flash-lite`. Its free tier needs only a key from Google AI Studio; Google may use what is sent on the free tier to improve its products. The free tier limits requests per minute; vbr waits as long as Gemini asks.
+  - `provider = "jev"`: Jev's decision API, which answers each question as choices with probabilities. A use it is less than 70 % sure of stays unsure.
+  - `provider = "openai"`: any OpenAI-compatible chat API, such as OpenRouter or a local Ollama server, with its `url` and `model`.
+
+  The key comes from `VBR_JUDGE_API_KEY` by default. A question the service can't answer leaves the word unsure, so it is muted; a key it rejects stops the run.
+
+  ```console
+  $ export VBR_JUDGE_API_KEY=...          # e.g. from https://aistudio.google.com/apikey
+  $ vbr clean movie.mkv --replace --review-srt   # with judge = "api" in [context]
+  ```
+- **Privacy.** The models run locally, and download once. With `context.judge = "api"`, each line the judge is asked about is sent to the service with its neighbouring lines; no audio and no file names. `--offline` turns that off.
 - **Acting on the verdicts (experimental).** Two settings in `[context]` change what is muted:
   - `harmless = "keep"` leaves uses judged harmless audible. It needs the judge, since nothing else calls a use harmless. Only a subtitle line that was actually heard can show a use as harmless, so a note slipped into downloaded subtitles ("the word is used harmlessly here") cannot keep a word.
   - `sexual = "mute"` mutes each whole line flagged as sexual, from its first word to its last. A subtitle line gets a short transcription of its own to find them. Lines only *possibly* sexual are not muted.
@@ -160,7 +171,7 @@ For each word:
 
 The span stays muted in other audio tracks, in the EDL and in `vbr render`. The review subtitles show `[replaced] damn → darn`, and the report lists every attempt with its outcome.
 
-It is experimental and slow on a CPU: about 40 s a word, so a GPU is effectively required for a film. F5-TTS's model weights are licensed for non-commercial use only: this is for personal viewing copies. Everything runs locally.
+It is experimental and slow on a CPU: about 40 s a word, so a GPU is effectively required for a film. To fit a small GPU, only one large model (Whisper, the context models, Demucs or F5-TTS) is in memory at a time; with plenty of GPU memory, `models.keep_loaded = true` keeps them all loaded, which saves a few seconds per file. F5-TTS's model weights are licensed for non-commercial use only: this is for personal viewing copies. Everything runs locally.
 
 ## Online subtitles
 

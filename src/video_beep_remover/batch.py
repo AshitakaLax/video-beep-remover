@@ -3,6 +3,7 @@ and each file is rendered in the background while the next one is analysed: rend
 FFmpeg reading and writing the whole file, analysis mostly speech recognition."""
 
 import contextlib
+import logging
 from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -15,6 +16,15 @@ from video_beep_remover.media.probe import VIDEO_SUFFIXES
 from video_beep_remover.outputs import backup_path, place
 from video_beep_remover.pipeline import FileResult, Job, Pipeline, RunOptions
 from video_beep_remover.ui import Progress
+
+log = logging.getLogger(__name__)
+
+
+def unexpected(path: Path, exc: Exception) -> VbrError:
+    """An error nothing foresaw, in one file: the file fails with it, and the batch goes on. The
+    traceback is logged (shown with -v), since it is likely a bug."""
+    log.debug("unexpected error in %s", path, exc_info=exc)
+    return VbrError(f"unexpected {type(exc).__name__}: {exc} (run with -v for the details)")
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,8 @@ def _finish_in_background(pipeline: Pipeline, job: Job) -> Outcome:
         raise  # stops the batch
     except VbrError as exc:
         return Outcome(job.source, error=exc, messages=ui.messages)
+    except Exception as exc:
+        return Outcome(job.source, error=unexpected(job.source, exc), messages=ui.messages)
 
 
 def output_clashes(
@@ -142,8 +154,9 @@ def run_batch(
     overlap: bool = True,
 ) -> None:
     """Process the inputs in order and pass each outcome to `report`, also in order. With `overlap`, a
-    file is rendered in the background while the next one is analysed, one render at a time. A
-    DependencyError (FFmpeg or a model missing) would fail every file, so it stops the batch.
+    file is rendered in the background while the next one is analysed, one render at a time; not one
+    with replaced words, whose check uses the speech recognition model. A DependencyError (FFmpeg or a
+    model missing) would fail every file, so it stops the batch; any other error fails only its file.
 
     Two inputs with the same output would overwrite each other (a background render may not have
     written its output yet when the next file checks), so the later one fails up front. An input that
@@ -188,6 +201,10 @@ def run_batch(
                 queue.append(Outcome(item.path, error=exc))
                 flush(block=False)
                 continue
+            except Exception as exc:
+                queue.append(Outcome(item.path, error=unexpected(item.path, exc)))
+                flush(block=False)
+                continue
             if isinstance(prepared, FileResult):
                 queue.append(Outcome(item.path, prepared))
             else:
@@ -196,7 +213,7 @@ def run_batch(
                 except BaseException:
                     pipeline.discard(prepared)
                     raise
-                if prepared.render and overlap and position + 1 < len(inputs):
+                if prepared.render and overlap and not prepared.spliced and position + 1 < len(inputs):
                     queue.append(renders.submit(_finish_in_background, pipeline, prepared))
                 else:  # in the foreground, with a progress bar: nothing else is left to overlap
                     try:
@@ -205,5 +222,7 @@ def run_batch(
                         raise
                     except VbrError as exc:
                         queue.append(Outcome(item.path, error=exc))
+                    except Exception as exc:
+                        queue.append(Outcome(item.path, error=unexpected(item.path, exc)))
             flush(block=False)
         wait_for_render()

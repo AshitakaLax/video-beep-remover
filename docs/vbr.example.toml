@@ -190,7 +190,8 @@ sexual = "report"                   # "mute": mute each whole line flagged as se
 classifier = "unitary/unbiased-toxic-roberta"   # scores every line (about 500 MB)
 judge = "auto"                      # a small language model for the few lines that need judging;
                                     # "auto": Qwen/Qwen3-4B-Instruct-2507 on an NVIDIA GPU, none on a
-                                    # CPU (20-35 s per question there); "" never; or a model name
+                                    # CPU (20-35 s per question there); "" never; a model name; or
+                                    # "api": a service online, set below ([context.api])
 ambiguous = [                       # listed terms, as written above, with innocent senses too
   "hell", "damned", "ass", "asses", "jackass*", "bitch*", "bastard*", "piss", "pissed", "jesus christ",
   "sleep with", "sleeping with", "slept with", "sleeps with", "sleep together", "slept together",
@@ -206,6 +207,18 @@ clean_below = 0.3                   # a use can be harmless only if the line sco
 profane_above = 0.5                 # a line scoring this much is profane without asking the judge
 min_heard = 0.7                     # a subtitle line can show a use as harmless only if this share
                                     # of its words is heard: subtitles can hold text never said
+
+# judge = "api" sends each line the judge is asked about, with its neighbours, to this service. Nothing
+# else leaves the machine: no audio, no file names. --offline turns it off.
+[context.api]
+provider = "gemini"                 # "gemini" (Google's Gemini API; its free tier may use what is sent
+                                    # to improve Google's products), "jev" (Jev's decision API), or
+                                    # "openai": any OpenAI-compatible chat API (OpenRouter, Ollama...)
+url = ""                            # "": the provider's; needed for "openai"
+model = ""                          # "": gemini-3.5-flash-lite, or jev-latest; needed for "openai"
+api_key = "${VBR_JUDGE_API_KEY}"
+reasoning_effort = "auto"           # "auto": Gemini thinks little ("low"; "none" on 2.5); "": not sent
+timeout_s = 30
 
 # ---------------------------------------------------------------------------
 # Voice replacement (DESIGN.md §16): experimental
@@ -255,6 +268,11 @@ voice_margin = 0.15                 # how much less like the speaker the new wor
 "jesus christ" = ["jeez"]
 "oh my [god]" = ["gosh"]
 "for christ's sake" = ["for crying out loud"]
+
+[models]
+keep_loaded = false                 # false: one large model in memory at a time (speech recognition, context
+                                    # or voice), each freed before the next loads: a few seconds more per file.
+                                    # true: keep them all loaded, which is faster with plenty of GPU memory
 
 [cache]
 dir = "auto"                        # per-user cache dir

@@ -10,7 +10,7 @@ import pytest
 
 from helpers import FakeTranscriber, StrictUI, make_clip, say, srt
 from video_beep_remover.config import load_config
-from video_beep_remover.context.models import LABELS
+from video_beep_remover.context.models import LABELS, Question
 from video_beep_remover.models import Word
 from video_beep_remover.pipeline import Pipeline, RunOptions
 
@@ -45,7 +45,8 @@ class Judge:
     def __init__(self) -> None:
         self.questions: list[str] = []
 
-    def ask(self, prompt: str) -> str:
+    def ask(self, question: Question) -> str:
+        prompt = question.text
         self.questions.append(prompt)
         line = next(part for part in prompt.splitlines() if part.startswith(">> "))
         if "road to hell" in line:

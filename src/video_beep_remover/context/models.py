@@ -8,10 +8,11 @@ import logging
 import re
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from video_beep_remover.errors import ConfigError, DependencyError
+from video_beep_remover.errors import ConfigError, DependencyError, VbrError
 
 log = logging.getLogger(__name__)
 
@@ -108,11 +109,28 @@ class ToxicityClassifier:
         return scores
 
 
+@dataclass(frozen=True)
+class Question:
+    """A question for the judge (DESIGN.md §17.3): its wording for a language model, and the same
+    question as data, for a judge that takes it that way (Jev, §17.10)."""
+
+    kind: Literal["sense", "sexual", "substitute"]
+    text: str  # the wording, which asks for a JSON answer
+    dialogue: str  # the lines shown, quoted, the one asked about marked >>
+    word: str = ""  # sense and substitute: the listed word
+    candidates: tuple[str, ...] = ()  # substitute: the milder words to choose from
+
+
+class JudgeError(VbrError):
+    """The judge could not answer this question, e.g. its API was unreachable. The question counts as
+    unanswered, which leaves the use unsure: it is muted."""
+
+
 class Judge(Protocol):
     name: str
 
-    def ask(self, prompt: str) -> str:
-        """The model's answer to one question, as text."""
+    def ask(self, question: Question) -> str:
+        """The answer to one question, as text holding a JSON object (parsed by parse_answer)."""
         ...
 
 
@@ -140,8 +158,8 @@ class LocalJudge:
         except Exception as exc:  # a failed download, or out of GPU memory
             raise _load_failure("judge model", name, offline, exc) from exc
 
-    def ask(self, prompt: str) -> str:
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
+    def ask(self, question: Question) -> str:
+        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question.text}]
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
@@ -188,12 +206,13 @@ class CachedJudge:
             except (ValueError, KeyError, TypeError):
                 continue  # a line cut short by an interrupted run
 
-    def ask(self, prompt: str) -> str:
-        key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    def ask(self, question: Question) -> str:
+        """The judge's answer; a JudgeError is passed on, and nothing is cached for it."""
+        key = hashlib.sha256(question.text.encode("utf-8")).hexdigest()
         if key in self.answers:
             return self.answers[key]
         started = time.monotonic()
-        answer = self.judge.ask(prompt)
+        answer = self.judge.ask(question)
         self.seconds += time.monotonic() - started
         self.asked += 1
         self.answers[key] = answer
