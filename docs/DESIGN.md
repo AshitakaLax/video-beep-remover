@@ -227,6 +227,8 @@ src/video_beep_remover/
 ├── outputs.py             # where files go: output.path, --backup/--in-place, report, EDL, review SRT
 ├── context/               # context analysis (§17): lines, rules, classifier and judge, verdicts
 ├── pipeline.py            # per-file stages, strategy fallbacks, report, timings; vbr render
+├── model_pool.py          # Whisper by role, the context layer, voice replacement: loaded on first use,
+│                          #   one large model in memory at a time (models.keep_loaded)
 ├── guided.py              # subtitle-guided analysis: targeted and hybrid (§6.3-6.9)
 ├── voice/                 # voice replacement (§16): the sentence, separation, the voice model, the check
 ├── models.py              # dataclasses shared by all stages (§5.3)
@@ -260,7 +262,7 @@ src/video_beep_remover/
 │   ├── base.py            # Transcriber protocol, Clip
 │   ├── faster_whisper.py  # default backend (sequential, or batched with packed windows)
 │   ├── whisperx.py        # optional backend: faster-whisper words re-timed by forced alignment
-│   ├── cuda.py            # loads the [gpu] extra's cuBLAS and cuDNN
+│   ├── cuda.py            # loads the CUDA libraries installed with pip: the [gpu] extra's, PyTorch's
 │   ├── vad.py             # Silero speech regions; trimming clips to their speech
 │   └── cache.py           # transcripts and speech regions kept between runs (§8.3)
 ├── detect/

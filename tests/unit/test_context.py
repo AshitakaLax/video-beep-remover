@@ -556,7 +556,7 @@ def test_acting_on_verdicts_warns_that_it_is_experimental(tmp_path: Path) -> Non
     ui = WarningsUI()
     no_ffmpeg: Any = SimpleNamespace()
     models = (lambda name, device: Classifier(), lambda name, device: Judge({}))
-    Pipeline(loaded, ui=ui, ff=no_ffmpeg, context_models=models).context_layer()
+    Pipeline(loaded, ui=ui, ff=no_ffmpeg, context_models=models).models.context_layer()
     assert [w.split(":")[0] for w in ui.warnings] == [
         "acting on context verdicts is experimental",
         'context.harmless = "keep" keeps nothing without a judge (context.judge)',  # "auto" on a CPU
@@ -566,11 +566,11 @@ def test_acting_on_verdicts_warns_that_it_is_experimental(tmp_path: Path) -> Non
 def test_a_gpu_that_pytorch_cannot_use_is_named_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cpu_only = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
     monkeypatch.setitem(sys.modules, "torch", cpu_only)
-    monkeypatch.setattr("video_beep_remover.pipeline.cuda_available", lambda: True)  # Whisper sees one
+    monkeypatch.setattr("video_beep_remover.model_pool.cuda_available", lambda: True)  # Whisper sees one
     ui = WarningsUI()
     no_ffmpeg: Any = SimpleNamespace()
     pipeline = Pipeline(load_config(None, env={}, cwd=tmp_path), ui=ui, ff=no_ffmpeg)
-    assert (pipeline.model_device(), pipeline.model_device()) == ("cpu", "cpu")
+    assert (pipeline.models.device(), pipeline.models.device()) == ("cpu", "cpu")
     assert len(ui.warnings) == 1 and "CPU-only" in ui.warnings[0]
 
 

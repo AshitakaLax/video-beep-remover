@@ -10,14 +10,13 @@ One file goes through Pipeline in this order:
    subtitles).
 
 batch.py calls prepare and finish separately, so that one file renders while the next is analysed.
-render_report (`vbr render`) takes a report's intervals straight to finish."""
+render_report (`vbr render`) takes a report's intervals straight to finish. The models every stage
+uses are in model_pool.py, which loads them and keeps only one large model in memory at a time."""
 
 import contextlib
 import dataclasses
-import gc
 import logging
 import shutil
-import sys
 import tempfile
 import time
 import traceback
@@ -27,25 +26,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import httpx
-
 from video_beep_remover import __version__
 from video_beep_remover import guided as guided_analysis
-from video_beep_remover.asr.base import Clip, Transcriber, build_prompt
+from video_beep_remover.asr.base import Clip, build_prompt
 from video_beep_remover.asr.cache import VERSION as TRANSCRIPT_VERSION
 from video_beep_remover.asr.cache import TranscriptCache, TranscriptStore, settings_key
-from video_beep_remover.asr.cuda import load_pip_libraries
 from video_beep_remover.asr.faster_whisper import (
-    FasterWhisperTranscriber,
     ModelChoice,
-    cuda_available,
-    resolve_anchor_model,
-    resolve_model,
 )
 from video_beep_remover.asr.vad import Regions, SpeechDetector, silero_speech
 from video_beep_remover.config.loader import LoadedConfig, cache_root, config_hash
 from video_beep_remover.context import (
-    ContextLayer,
     Line,
     ModelFactory,
     build_lines,
@@ -54,7 +45,6 @@ from video_beep_remover.context import (
     review_cues,
     review_labels,
     review_notes,
-    torch_device,
     verdict_dict,
     word_lines,
 )
@@ -86,6 +76,7 @@ from video_beep_remover.media.render import (
     plan_streams,
     render,
 )
+from video_beep_remover.model_pool import ModelPool, TranscriberFactory, VoiceFactories
 from video_beep_remover.models import CensorInterval, Detection, Word
 from video_beep_remover.outputs import Placement, edl_path, place, report_path, review_path
 from video_beep_remover.report import (
@@ -107,7 +98,7 @@ from video_beep_remover.subtitles.oshash import fingerprint, opensubtitles_hash
 from video_beep_remover.subtitles.output import censor_streams, write_censored_copy
 from video_beep_remover.subtitles.parse import parse_sounds
 from video_beep_remover.ui import UI, NullUI, Progress
-from video_beep_remover.voice import Candidate, Replacement, Replacer, VoiceModels
+from video_beep_remover.voice import Candidate, Replacement
 from video_beep_remover.voice import check_installed as check_voice_installed
 
 __all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOptions"]
@@ -115,7 +106,6 @@ __all__ = ["UI", "FileResult", "Job", "NullUI", "Pipeline", "Progress", "RunOpti
 log = logging.getLogger(__name__)
 
 Status = Literal["cleaned", "copied", "clean", "scanned", "skipped"]
-TranscriberFactory = Callable[[ModelChoice], Transcriber]
 
 WORKDIR_PREFIX = "vbr-"  # each file's temporary folder, in the system's temp dir
 STALE_AFTER_S = 12 * 3600  # a temporary folder untouched this long was left by a run that died
@@ -237,14 +227,6 @@ class Job:
         self.clock = now
 
 
-def _free_memory() -> None:
-    """Return the memory of dropped models: Python's, and the GPU memory PyTorch keeps cached."""
-    gc.collect()
-    torch = sys.modules.get("torch")  # only if a model already imported it
-    if torch is not None and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 class _Track:
     """The decoded soundtrack, decoded at most once per file and shared by every stage that needs it."""
 
@@ -293,12 +275,10 @@ class Pipeline:
         speech_detector: SpeechDetector | None = None,
         opensubtitles: OpenSubtitlesClient | None = None,
         context_models: tuple[ModelFactory, ModelFactory] | None = None,
-        voice_models: tuple[Callable[[], Any], Callable[[], Any], Callable[[], Any]] | None = None,
+        voice_models: VoiceFactories | None = None,
     ) -> None:
+        """The factories and the speech detector stand in for the models in tests (model_pool.py)."""
         self.config = loaded.config
-        if self.config.transcription.device != "cpu":
-            # Before anything imports ctranslate2, even the speech detector (asr/cuda.py).
-            load_pip_libraries()
         self.ui: UI = ui or NullUI()
         self.ff = ff or FFmpeg(self.config.tools.ffmpeg, self.config.tools.ffprobe)
         self.lexicon = compile_lexicon(self.config.lexicon, only=categories, base_dir=loaded.base_dir)
@@ -307,20 +287,22 @@ class Pipeline:
         if not self.lexicon.terms and not self.lexicon.masked_patterns:
             raise ConfigError("the word list is empty: enable a category or add terms")
         self.prompt = build_prompt(self.config.transcription.initial_prompt, self.lexicon)
-        self._factory = transcriber_factory or self._load_transcriber
-        self._transcribers: dict[ModelChoice, Transcriber] = {}
+        self.models = ModelPool(
+            self.config,
+            self.ui,
+            self.lexicon,
+            self.prompt,
+            self.ff,
+            transcriber_factory=transcriber_factory,
+            context_models=context_models,
+            voice_models=voice_models,
+        )
         self.detect_speech: SpeechDetector = speech_detector or silero_speech
         self.subtitle_cache = SubtitleCache(cache_root(self.config))
         self._opensubtitles = opensubtitles
         self.tag = f"{__version__};{config_hash(self.config)}"  # VBR_CENSORED on every output
         self.transcript_cache = TranscriptCache(cache_root(self.config))
         self._scope: _CacheScope | None = None  # the file being analysed, for the transcript cache
-        self._context_models = context_models  # (classifier, judge) factories, for tests
-        self._context: ContextLayer | None = None
-        self._voice_models = voice_models  # (separator, editor, speaker encoder) factories, for tests
-        self._replacer: Replacer | None = None
-        self._check_role = "full"  # the transcriber that checks replaced words: the analysis's
-        self._device: str | None = None  # of the context and voice models, once decided
 
     def opensubtitles(self) -> OpenSubtitlesClient | None:
         """The OpenSubtitles client, when there is a key and the network may be used. One client
@@ -342,69 +324,12 @@ class Pipeline:
             return None
         return OnlineSubtitles(self.config, info, client=self.opensubtitles(), cache=self.subtitle_cache)
 
-    def _load_transcriber(self, choice: ModelChoice) -> Transcriber:
-        settings = self.config.transcription
-        whisper = FasterWhisperTranscriber(
-            choice,
-            beam_size=settings.beam_size,
-            batch_size=settings.batch_size,
-            vad_filter=settings.vad_filter,
-            offline=self.config.offline,
-        )
-        if not choice.align:
-            return whisper
-        from video_beep_remover.asr.whisperx import WhisperXTranscriber
-
-        return WhisperXTranscriber(
-            whisper,
-            language=self.config.analysis.language,
-            align_model=settings.align_model,
-            offline=self.config.offline,
-        )
-
-    def model_choice(self, role: str) -> ModelChoice:
-        """The model for a role: "full", "targeted" or "hybrid" (by strategy), or "anchor"."""
-        settings, language = self.config.transcription, self.config.analysis.language
-        if role == "anchor":
-            return resolve_anchor_model(settings, language=language)
-        return resolve_model(settings, strategy=role, language=language)
-
-    def make_room(self, model: str) -> None:
-        """Before `model` runs ("whisper", "context", "separator" or "editor"), drop the other large
-        models, unless models.keep_loaded. Each of them can take one to several GB of GPU memory, and on
-        Windows what does not fit on the GPU spills into system memory; one at a time, the peak is the
-        largest of them rather than their sum. A dropped model is loaded again on its next use."""
-        if self.config.models.keep_loaded:
-            return
-        dropped = []
-        if model != "whisper" and self._transcribers:
-            self._transcribers.clear()
-            dropped.append("whisper")
-        if model != "context" and self._context is not None and self._context.release():
-            dropped.append("context")
-        for name in ("separator", "editor"):
-            if model != name and self._replacer is not None and self._replacer.models.release(name):
-                dropped.append(name)
-        if dropped:
-            log.debug("freed %s before %s runs", ", ".join(dropped), model)
-            _free_memory()
-
-    def transcriber(self, role: str) -> tuple[ModelChoice, Transcriber]:
-        """The model for a role, loaded on first use. Loading is announced on a line of its own rather
-        than a live status, since it can happen while one is shown (e.g. during the sync check)."""
-        self.make_room("whisper")
-        choice = self.model_choice(role)
-        if choice not in self._transcribers:
-            self.ui.info(f"Loading Whisper model {choice.describe()}")
-            self._transcribers[choice] = self._factory(choice)
-        return choice, self._transcribers[choice]
-
     def transcripts(self, role: str) -> TranscriptStore | None:
         """The cached transcripts of the file being analysed, for the model and settings of `role`."""
         scope = self._scope
         if scope is None:
             return None
-        choice = self.model_choice(role)
+        choice = self.models.model_choice(role)
         settings = self.config.transcription
         key = settings_key(
             version=TRANSCRIPT_VERSION,
@@ -433,11 +358,11 @@ class Pipeline:
             prompt=self.prompt,
             ui=self.ui,
             ff=self.ff,
-            transcriber=self.transcriber,
+            transcriber=self.models.transcriber,
             detect_speech=self.detect_speech,
             online=self.online_source,
             transcripts=self.transcripts,
-            model_choice=self.model_choice,
+            model_choice=self.models.model_choice,
         )
 
     def _full(
@@ -449,7 +374,7 @@ class Pipeline:
         if words is None:
             audio = track.get()
             lap("decode")
-            _, transcriber = self.transcriber("full")
+            _, transcriber = self.models.transcriber("full")
             with self.ui.progress("Transcribing", len(audio) / SAMPLE_RATE) as update:
                 [words] = transcriber.transcribe(
                     [Clip(0.0, audio)],
@@ -466,7 +391,7 @@ class Pipeline:
             fallback_reason,
             detect_in_words(self.lexicon, words),
             len(words),
-            self.model_choice("full"),
+            self.models.model_choice("full"),
             report,
             "all" if cached else "none",
             heard=list(words),
@@ -581,9 +506,9 @@ class Pipeline:
         started = time.monotonic()
         if options.subtitles is not None and not options.subtitles.is_file():
             raise UsageError(f"subtitle file not found: {options.subtitles}")
-        if (cfg.context.enabled or cfg.replace.enabled) and self._context_models is None:
+        if (cfg.context.enabled or cfg.replace.enabled) and self.models.context_models is None:
             check_installed()  # the layer runs last: fail before the transcription, not after it
-        if cfg.replace.enabled and self._voice_models is None:
+        if cfg.replace.enabled and self.models.voice_models is None:
             check_voice_installed()
         placement = None
         if not options.dry_run:
@@ -837,7 +762,7 @@ class Pipeline:
 
     def _check_splice(self, audio: Audio, start: float, span: CensorInterval) -> str | None:
         """Why a replaced word fails in the rendered file: a listed word is heard in its span."""
-        words = self._check_transcriber(audio, start)
+        words = self.models.hear(audio, start)
         found = detect_in_words(self.lexicon, words)
         leaked = [d for d in found if d.start < span.end and span.start < d.end]
         return f"a listed word is heard in the output: {leaked[0].heard.strip()!r}" if leaked else None
@@ -943,48 +868,6 @@ class Pipeline:
         if job.workdir.exists():  # e.g. a file another program holds open: a later run sweeps it
             log.debug("could not delete the temporary folder %s", job.workdir)
 
-    def model_device(self) -> str:
-        """Where the context and voice models run (context.models.torch_device), decided once, with a
-        warning when PyTorch cannot use the GPU that Whisper uses."""
-        if self._device is None:
-            setting = self.config.transcription.device
-            self._device = torch_device(setting)
-            if setting == "auto" and self._device == "cpu" and cuda_available():
-                self.ui.warn(
-                    "PyTorch cannot use the GPU that Whisper uses (is it a CPU-only build?), so the "
-                    "context and voice models run on the CPU"
-                )
-        return self._device
-
-    def context_layer(self) -> ContextLayer:
-        """The context layer (DESIGN.md §17), created once: its models serve every file of a batch."""
-        if self._context is None:
-            classifier, judge = self._context_models or (None, None)
-            self._context = ContextLayer(
-                self.config,
-                device=self.model_device(),
-                cache_dir=cache_root(self.config) / "context",
-                classifier_factory=classifier,
-                judge_factory=judge,
-            )
-            settings = self.config.context
-            if settings.harmless == "keep" or settings.sexual == "mute":
-                self.ui.warn(
-                    "acting on context verdicts is experimental: it is measured on a small labelled set "
-                    "only (DESIGN.md §17.7); check the review subtitles (--review-srt)"
-                )
-            if settings.judge == "api" and self._context.judge_name is not None:
-                from video_beep_remover.context.api import endpoint
-
-                host = httpx.URL(endpoint(settings.api)[0]).host
-                self.ui.warn(
-                    f"the context judge is {self._context.judge_name}: each line it is asked about is "
-                    f"sent to {host}, with its neighbours"
-                )
-            if settings.harmless == "keep" and self._context.judge_name is None:
-                self.ui.warn('context.harmless = "keep" keeps nothing without a judge (context.judge)')
-        return self._context
-
     def _run_context(
         self,
         job: Job,
@@ -1004,8 +887,8 @@ class Pipeline:
             lines = build_lines(chosen.cues, sounds, chosen.sync.model, analysis.heard)
         else:
             lines = word_lines(analysis.heard)
-        layer = self.context_layer()
-        self.make_room("context")
+        layer = self.models.context_layer()
+        self.models.make_room("context")
         with self.ui.status("Reading the dialogue in context"):
             result, section = layer.run(detections, lines, analysis.heard)
         job.context = section
@@ -1105,38 +988,6 @@ class Pipeline:
                 spans.append((line.start, line.end, False))
         return spans
 
-    def replacer(self, role: str) -> Replacer:
-        """Voice replacement (DESIGN.md §16), created once: its models serve every file of a batch. The
-        check hears the new words with the transcriber of the analysis (`role`)."""
-        if self._replacer is None:
-            cfg = self.config
-            separator, editor, encoder = self._voice_models or (None, None, None)
-            models = VoiceModels(
-                cfg.replace,
-                device=self.model_device(),
-                offline=cfg.offline,
-                cache_dir=cache_root(cfg) / "voice",
-                separator=separator,
-                editor=editor,
-                encoder=encoder,
-            )
-            self._replacer = Replacer(
-                cfg.replace, self.lexicon, self.ff, models, self._check_transcriber, self.make_room
-            )
-            self.ui.warn(
-                "voice replacement is experimental (DESIGN.md §16): check the review subtitles "
-                "(--review-srt); its voice model's weights are licensed for non-commercial use only"
-            )
-        self._check_role = role
-        return self._replacer
-
-    def _check_transcriber(self, audio: Audio, start: float) -> list[Word]:
-        _, transcriber = self.transcriber(self._check_role)
-        [words] = transcriber.transcribe(
-            [Clip(start, audio)], language=self.config.analysis.language, prompt=self.prompt, vad=False
-        )
-        return list(words)
-
     def _replace_words(
         self,
         job: Job,
@@ -1148,8 +999,8 @@ class Pipeline:
     ) -> None:
         """Say a milder word in place of each listed word the context layer lets through (DESIGN.md §16,
         §17.6). A word's span is replaced only if no other muted word shares it; any failure mutes it."""
-        layer = self.context_layer()
-        self.make_room("context")  # the judge picks the substitutes
+        layer = self.models.context_layer()
+        self.models.make_room("context")  # the judge picks the substitutes
         choices = layer.substitutes(detections, context, self.config.replace.substitutes)
         candidates = []
         for index, (detection, choice) in enumerate(zip(detections, choices, strict=True)):
@@ -1165,7 +1016,7 @@ class Pipeline:
                 continue
             crowded = any(d != detection and d.start < span.end and span.start < d.end for d in to_mute)
             candidates.append((index, detection, choice.substitute, span, crowded))
-        replacer = self.replacer(analysis.strategy)
+        replacer = self.models.replacer(analysis.strategy)
         planned: list[Candidate | Replacement] = []
         for index, detection, substitute, span, crowded in candidates:
             if crowded:

@@ -47,6 +47,7 @@ src/video_beep_remover/
                 configuration keys that flags set, console.py the output
   batch.py      files and folders: skips vbr's own outputs and backups, renders in the background
   pipeline.py   one file, stage by stage (its docstring lists the stages); strategy fallbacks; the report
+  model_pool.py the large models (Whisper by role, context, voice): loaded on first use, one at a time
   outputs.py    where files go: output.path, --backup and --in-place, report, EDL, review subtitles
   guided.py     the subtitle-guided strategies, targeted and hybrid
   config/       schema.py (pydantic), loader.py, defaults.toml (the same bytes as docs/vbr.example.toml)

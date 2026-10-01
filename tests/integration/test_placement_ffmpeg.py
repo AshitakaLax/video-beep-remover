@@ -15,6 +15,7 @@ from video_beep_remover.config import load_config
 from video_beep_remover.errors import RenderError, UsageError
 from video_beep_remover.media.ffmpeg import FFmpeg
 from video_beep_remover.media.probe import probe
+from video_beep_remover.model_pool import ModelPool
 from video_beep_remover.pipeline import Pipeline, RunOptions
 
 pytestmark = pytest.mark.ffmpeg
@@ -88,7 +89,7 @@ def test_backup_and_in_place_do_not_take_an_output_path(tmp_path: Path) -> None:
 def test_scan_then_render_and_clean_a_folder_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(Pipeline, "_load_transcriber", lambda self, choice: FakeTranscriber(SPOKEN))
+    monkeypatch.setattr(ModelPool, "_load_transcriber", lambda self, choice: FakeTranscriber(SPOKEN))
     monkeypatch.setattr("video_beep_remover.pipeline.silero_speech", lambda audio, on_progress=None: [])
     for name in ("a.mp4", "b.mkv"):
         make_clip(tmp_path / name, duration=3.0)
