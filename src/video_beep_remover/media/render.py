@@ -39,6 +39,10 @@ _SAME_CODEC = {
     "aac": "aac", "ac3": "ac3", "eac3": "eac3", "mp3": "libmp3lame", "opus": "libopus",
     "vorbis": "libvorbis", "flac": "flac", "alac": "alac",
 }  # fmt: skip
+# Windows' own AAC encoder (Media Foundation): 2.4 times as fast as FFmpeg's, and closer to the source in
+# every band below 16 kHz at 160 kbps (DESIGN.md §6.11). It takes the common sample rates and layouts
+# only, and snaps a bitrate to one it supports: 22.05 kHz stereo got 33 kbps.
+_PLATFORM_AAC = "aac_mf"
 # Otherwise (DTS, TrueHD, missing encoder): what suits the output container.
 _CONTAINER_FALLBACK = {
     ".mkv": "flac", ".mka": "flac", ".webm": "libopus", ".mp4": "aac", ".m4v": "aac", ".m4a": "aac",
@@ -196,6 +200,9 @@ def choose_encoder(
             encoder = next((name for name in options if name in encoders), "")
         if not encoder:
             raise DependencyError(f"FFmpeg has no audio encoder usable for {suffix} output")
+        common = stream.sample_rate in (44_100, 48_000) and (stream.channels or 2) in (1, 2, 6)
+        if encoder == "aac" and _PLATFORM_AAC in encoders and common:
+            encoder = _PLATFORM_AAC
     if encoder in ("flac", "alac") or encoder.startswith("pcm_"):
         return encoder, None
     if bitrate != "auto":
@@ -205,7 +212,8 @@ def choose_encoder(
 
 def _default_bitrate(encoder: str, stream: StreamInfo) -> str:
     channels = stream.channels or 2
-    source = stream.bit_rate if _SAME_CODEC.get(stream.codec or "") == encoder else None
+    codec = "aac" if encoder == _PLATFORM_AAC else encoder
+    source = stream.bit_rate if _SAME_CODEC.get(stream.codec or "") == codec else None
     if encoder in ("ac3", "eac3"):
         default, cap = (640_000 if channels > 2 else 192_000), (640_000 if encoder == "ac3" else 6_144_000)
     elif encoder == "libopus":

@@ -25,6 +25,7 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 
 - Each word is muted with short fades inside its padding.
 - Only the audio is re-encoded; video, chapters and attachments are copied untouched.
+- On Windows, AAC is re-encoded with Windows' own encoder where it suits the track: 2.4 times as fast as FFmpeg's, and closer to the source.
 - Every muted span is checked for silence before the output is kept, and the output must keep every stream and the input's length.
 - Other audio tracks get the same mutes when their dialogue matches the analysed track; tracks that don't match are dropped.
 - Listed words are masked in text subtitle tracks, and in a copy of the subtitle file that guided the search, which keeps the file's line endings.

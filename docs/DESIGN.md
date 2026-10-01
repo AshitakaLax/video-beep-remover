@@ -587,6 +587,16 @@ Filtered streams lose their per-stream tags, so language, title and disposition 
 
 Re-encoding a lossy track at its source bitrate costs a generation of quality, which is generally inaudible. With MKV, `audio_codec = "flac"` avoids that loss entirely. `vbr doctor` checks `ffmpeg -encoders` up front.
 
+AAC is encoded with Windows' own encoder (`aac_mf`, Media Foundation) when FFmpeg has it and the track is 44.1 or 48 kHz with 1, 2 or 6 channels. Measured on 10 minutes of a TV episode's 160 kbps stereo AAC, re-encoded at 160 kbps, as signal-to-noise ratio against the source in each band:
+
+| Encoder | Time | below 4 kHz | 4–11 kHz | 11–16 kHz | above 16 kHz |
+|---|---|---|---|---|---|
+| `aac` (FFmpeg's, two-loop search) | 10.0 s | 28.8 dB | 20.3 dB | 14.6 dB | 6.4 dB |
+| `aac` with `-aac_coder fast` | 3.8 s | 31.2 dB | 10.2 dB | 5.7 dB | 4.3 dB |
+| `aac_mf` | 4.2 s | 34.0 dB | 24.3 dB | 20.7 dB | 4.5 dB |
+
+`aac_mf` is 2.4 times as fast and closer to the source in every band below 16 kHz; above it, both low-pass. FFmpeg's fast mode loses 10 dB in the middle bands, so it is not used. Rendering the whole 50-minute episode took 31 s instead of 70 s. `aac_mf` snaps a bitrate to one it supports, which at 22.05 kHz stereo gave 33 kbps, hence the limits. Other platforms' encoders (`aac_at` on macOS, `libfdk_aac`) are not measured; `audio_codec` can name them.
+
 **Other audio streams (`other_audio_streams`)**
 
 - `auto` (default): streams with the analyzed stream's language get the same intervals, which covers e.g. a stereo downmix next to the 5.1 mix. Other languages, commentary and audio description are dropped with a warning, since keeping them would leave uncensored speech in the file. A cheap guard checks that a same-language stream really carries the same dialogue before applying the intervals. It decodes both streams' 16 kHz mono downmixes around up to five muted spans spread over the file, each widened by 1 s, and takes the median of their normalized cross-correlation within ±0.1 s of lag. At 0.5 or more the stream is censored; below, it is dropped with a note naming the correlation, e.g. for a mislabelled dub or an offset track. Spans where either stream is silent prove nothing and are skipped. In synthetic tests a downmix scores above 0.9 and unrelated audio below 0.1; the threshold is to be tuned on the evaluation set. The report lists every check under `output.audio_checks`.
@@ -689,7 +699,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | `targeted`, 40 flagged cues | ≈ 3.5 min (about 30 windows × 7 s) | ≈ 17 s | ≈ 27 s |
 | sync anchors, trusted subtitles | ≈ 1 min through `base.en` | a few seconds | a few seconds |
 
-**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127 s for two hours of stereo AAC on a 4-vCPU container, and 131 s with 479 muted spans (Appendix A). The cost scales with channel count and encoder. With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
+**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127 s for two hours of stereo AAC on a 4-vCPU container, and 131 s with 479 muted spans (Appendix A). The cost scales with channel count and encoder: on Windows, AAC is encoded 2.4 times as fast with Media Foundation (§6.11). With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
 
 ### 8.2 Techniques
 

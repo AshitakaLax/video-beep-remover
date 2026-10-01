@@ -84,6 +84,22 @@ def test_encoder_choice(
     assert choose_encoder(stream(1, codec=codec, **extra), suffix, ENCODERS, "auto", "auto") == expected
 
 
+def test_windows_aac_encoder_is_preferred_where_it_suits() -> None:
+    """aac_mf is faster than FFmpeg's encoder and closer to the source, but snaps rates it lacks."""
+    windows = ENCODERS | {"aac_mf"}
+
+    def chosen(**fields: Any) -> tuple[str, str | None]:
+        return choose_encoder(stream(1, codec="aac", **fields), ".mp4", windows, "auto", "auto")
+
+    assert chosen(sample_rate=48_000, bit_rate=160_245) == ("aac_mf", "160k")  # the source's bitrate
+    assert chosen(sample_rate=44_100, channels=6) == ("aac_mf", "384k")
+    assert chosen(sample_rate=22_050) == ("aac", "128k")  # it would give 33 kbps
+    assert chosen(sample_rate=48_000, channels=8) == ("aac", "512k")
+    assert chosen() == ("aac", "128k")  # an unknown rate
+    explicit = choose_encoder(stream(1, codec="aac", sample_rate=48_000), ".mp4", windows, "aac", "auto")
+    assert explicit == ("aac", "128k")  # output.audio_codec still decides
+
+
 def test_explicit_codec_and_bitrate() -> None:
     assert choose_encoder(stream(1, codec="aac"), ".mkv", ENCODERS, "flac", "auto") == ("flac", None)
     assert choose_encoder(stream(1, codec="aac"), ".mkv", ENCODERS, "auto", "256k") == ("aac", "256k")
