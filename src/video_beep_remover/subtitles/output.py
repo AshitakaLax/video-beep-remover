@@ -63,7 +63,7 @@ def censor_streams(
             )
             continue
         target = workdir / f"censored-{stream.index}{source.suffix}"
-        target.write_text(done.text, "utf-8")
+        target.write_text(done.text, "utf-8", newline="")
         result.files[stream.index] = target
         result.report.append(
             {
@@ -114,6 +114,7 @@ def write_censored_copy(
         kept.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(subtitle, kept)
     tmp = target.with_name(f".{target.name}.tmp")
-    tmp.write_text(done.text, "utf-8")
+    # The text keeps the file's own line endings; text mode would add a "\r" to each "\r\n" on Windows.
+    tmp.write_text(done.text, "utf-8", newline="")
     tmp.replace(target)
     return CensoredCopy(target, done.masked)

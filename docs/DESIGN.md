@@ -109,6 +109,8 @@ Render      ━━━━━━━━━━━━━━━━━━━━ 100 % �
 Done        The Movie (2019).clean.mkv · The Movie (2019).clean.vbr.json
 ```
 
+Each file's result (the `Done` line) goes to standard output, and everything else to standard error, so the results of a run can be redirected on their own. Both are written in UTF-8 when redirected: Windows would otherwise use its ANSI code page, which has no `→`.
+
 ## 4. Configuration
 
 ### 4.1 Format, discovery and precedence
@@ -225,6 +227,8 @@ src/video_beep_remover/
 ├── outputs.py             # where files go: output.path, --backup/--in-place, report, EDL, review SRT
 ├── context/               # context analysis (§17): lines, rules, classifier and judge, verdicts
 ├── pipeline.py            # per-file stages, strategy fallbacks, report, timings; vbr render
+├── model_pool.py          # Whisper by role, the context layer, voice replacement: loaded on first use,
+│                          #   one large model in memory at a time (models.keep_loaded)
 ├── guided.py              # subtitle-guided analysis: targeted and hybrid (§6.3-6.9)
 ├── voice/                 # voice replacement (§16): the sentence, separation, the voice model, the check
 ├── models.py              # dataclasses shared by all stages (§5.3)
@@ -258,7 +262,7 @@ src/video_beep_remover/
 │   ├── base.py            # Transcriber protocol, Clip
 │   ├── faster_whisper.py  # default backend (sequential, or batched with packed windows)
 │   ├── whisperx.py        # optional backend: faster-whisper words re-timed by forced alignment
-│   ├── cuda.py            # loads the [gpu] extra's cuBLAS and cuDNN
+│   ├── cuda.py            # loads the CUDA libraries installed with pip: the [gpu] extra's, PyTorch's
 │   ├── vad.py             # Silero speech regions; trimming clips to their speech
 │   └── cache.py           # transcripts and speech regions kept between runs (§8.3)
 ├── detect/
@@ -363,7 +367,7 @@ Sources are tried in the configured order. Acquisition stops at the first candid
 |---|---|---|
 | `--subtitles PATH` | As given. | trusted |
 | embedded | Text subtitle streams (`subrip`, `ass`, `ssa`, `webvtt`, `mov_text`, `text`). Extraction reads the whole file, so every candidate stream is extracted in one pass (`ffmpeg -i file:<input> -map 0:<index> -f srt <file> ...`), the first time one is needed. ASS stays ASS. Commentary tracks are skipped. | trusted |
-| sidecar | `<stem>.*.{srt,ass,ssa,vtt}` next to the video or inside `Subs/` or `Subtitles/`; `Subs/<stem>/*` (season packs); any file in `Subs/` when the video is alone in its folder (movie releases). Language, SDH and forced come from name tokens (`.en.`, `.eng.`, `.English.`, `.sdh.`, `.cc.`, `.forced.`). `.hi.` means hearing impaired next to a language token and Hindi on its own. | trusted |
+| sidecar | `<stem>.*.{srt,ass,ssa,vtt}` next to the video or inside `Subs/` or `Subtitles/`; `Subs/<stem>/*` (season packs); any file in `Subs/` when the video is alone in its folder (movie releases). Language, SDH and forced come from name tokens (`.en.`, `.eng.`, `.English.`, `.sdh.`, `.cc.`, `.forced.`). `.hi.` means hearing impaired next to a language token and Hindi on its own. vbr's own review subtitles (`*.review.srt`, §6.12) are skipped: they name what was muted, not what is said. | trusted |
 | OpenSubtitles.com | Hash search first, then a metadata search (§6.4). | trusted if `moviehash_match`, otherwise untrusted |
 | more providers (a `subliminal` adapter; not implemented yet) | Podnapisi, Addic7ed, Gestdown, and others. | untrusted |
 
@@ -406,7 +410,7 @@ This provider uses the REST API v1 at `https://api.opensubtitles.com/api/v1/`. E
        return f"{h:016x}"
    ```
 2. **Hash search.** `GET /subtitles?moviehash=<hash>&languages=en`. From each result it reads `attributes.moviehash_match`, `hearing_impaired`, `foreign_parts_only`, `machine_translated`, `fps`, `release`, `download_count` and `files[].file_id`. Hash-matched subtitles were timed against this exact file, so they are trusted.
-3. **Metadata search** runs only when no result is hash-matched. `guessit(<filename>)` supplies the title, year, season and episode, and the search is `GET /subtitles?query=<title>&year=<year>&languages=en`. For episodes it adds `season_number` and `episode_number`. For a movie with an IMDb id in a Kodi-style `.nfo` file next to it, it searches by `imdb_id` instead. Parameters are sent sorted and in lower case, as the API asks, which avoids redirects. Results split over several CDs are skipped.
+3. **Metadata search** runs only when no result is hash-matched. An IMDb id in a Kodi-style `.nfo` file next to the video is searched first (`imdb_id`): a movie's, or an episode's own, from its `<episodedetails>` file. The title is searched only when that finds nothing usable. `guessit(<filename>)` supplies the title, year, season and episode, and the search is `GET /subtitles?query=<title>&year=<year>&languages=en`. For episodes it adds `season_number` and `episode_number`. guessit takes an episode's own title for the show's when the name starts with the episode (`S01E02 - Pilot.mkv`). The show then comes from the episode's `.nfo` (`<showtitle>`), from the show folder's `tvshow.nfo`, or from the name of the folder that holds a `Season 01` folder. With none of these, no title is searched: a wrong one could cost downloads. Parameters are sent sorted and in lower case, as the API asks, which avoids redirects. Results split over several CDs are skipped.
 4. **Download.** `POST /download {"file_id": N}` returns `{link, remaining, reset_time_utc}`. The tool fetches `link`, caps the file at 5 MB and decodes it as in §6.5. The API key is sent only to the API, never to the host serving the file. The file is cached under its `file_id`, and an index records it under the video's fingerprint (hash and size). So a cached copy never costs quota again, and a later run offers it first, even offline or without a key.
 5. **Quota and rate limits.** Downloads are limited per 24 h: 5 per IP address without logging in, more for logged-in and VIP users. The tool downloads only the top candidate and tries the next one only if the sync check fails, up to `max_candidates`. When the quota runs out (`remaining` reaches 0 or a download is refused), the tool warns, records the reset time in the report and moves on to the fallback. HTTP 429 is retried with capped exponential backoff, honouring `Retry-After`.
 
@@ -479,8 +483,8 @@ The default backend is faster-whisper.
 - **Profanity spelling.** Whisper sometimes writes profanity masked, e.g. "s\*\*\*" ([openai/whisper#1534](https://github.com/openai/whisper/discussions/1534)). The masked-token rule catches that. In addition, `initial_prompt = "auto"` primes the decoder with a short uncensored sentence built from enabled terms, which pushes it toward verbatim spelling. The benchmark must show this does not add false positives before the default ships (open question 1).
 - **Trimming to speech.** After a pause, Whisper tends to start the first word at the very beginning of the clip. During implementation, a word 0.85 s into a clip was placed at 0.00 s, and faster-whisper's own clamp only engages after longer pauses. So each window is trimmed to its speech (Silero VAD, which pads speech by 0.2 s, plus 0.1 s) before transcription. That brought the error to about 0.2 s, spent in silence. A window where VAD hears nothing is transcribed whole, since VAD can miss shouting or singing.
 - **Window edges.** Words within 0.3 s of a window edge are dropped as unreliable, because the edge may cut a word in half. The rule does not apply at the start or end of the file, or at an edge trimmed to silence. Where the pieces of a split window overlap, each keeps its words before or after the middle of the overlap. Windows are padded so flagged cues sit well inside them.
-- **Model files.** Models are downloaded from Hugging Face on first use and cached. With `offline = true` they load with `local_files_only=True`. A model missing from the cache is then an error (exit code 3), not a download.
-- **GPU libraries.** On a GPU, the CUDA libraries that the `[gpu]` extra installs with pip are loaded by path before the first model. ctranslate2 looks for cuBLAS and cuDNN only on the library search path, which pip's copies are not on; faster-whisper's documentation has users set `LD_LIBRARY_PATH` instead.
+- **Model files.** Models are downloaded from Hugging Face on first use and cached. With `offline = true` they load with `local_files_only=True`. A model missing from the cache is then an error (exit code 3), not a download. The voice models (§16) take no such argument, so huggingface_hub's offline setting is changed directly: it reads `HF_HUB_OFFLINE` only when it is first imported, which Whisper does first. torch.hub, which Demucs downloads with, has no offline mode, so it is made to refuse.
+- **GPU libraries.** On a GPU, the CUDA libraries that the `[gpu]` extra installs with pip are loaded by path before the first model. ctranslate2 looks for cuBLAS and cuDNN only on the library search path, which pip's copies are not on; faster-whisper's documentation has users set `LD_LIBRARY_PATH` instead. On Windows, ctranslate2 finds no cuBLAS unless the CUDA toolkit is on `PATH`. The cuDNN it ships, and loads when it is imported, broke PyTorch's: a PyTorch model that then used cuDNN aborted the process (`Could not load symbol cudnnGetLibConfig`, exit code 127). So when PyTorch's CUDA build is installed, its `cudart`, `cuBLAS` and `cuDNN` are loaded by path before anything imports ctranslate2, and both libraries use them.
 - **Optional alignment.** The `whisperx` backend (`[align]` extra) re-times faster-whisper's words with wav2vec2 forced alignment, through WhisperX:
   - **Per segment.** Each segment is aligned as soon as it is decoded, with 0.2 s of audio around it, so progress stays smooth even in full mode. WhisperX aligns the segment's words, or its characters in Chinese and Japanese, and they are paired back with Whisper's words. A segment whose alignment fails or loses words keeps Whisper's times.
   - **Widened, not replaced.** On the evaluation set, Whisper's word ends came up to 230 ms early and the aligned ones within 50 ms. But aligned starts came up to 200 ms late, where Whisper's were always early (Appendix C). A word censored late is heard, so each word keeps the earlier of the two starts and the later of the two ends. An aligned edge more than 0.5 s outside Whisper's is taken for a misalignment and ignored.
@@ -585,6 +589,16 @@ Filtered streams lose their per-stream tags, so language, title and disposition 
 
 Re-encoding a lossy track at its source bitrate costs a generation of quality, which is generally inaudible. With MKV, `audio_codec = "flac"` avoids that loss entirely. `vbr doctor` checks `ffmpeg -encoders` up front.
 
+AAC is encoded with Windows' own encoder (`aac_mf`, Media Foundation) when FFmpeg has it and the track is 44.1 or 48 kHz with 1, 2 or 6 channels. Measured on 10 minutes of a TV episode's 160 kbps stereo AAC, re-encoded at 160 kbps, as signal-to-noise ratio against the source in each band:
+
+| Encoder | Time | below 4 kHz | 4–11 kHz | 11–16 kHz | above 16 kHz |
+|---|---|---|---|---|---|
+| `aac` (FFmpeg's, two-loop search) | 10.0 s | 28.8 dB | 20.3 dB | 14.6 dB | 6.4 dB |
+| `aac` with `-aac_coder fast` | 3.8 s | 31.2 dB | 10.2 dB | 5.7 dB | 4.3 dB |
+| `aac_mf` | 4.2 s | 34.0 dB | 24.3 dB | 20.7 dB | 4.5 dB |
+
+`aac_mf` is 2.4 times as fast and closer to the source in every band below 16 kHz; above it, both low-pass. FFmpeg's fast mode loses 10 dB in the middle bands, so it is not used. Rendering the whole 50-minute episode took 31 s instead of 70 s. `aac_mf` snaps a bitrate to one it supports, which at 22.05 kHz stereo gave 33 kbps, hence the limits. Other platforms' encoders (`aac_at` on macOS, `libfdk_aac`) are not measured; `audio_codec` can name them.
+
 **Other audio streams (`other_audio_streams`)**
 
 - `auto` (default): streams with the analyzed stream's language get the same intervals, which covers e.g. a stereo downmix next to the 5.1 mix. Other languages, commentary and audio description are dropped with a warning, since keeping them would leave uncensored speech in the file. A cheap guard checks that a same-language stream really carries the same dialogue before applying the intervals. It decodes both streams' 16 kHz mono downmixes around up to five muted spans spread over the file, each widened by 1 s, and takes the median of their normalized cross-correlation within ±0.1 s of lag. At 0.5 or more the stream is censored; below, it is dropped with a note naming the correlation, e.g. for a mislabelled dub or an offset track. Spans where either stream is silent prove nothing and are skipped. In synthetic tests a downmix scores above 0.9 and unrelated audio below 0.1; the threshold is to be tuned on the evaluation set. The report lists every check under `output.audio_checks`.
@@ -597,7 +611,7 @@ Re-encoding a lossy track at its source bitrate costs a generation of quality, w
   - **Masking.** Words are found in the text a viewer sees: HTML-like tags, ASS override blocks and WebVTT tags take no space, and `\N` separates words. The file is then edited in place, so markup, styling, timing and layout survive untouched: in SRT and WebVTT the lines after each timing line, in ASS the text field of each `Dialogue` line. Other formats go through pysubs2. Words the subtitles already mask (`f***`) stay as they are with `first_letter`. Hint words are never masked. `remove` keeps line breaks, even inside a removed phrase. In SRT and WebVTT, a blank line ends a cue, so a line left empty is dropped, and so is a cue left with nothing to show.
   - **Muxing.** Each censored file is a separate FFmpeg input, mapped at the stream's position and encoded with the codec the container takes (`mov_text` in MP4, `webvtt` in WebM, else the source's `srt` or `ass`). Language, title and disposition are re-applied from the probe.
   - Streams in a language other than the word list's are masked too, with a note that the list does not cover their language. Image-based streams (PGS, VobSub, DVB) are copied with a warning. A stream that cannot be extracted or read is dropped, since copying it would keep its words.
-  - The subtitle file the analysis used, if it was a sidecar or `--subtitles`, gets a masked copy next to the output, named after it so players load it with the cleaned file: `Movie.en.sdh.srt` becomes `Movie.clean.en.sdh.srt`, and `Subs/English.srt` becomes `Movie.clean.en.srt`.
+  - The subtitle file the analysis used, if it was a sidecar or `--subtitles`, gets a masked copy next to the output, named after it so players load it with the cleaned file: `Movie.en.sdh.srt` becomes `Movie.clean.en.sdh.srt`, and `Subs/English.srt` becomes `Movie.clean.en.srt`. The copy keeps the file's own line endings.
 - `copy` or `drop`.
 
 **Nothing to censor.** `when_clean = "copy"` does a plain stream copy (`-map 0 -c copy`), which takes seconds; the subtitle streams are still masked, since a line can hold a listed word the audio does not. `"skip"` writes nothing. Every output is tagged `VBR_CENSORED=<version>;<config hash>`, so later runs can skip processed files (§8.2). The hash covers the effective settings, secrets left out. MP4 keeps a tag of its own only with `-movflags +use_metadata_tags`, which is added.
@@ -617,7 +631,7 @@ In every mode the renderer writes `<output stem>.partial<ext>`, verifies it, and
 ```json
 {
   "schema_version": 1,
-  "input": {"path": "The Movie (2019).mkv", "size": 4368124121, "duration": 7442.3},
+  "input": {"path": "The Movie (2019).mkv", "size": 4368124121, "oshash": "8e245d9679d31e12", "duration": 7442.3},
   "audio_stream": {"index": 1, "codec": "eac3", "channels": 6, "language": "eng"},
   "strategy": {"requested": "hybrid", "used": "hybrid", "fallback_reason": null},
   "subtitle_candidates": [{"source": "embedded", "label": "embedded #4 'English SDH' (eng)", "cues": 1412,
@@ -630,12 +644,12 @@ In every mode the renderer writes `<output stem>.partial<ext>`, verifies it, and
               "audio_seconds": 281.0, "coverage": 0.038, "expanded": 2, "cached": 0, "partly_cached": 0},
   "confirmation": {"strong_flags": 41, "confirmed": 40},
   "transcription": {"backend": "faster-whisper", "model": "large-v3-turbo", "device": "cuda",
-                    "compute_type": "float16", "words": 3120, "from_cache": "none"},
+                    "compute_type": "float16", "prompt": "Damn, hell, …", "words": 3120, "from_cache": "none"},
   "detections": [{"start": 4383.41, "end": 4383.78, "heard": "hell", "term": "hell", "category": "mild",
                   "confidence": 0.94, "source": "asr", "cue": 812}],
   "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
   "intervals": [{"start": 4383.29, "end": 4383.98}],
-  "output": {"path": "The Movie (2019).clean.mkv", "backup": null,
+  "output": {"path": "The Movie (2019).clean.mkv", "backup": null, "encoders": {"1": "eac3"},
              "muted_spans": [{"start": 4383.29, "end": 4383.98}],
              "verified_spans": 44, "timeline_shift": 0.0,
              "audio_checks": [{"stream": 2, "same_dialogue": true, "correlation": 0.97, "lag": 0.0}],
@@ -687,7 +701,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | `targeted`, 40 flagged cues | ≈ 3.5 min (about 30 windows × 7 s) | ≈ 17 s | ≈ 27 s |
 | sync anchors, trusted subtitles | ≈ 1 min through `base.en` | a few seconds | a few seconds |
 
-**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127 s for two hours of stereo AAC on a 4-vCPU container, and 131 s with 479 muted spans (Appendix A). The cost scales with channel count and encoder. With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
+**Rendering.** Re-encoding the audio track is needed in every mode except EDL output. The prototype measured 127 s for two hours of stereo AAC on a 4-vCPU container, and 131 s with 479 muted spans (Appendix A). The cost scales with channel count and encoder: on Windows, AAC is encoded 2.4 times as fast with Media Foundation (§6.11). With subtitle-guided detection, end-to-end time is **dominated by the audio re-encode**, not by speech recognition.
 
 ### 8.2 Techniques
 
@@ -746,6 +760,8 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 | Image-based subtitle streams (PGS, VobSub) | Copied uncensored, with a warning: editing them would need OCR. |
 | A report edited by hand for `vbr render` | Intervals are sorted and merged; malformed ones are an error naming their index. A report for another file needs `--force`. |
 | Run interrupted (Ctrl-C) | Partial output deleted. Caches keep the finished work. |
+| A file fails while its decoded track is memory-mapped | The error's frames, which can still map the track, are cleared before its temporary folder is deleted: Windows deletes no mapped file. |
+| A run killed, or out of memory | Its temporary folder (`vbr-*` in the system's temp dir) stays behind. The next `clean`, `scan` or `render` deletes folders untouched for 12 hours, except those kept with `--keep-temp`. |
 | File smaller than 128 KiB | No OpenSubtitles hash; metadata search only. |
 | Network error or quota exhausted | Warning, then the next source, and eventually the fallback. |
 
@@ -783,6 +799,7 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
   - the post-render check failing on a deliberately broken command file
   - codec choice
   - stream order, tags, dispositions and chapters preserved (checked with ffprobe on the output)
+- **Model tests** (opt-in with `VBR_RUN_MODEL_TESTS=1`; need the `[context]` and `[voice]` extras). The real classifier, Demucs, F5-TTS and ECAPA run on made-up text and audio, on the GPU when PyTorch has one; `VBR_TEST_JUDGE` adds a judge model. Every other test replaces them with stand-ins, which cannot catch a model's tensors left on the wrong device: F5-TTS once failed on every GPU that way. Run them on a GPU machine before a release.
 - **ASR integration tests** (opt-in with `VBR_RUN_ASR_TESTS=1`; need espeak-ng). A short film synthesized with espeak-ng, with verbatim subtitles and one line missing from them, is run with `small.en`:
   - every strategy must find the words it can hear;
   - targeted detections must fall within 100 ms of full-mode ones;
@@ -829,9 +846,9 @@ The table estimates speech-recognition time for a two-hour film. It extrapolates
 
 **Extras:**
 
-- `[gpu]`: the CUDA 12 cuBLAS and cuDNN 9 wheels that faster-whisper documents, on Linux. vbr loads them itself (§6.8), so no `LD_LIBRARY_PATH` is needed.
+- `[gpu]`: the CUDA 12 cuBLAS and cuDNN 9 wheels that faster-whisper documents, on Linux. vbr loads them itself (§6.8), so no `LD_LIBRARY_PATH` is needed. On Windows, PyTorch's CUDA build provides them instead.
 - `[align]`: whisperx 3.8.1 or later (the first with offline model loading), which brings PyTorch.
-- `[context]`: PyTorch and transformers, for context analysis (§17)
+- `[context]`: PyTorch, transformers and accelerate, for context analysis (§17)
 - `[voice]`: PyTorch, F5-TTS, Demucs and SpeechBrain, for voice replacement (§16)
 - `[sync]`: ffsubsync
 - `[dev]`: pytest, hypothesis, respx, ruff, mypy
@@ -881,6 +898,7 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 - **Censoring in Python** (piping decoded PCM through numpy). This is sample-accurate with smooth fades, but it pushes the entire decoded track through Python, and the FFmpeg `afade` graph is already sample-accurate and click-free. A PCM renderer comes back for the voice-replacement stretch goal (§16), which has to splice generated audio in.
 - **Hard or stepped `volume` switching.** A hard cut clicks and snaps to audio frames. Stepping the volume down in 5 ms stages clicked even more (Appendix A). Replaced by `afade`.
 - **`enable=` timeline expressions.** They are the simplest option, but render time grew 75 % at 500 intervals and the expressions become huge. Replaced by `asendcmd` command files.
+- **Re-encoding only around the muted spans,** and stream-copying the audio between them. On a 50-minute episode, a plain stream copy takes 1.5 s, the same copy with the audio re-encoded 29 s, and the whole render 31 s, so this would make rendering almost free. But lossy codecs overlap neighbouring frames: an AAC frame's transform covers two frames' worth of samples. At every join, the decoder would overlap two different encodings, whose window shapes and errors were never matched to each other. The re-encoded stretches would have to be cut at frame boundaries, with each codec's frame size and the encoder's priming handled in each container. Every join would need measuring for clicks, as Appendix A measured the fades. The saving is also smaller than it looks, since a batch renders one file while it analyses the next, and analysing that episode took 58 s. It may come back where AAC has no fast encoder: with FFmpeg's own, that episode's render took 70 s.
 - **YAML config.** Rejected because of implicit booleans in word lists and the extra dependency.
 
 ## 15. Decisions and open questions
@@ -890,7 +908,7 @@ M6 to M8 follow the design iteration in §17. Its choices were made with the use
 - **Default strategy:** `hybrid`. `targeted` remains available when speed matters more than recall (§7).
 - **OpenSubtitles API key:** each user registers their own free key. No key ships with the tool (§6.4).
 - **The `sexual` category** (§17.5) holds phrases of a sexual nature and ships off; context analysis reports the lines they occur in either way.
-- **The judge** (§17.3) runs by default only on an NVIDIA GPU (`context.judge = "auto"`).
+- **The judge** (§17.3) runs by default only on an NVIDIA GPU with room for it, about 9 GB (`context.judge = "auto"`).
 - **Acting on verdicts** (M7) is opt-in and experimental (`context.harmless`, `context.sexual`) until it is measured on real films.
 - **Voice replacement** (M8) uses F5-TTS, whose weights are licensed for non-commercial use, with Demucs and ECAPA (§16). It is opt-in and experimental. The tool is for personal use, which the licence allows.
 - **Release.** Nothing is published or versioned yet: the next step is to evaluate the models on a GPU, and the open questions below wait for that evaluation.
@@ -975,7 +993,7 @@ v1 decides by the word alone: a listed word is muted wherever it is heard. This 
 - **Local only.** Every model runs on the user's machine, from the model cache when offline (§10). No dialogue leaves the machine.
 - **Report-only first.** The first milestone adds verdicts to the report and the review subtitles, and changes nothing that is muted. Acting on verdicts comes later, opt-in, once they are measured.
 - **The `sexual` category holds phrases of a sexual nature** ("have sex", "sleep with", "make love", …) rather than single words. It is off by default, since turning it on changes what every existing config mutes. Its phrases count as evidence for sexual lines either way (§17.5).
-- **No judge without a GPU by default.** `context.judge = "auto"` runs the judge only on an NVIDIA GPU; on a CPU, where it takes 20–35 s per question (Appendix D), the layer uses the rules and the classifier alone. A judge can still be named explicitly.
+- **No judge without a GPU by default.** `context.judge = "auto"` runs the judge only on an NVIDIA GPU; on a CPU, where it takes 20–35 s per question (Appendix D), the layer uses the rules and the classifier alone. A judge can still be named explicitly. The GPU needs about 9 GB of memory, since Qwen3-4B's weights alone take 7.5 GB: on a smaller one, such as a 6 GB laptop GPU, "auto" runs without a judge too, and the report says why. Loaded through system memory, the judge once left a 16 GB laptop 0.4 GB free, so it loads straight onto the GPU (`device_map`, which needs accelerate). The GPU must be one PyTorch can use: with `transcription.device = "auto"`, PyTorch decides where the context and voice models run, and a CPU-only build of PyTorch (PyPI's on Windows) runs them on the CPU, with a warning when Whisper uses a GPU.
 
 ### 17.1 What a first test showed
 
@@ -1177,9 +1195,10 @@ The judge needs about 8 GB of GPU memory (Qwen3-4B in bfloat16), and a 6 GB lapt
 
 - **Two kinds of service.** A chat model behind an OpenAI-compatible API (`provider = "gemini"` or `"openai"`) gets the same wording and system prompt as the local judge, with temperature 0, and answers with the same JSON object. Jev's decision API (`provider = "jev"`) takes a *state* and typed questions instead, and answers each with the option it chose and the probabilities of all of them. So each question is also kept as data (`Question`: its kind, the dialogue shown, the word and the candidates), and the Jev judge asks it as choices: the use, the reason and the emotion for a sense question, a yes or no for a sexual one, and the candidates plus "none" for a substitute. Its answer is written as the JSON object the other judges give, so the rest of the layer does not change.
 - **Gemini.** The default model is `gemini-3.5-flash-lite`, on the free tier. Gemini 1.5 is no longer offered, and 2.5 is closed to new keys (a 404 says so). Gemini 3 models cannot turn thinking off, so `reasoning_effort = "auto"` asks for "low" (and "none" on 2.5). On five test questions (the "hell" idiom, "What the hell", the farmer's ass, "Your place or mine?", and a substitute for "fuck"), Flash-Lite answered all five correctly, in under a second each. `gemini-3.8-flash` answered the four context questions correctly too, taking up to 9 s, but its free tier allows 5 requests a minute, so the fifth waited out its retries and failed. Gemini puts the wait in the body of a 429 (`retryDelay`), which vbr honours.
+- **Several models.** Gemini's free tier limits each model separately, per minute and per day, so `context.api.fallback_models` lists more models of the same service, in order of preference after `model`. A model that answers 429 rests for the `retryDelay` Gemini gives, and one that answers 5xx rests for the backoff; meanwhile the next model that is not resting answers, at once. The first comes back when its rest is over, so the preferred model answers whenever it can. A 429 for a quota per day (its `quotaId` says `PerDay`) or a 404 (a model not offered to the key) drops the model for the rest of the run, with a warning. A 404 for the last model left stops the run, as for one model. vbr waits only when every model rests, for the first one back. A question may take one more request per fallback model, `reasoning_effort` follows the model asked (none for Gemma), and the report counts the answers of each (`judge_models`).
 - **Probabilities.** Jev is taken at its word on a use only when it gives it at least 0.7 (`MIN_PROBABILITY`); below that the use stays unsure. Jev's authors say it is weak on adversarial content, which subtitles can be (§17.9). The defences of §17.9 do not depend on the judge: only heard lines can show a use as harmless, and the classifier must agree.
-- **Failures.** Rate limits (429), server errors and network errors are retried four times, waiting 5, 10 and 20 s or what the service asks. A question still unanswered raises `JudgeError`: the use stays unsure, which mutes it, and nothing is cached for it. A rejected key (401, 403) or an unknown model (404) raises `DependencyError` and stops the run, since every question would fail the same way.
-- **Cache.** Answers are cached by judge name (`gemini:gemini-3.5-flash-lite`, `jev:jev-latest`) and question, as for a local judge, so re-running a file asks nothing again.
+- **Failures.** Rate limits (429), server errors and network errors are retried four times, waiting 5, 10 and 20 s or what the service asks. A question still unanswered raises `JudgeError`: the use stays unsure, which mutes it, and nothing is cached for it. A service that is down would cost minutes per question that way, so after one unanswered question the next get one attempt each, and after three in a row the service is asked nothing more in that run (`JudgeSkipped`); one warning says so, and the report counts the unanswered questions (`judge_unanswered`). An empty answer, from a model that thought until its tokens ran out, is unanswered too, rather than cached. A rejected key (401, 403, or Gemini's 400 with `API_KEY_INVALID`) or an unknown model (404) raises `DependencyError` and stops the run, since every question would fail the same way. Any other 400 fails only its question: a content filter can reject one line and not the next.
+- **Cache.** Answers are cached by judge name (`gemini:gemini-3.5-flash-lite`, `jev:jev-latest`) and question, as for a local judge, so re-running a file asks nothing again. The name is the first model's, whichever model answered: the fallback models are the same judge. The judge holds no model, so freeing memory for the next model (`models.keep_loaded = false`) leaves it, and its connection, in place.
 - **Privacy.** The lines asked about leave the machine (§10). It is opt-in, `--offline` turns it off, and vbr warns which host they go to. On Gemini's free tier, Google may use what is sent to improve its products.
 
 **Measured.** `scripts/evaluate_context.py --judge api` on the sets of Appendix D.2 and D.3, with `gemini-3.5-flash-lite` on the free tier (the classifier on a laptop CPU), against Qwen3-4B with the word masked (the M6 column of D.2):

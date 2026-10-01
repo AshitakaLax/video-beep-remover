@@ -1,11 +1,22 @@
 import random
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from video_beep_remover.config.loader import cache_root, load_config
+from video_beep_remover.media.probe import parse_probe
 from video_beep_remover.subtitles.cache import CachedSubtitle, SubtitleCache
-from video_beep_remover.subtitles.names import guess, imdb_id_from_nfo, release_similarity
+from video_beep_remover.subtitles.names import (
+    EpisodeNfo,
+    episode_nfo,
+    guess,
+    guess_video,
+    imdb_id_from_nfo,
+    release_similarity,
+)
+from video_beep_remover.subtitles.online import OnlineSubtitles
+from video_beep_remover.subtitles.opensubtitles import OnlineSubtitle
 from video_beep_remover.subtitles.oshash import fingerprint, opensubtitles_hash
 
 
@@ -91,3 +102,72 @@ def test_cache_root_follows_the_config(tmp_path: Path) -> None:
     assert cache_root(config).name == "cache"  # the tests' stand-in for the per-user cache dir
     custom = load_config(None, env={}, cwd=tmp_path, overrides={"cache.dir": str(tmp_path / "c")}).config
     assert cache_root(custom) == tmp_path / "c"
+
+
+EPISODE_NFO = """<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<episodedetails>
+    <title>Biscuit Bazooka</title>
+    <showtitle>MythBusters</showtitle>
+    <season>1</season>
+    <episode>2</episode>
+    <uniqueid type="imdb">tt0768454</uniqueid>
+    <uniqueid type="tmdb" default="true">65242</uniqueid>
+</episodedetails>
+"""
+
+
+def test_an_episode_named_without_its_show_finds_it_in_its_nfo(tmp_path: Path) -> None:
+    video = tmp_path / "input" / "S01E02 - Biscuit Bazooka.mp4"
+    video.parent.mkdir()
+    assert guess(video.name).title == "Biscuit Bazooka"  # guessit takes the episode's title for the show's
+    assert guess_video(video).title is None  # "input" names no show, so no title is searched
+    video.with_suffix(".nfo").write_text(EPISODE_NFO, "utf-8")
+    found = guess_video(video)
+    assert (found.kind, found.title, found.season, found.episode) == ("episode", "MythBusters", 1, 2)
+    assert episode_nfo(video) == EpisodeNfo("MythBusters", 768454)
+
+
+def test_an_episode_in_a_library_takes_its_show_from_the_folders(tmp_path: Path) -> None:
+    show = tmp_path / "MythBusters (2003)"
+    season = show / "Season 01"
+    season.mkdir(parents=True)
+    assert guess_video(season / "S01E02 - Biscuit Bazooka.mp4").title == "MythBusters"
+    (show / "tvshow.nfo").write_text("<tvshow><title>Mythbusters</title></tvshow>", "utf-8")
+    assert guess_video(season / "S01E02 - Biscuit Bazooka.mp4").title == "Mythbusters"  # the .nfo's
+    assert guess_video(season / "Show Name - S01E02 - Pilot.mkv").title == "Show Name"  # the name has one
+    assert guess_video(tmp_path / "The.Movie.2019.mkv").title == "The Movie"
+
+
+class Client:
+    """OpenSubtitles' search, with results for some kinds of search ("imdb_id", "query")."""
+
+    def __init__(self, results: dict[str, list[OnlineSubtitle]]) -> None:
+        self.results = results
+        self.searches: list[dict[str, Any]] = []
+
+    def search(self, *, languages: list[str], **params: Any) -> list[OnlineSubtitle]:
+        self.searches.append(params)
+        return self.results.get(next(iter(params)), [])
+
+
+def test_an_episode_is_searched_by_its_imdb_id_then_by_its_show(tmp_path: Path) -> None:
+    video = tmp_path / "S01E02 - Biscuit Bazooka.mp4"
+    video.write_bytes(b"")  # too small for a movie hash
+    video.with_suffix(".nfo").write_text(EPISODE_NFO, "utf-8")
+    config = load_config(None, env={}, cwd=tmp_path).config
+    info = parse_probe(video, {"format": {"duration": "3003"}, "streams": []})
+
+    def online(client: Client) -> OnlineSubtitles:
+        return OnlineSubtitles(config, info, client=client, cache=SubtitleCache(tmp_path))  # type: ignore[arg-type]
+
+    by_id = Client({"imdb_id": [OnlineSubtitle(1, "1.srt", "en", False, False, False, None, None, 9, False)]})
+    assert online(by_id).planned_searches() == [
+        {"imdb_id": 768454},
+        {"query": "MythBusters", "season": 1, "episode": 2},
+    ]
+    candidates, _ = online(by_id).find()
+    assert [c.file_id for c in candidates] == [1]
+    assert by_id.searches == [{"imdb_id": 768454}]  # found by the id: the title is not searched
+    nothing = Client({})
+    online(nothing).find()
+    assert [next(iter(s)) for s in nothing.searches] == ["imdb_id", "query"]

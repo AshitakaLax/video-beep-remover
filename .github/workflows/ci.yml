@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:  # a branch without a pull request: Actions > CI > Run workflow
 
 permissions:
   contents: read
@@ -15,8 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # The oldest supported Python, matching mypy's python_version: newer interpreters resolve
-          # dependencies (numpy >= 2.5) whose stubs use syntax mypy rejects when targeting 3.11.
+          # The oldest supported Python: mypy checks for the Python it runs on (pyproject.toml).
           python-version: "3.11"
           cache: pip
       - run: pip install -e ".[dev]"
@@ -32,9 +32,10 @@ jobs:
         os: [ubuntu-latest]
         python: ["3.11", "3.12", "3.13"]
         include:
-          # No FFmpeg on these runners: the ffmpeg-marked tests skip themselves.
+          # No FFmpeg on macOS: the ffmpeg-marked tests skip themselves there.
           - os: macos-latest
             python: "3.12"
+          # Windows gets the latest FFmpeg release; Linux gets the distribution's older one.
           - os: windows-latest
             python: "3.12"
     runs-on: ${{ matrix.os }}
@@ -47,6 +48,12 @@ jobs:
       - name: Install FFmpeg
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install FFmpeg
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+      - name: FFmpeg version
+        if: runner.os != 'macOS'
+        run: ffmpeg -version
       - run: pip install -e ".[dev]"
       - run: pytest -q
 

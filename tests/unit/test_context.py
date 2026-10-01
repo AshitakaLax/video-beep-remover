@@ -9,10 +9,11 @@ from typing import Any
 
 import pytest
 
-from helpers import StrictUI, say, srt
+from helpers import RecordingUI, StrictUI, say, srt
 from video_beep_remover.config import load_config
 from video_beep_remover.context import (
     ContextLayer,
+    analyse_file,
     judge_model,
     kept_cues,
     review_cues,
@@ -21,7 +22,15 @@ from video_beep_remover.context import (
     verdict_dict,
 )
 from video_beep_remover.context.analyse import Settings, analyse_context, mask_words, parse_answer
-from video_beep_remover.context.lines import Line, build_lines, cue_lines, heard_share, line_for, word_lines
+from video_beep_remover.context.lines import (
+    Line,
+    build_lines,
+    cue_lines,
+    heard_share,
+    line_for,
+    line_spans,
+    word_lines,
+)
 from video_beep_remover.context.models import (
     DEFAULT_JUDGE,
     LABELS,
@@ -30,6 +39,8 @@ from video_beep_remover.context.models import (
     Question,
     ToxicityClassifier,
     _libraries,
+    gpu_memory_gb,
+    torch_device,
 )
 from video_beep_remover.context.rules import Phrases, delivery, intensity, sexual_sounds
 from video_beep_remover.errors import DependencyError
@@ -169,6 +180,16 @@ def test_detections_find_their_line() -> None:
     assert line_for(detection("hell", 6.0), lines) == 1
     assert line_for(detection("hell", 9.1), lines) is None  # a sound-only line has nothing said
     assert line_for(detection("hell", 30.0), lines) is None
+
+
+def test_a_line_is_spoken_from_its_first_heard_word_to_its_last() -> None:
+    lines = [Line(1.0, 3.0, "Did you sleep with him?", cue=1), Line(5.0, 6.0, "Come to bed.")]
+    heard = [
+        Word(" Did", 0.7, 0.9),  # before the cue, but within COVER_MARGIN_S of it
+        Word(" him?", 2.5, 2.9),
+        Word(" Later", 4.0, 4.2),  # near neither line
+    ]
+    assert line_spans(lines, heard) == [(0.7, 2.9, True), (5.0, 6.0, False)]  # nothing heard: the cue's
 
 
 def test_rules_read_sounds_capitals_and_exclamations() -> None:
@@ -332,11 +353,52 @@ def test_answers_keep_only_known_fields() -> None:
     assert parse_answer("no json at all") == {}
 
 
-def test_the_judge_runs_by_default_only_on_a_gpu() -> None:
+def test_the_judge_runs_by_default_only_on_a_gpu_with_room_for_it() -> None:
     assert judge_model("auto", "cuda") == DEFAULT_JUDGE
     assert judge_model("auto", "cpu") is None
     assert judge_model("", "cuda") is None
     assert judge_model("someone/model", "cpu") == "someone/model"
+    assert judge_model("auto", "cuda", gpu_gb=12.0) == DEFAULT_JUDGE
+    assert judge_model("auto", "cuda", gpu_gb=6.0) is None  # a laptop GPU: the model alone takes 7.5 GB
+    assert judge_model("someone/model", "cuda", gpu_gb=6.0) == "someone/model"  # named: tried anyway
+
+
+def test_the_gpu_memory_is_what_pytorch_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = SimpleNamespace(
+        is_available=lambda: True, get_device_properties=lambda index: SimpleNamespace(total_memory=6 << 30)
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=gpu))
+    assert gpu_memory_gb() == 6.0
+    gpu.is_available = lambda: False
+    assert gpu_memory_gb() is None
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert gpu_memory_gb() is None
+
+
+def test_a_gpu_too_small_for_the_judge_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("video_beep_remover.context.gpu_memory_gb", lambda: 6.0)
+    layer = ContextLayer(
+        load_config(None, env={}, cwd=tmp_path).config,
+        device="cuda",
+        cache_dir=None,
+        classifier_factory=lambda name, device: Classifier(),
+        judge_factory=lambda name, device: pytest.fail("the judge does not fit"),
+    )
+    _, section = layer.run([detection("hell", 1.2, 1)], [Line(1.0, 2.0, "Go to hell.", cue=1)])
+    assert section["judge"] is None
+    assert section["judge_off"].startswith('the GPU has 6 GB: context.judge = "auto" needs about 9 GB')
+
+
+def test_the_models_run_where_pytorch_can_run_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whisper (ctranslate2) can see a GPU that a CPU-only build of PyTorch cannot use."""
+    assert (torch_device("cuda"), torch_device("cpu")) == ("cuda", "cpu")
+    gpu = SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=gpu))
+    assert torch_device("auto") == "cpu"
+    gpu.is_available = lambda: True
+    assert torch_device("auto") == "cuda"
+    monkeypatch.setitem(sys.modules, "torch", None)  # the extra is not installed
+    assert torch_device("auto") == "cpu"
 
 
 def test_judge_answers_are_cached_on_disk(tmp_path: Path) -> None:
@@ -388,6 +450,53 @@ def test_the_layer_reports_verdicts_and_sexual_lines(tmp_path: Path) -> None:
         "intensity": "low",
         "judged": False,
     }
+
+
+def test_the_verdicts_on_a_file_decide_what_is_muted(tmp_path: Path) -> None:
+    acting = {"context.judge": "fake-judge", "context.harmless": "keep", "context.sexual": "mute"}
+    judge = Judge(
+        {
+            "road to hell": '{"use": "harmless", "reason": "place", "emotion": "neutral"}',
+            "sleep with": '{"sexual": true}',
+        }
+    )
+    layer = ContextLayer(
+        load_config(None, env={}, cwd=tmp_path, overrides=acting).config,
+        device="cpu",
+        cache_dir=None,
+        classifier_factory=lambda name, device: Classifier(),
+        judge_factory=lambda name, device: judge,
+    )
+    lines = [
+        Line(1.0, 2.0, "Damn it.", cue=1),
+        Line(3.0, 5.0, "The road to hell is paved with good intentions.", cue=2),
+        Line(6.0, 8.0, "Did you sleep with the captain?", cue=3),
+    ]
+    heard = say(lines[0].text, 1.0, 2.0) + say(lines[1].text, 3.0, 5.0)
+    said = say(lines[2].text, 6.3, 7.6)  # no listed word there, so the analysis did not hear it
+    asked: list[list[tuple[float, float]]] = []
+
+    def hear_again(spans: list[tuple[float, float]]) -> list[Word]:
+        asked.append(spans)
+        return heard + said
+
+    damn, hell = detection("damn", 1.0, 1), detection("hell", 3.7, 2)
+    ui = RecordingUI()
+    found = analyse_file(layer, [damn, hell], lines, heard, ui, hear_again=hear_again)
+    assert asked == [[(6.0, 8.0)]]  # only the line to mute is transcribed again
+    sexual = Detection(6.3, said[-1].end, lines[2].text, "sexual line", "context", 1.0, "asr", 3)
+    assert found.to_mute == [damn, sexual]  # the harmless "hell" is kept
+    assert [verdict["use"] for verdict in found.verdicts] == ["profane", "harmless"]
+    assert found.section["kept"] == 1
+    assert found.section["sexual_lines"][0]["muted"] == {
+        "start": 6.3,
+        "end": round(said[-1].end, 3),
+        "from": "heard",
+    }
+    assert ui.infos == [
+        "Context: 1 profane, 1 probably harmless, 0 unsure · 1 sexual lines · 1 kept as harmless · "
+        "1 sexual lines muted"
+    ]
 
 
 def test_review_subtitles_show_the_verdicts() -> None:
@@ -449,13 +558,15 @@ def test_without_the_extra_the_classifier_says_how_to_install_it(monkeypatch: py
 
 
 def test_a_judge_that_does_not_fit_says_how_to_go_without(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Model:
-        def to(self, device: str) -> Any:
-            raise RuntimeError("CUDA out of memory")
+    loaded: dict[str, Any] = {}
+
+    def from_pretrained(name: str, **options: Any) -> Any:
+        loaded.update(options)
+        raise RuntimeError("CUDA out of memory")
 
     transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=lambda name, **options: object()),
-        AutoModelForCausalLM=SimpleNamespace(from_pretrained=lambda name, **options: Model()),
+        AutoModelForCausalLM=SimpleNamespace(from_pretrained=from_pretrained),
         logging=SimpleNamespace(set_verbosity_error=lambda: None, disable_progress_bar=lambda: None),
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bfloat16"))
@@ -464,6 +575,7 @@ def test_a_judge_that_does_not_fit_says_how_to_go_without(monkeypatch: pytest.Mo
         DependencyError, match=r'context\.judge = "" runs without a judge: CUDA out of memory'
     ):
         LocalJudge(DEFAULT_JUDGE, device="cuda", offline=False)
+    assert loaded["device_map"] == "cuda"  # the weights go straight to the GPU, not through system memory
 
 
 def test_models_load_without_a_progress_bar_unless_the_run_is_verbose(
@@ -496,24 +608,27 @@ def test_without_the_extra_a_run_fails_before_anything_is_transcribed(
 
 
 def test_acting_on_verdicts_warns_that_it_is_experimental(tmp_path: Path) -> None:
-    class UI(StrictUI):
-        def __init__(self) -> None:
-            super().__init__()
-            self.warnings: list[str] = []
-
-        def warn(self, message: str) -> None:
-            self.warnings.append(message)
-
     acting = {"context.harmless": "keep", "context.sexual": "mute", "transcription.device": "cpu"}
     loaded = load_config(None, env={}, cwd=tmp_path, overrides={"context.enabled": True, **acting})
-    ui = UI()
+    ui = RecordingUI()
     no_ffmpeg: Any = SimpleNamespace()
     models = (lambda name, device: Classifier(), lambda name, device: Judge({}))
-    Pipeline(loaded, ui=ui, ff=no_ffmpeg, context_models=models).context_layer()
+    Pipeline(loaded, ui=ui, ff=no_ffmpeg, context_models=models).models.context_layer()
     assert [w.split(":")[0] for w in ui.warnings] == [
         "acting on context verdicts is experimental",
         'context.harmless = "keep" keeps nothing without a judge (context.judge)',  # "auto" on a CPU
     ]
+
+
+def test_a_gpu_that_pytorch_cannot_use_is_named_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cpu_only = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setitem(sys.modules, "torch", cpu_only)
+    monkeypatch.setattr("video_beep_remover.model_pool.cuda_available", lambda: True)  # Whisper sees one
+    ui = RecordingUI()
+    no_ffmpeg: Any = SimpleNamespace()
+    pipeline = Pipeline(load_config(None, env={}, cwd=tmp_path), ui=ui, ff=no_ffmpeg)
+    assert (pipeline.models.device(), pipeline.models.device()) == ("cpu", "cpu")
+    assert len(ui.warnings) == 1 and "CPU-only" in ui.warnings[0]
 
 
 def test_ambiguous_words_are_scored_masked_so_their_sense_is_not_prejudged() -> None:

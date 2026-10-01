@@ -5,6 +5,7 @@ import pytest
 
 from video_beep_remover.config import load_config, redact, to_toml
 from video_beep_remover.config.loader import defaults_text, find_config_file
+from video_beep_remover.config.schema import Config
 from video_beep_remover.errors import ConfigError
 
 REPO = Path(__file__).resolve().parents[2]
@@ -12,6 +13,16 @@ REPO = Path(__file__).resolve().parents[2]
 
 def test_packaged_defaults_are_the_documented_example() -> None:
     assert defaults_text() == (REPO / "docs" / "vbr.example.toml").read_text("utf-8")
+
+
+def test_the_schema_defaults_are_the_packaged_ones(tmp_path: Path) -> None:
+    """schema.py repeats defaults.toml for code that builds a Config itself. The word list is the
+    exception: it lives in defaults.toml alone."""
+    packaged = load_config(env={}, cwd=tmp_path).config.model_dump()
+    built = Config().model_dump()
+    packaged.pop("lexicon")
+    built.pop("lexicon")
+    assert built == packaged
 
 
 def test_defaults_load_without_a_config_file(tmp_path: Path) -> None:

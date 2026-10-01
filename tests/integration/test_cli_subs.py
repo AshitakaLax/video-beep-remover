@@ -7,8 +7,8 @@ from typer.testing import CliRunner
 
 from helpers import FakeTranscriber, make_clip, say, srt
 from video_beep_remover.cli import app
+from video_beep_remover.model_pool import ModelPool
 from video_beep_remover.models import Word
-from video_beep_remover.pipeline import Pipeline
 
 pytestmark = pytest.mark.ffmpeg
 runner = CliRunner()
@@ -24,7 +24,7 @@ LINES = [
 def heard(monkeypatch: pytest.MonkeyPatch) -> list[Word]:
     """What the scripted "Whisper" hears; tests fill it in."""
     words: list[Word] = []
-    monkeypatch.setattr(Pipeline, "_load_transcriber", lambda self, choice: FakeTranscriber(words))
+    monkeypatch.setattr(ModelPool, "_load_transcriber", lambda self, choice: FakeTranscriber(words))
     monkeypatch.setattr("video_beep_remover.pipeline.silero_speech", lambda audio, on_progress=None: [])
     return words
 

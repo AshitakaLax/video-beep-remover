@@ -92,6 +92,23 @@ def build_lines(
     return sorted(lines + word_lines(uncovered), key=lambda line: (line.start, line.end))
 
 
+def line_spans(lines: Sequence[Line], heard: Sequence[Word]) -> list[tuple[float, float, bool]]:
+    """Where each line is spoken, from its first heard word to its last, and whether words were heard
+    there at all; a line nothing was heard in keeps its own span."""
+    spans = []
+    for line in lines:
+        words = [
+            w
+            for w in heard
+            if line.start - COVER_MARGIN_S <= (w.start + w.end) / 2 <= line.end + COVER_MARGIN_S
+        ]
+        if words:
+            spans.append((min(w.start for w in words), max(w.end for w in words), True))
+        else:
+            spans.append((line.start, line.end, False))
+    return spans
+
+
 def line_for(detection: Detection, lines: Sequence[Line]) -> int | None:
     """The line a detection belongs to: its subtitle cue, or else the line around its middle."""
     if detection.cue is not None:

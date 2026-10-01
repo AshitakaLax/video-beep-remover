@@ -87,8 +87,35 @@ def _quiet() -> Iterator[None]:
 
 
 def _offline(offline: bool) -> None:
+    """Offline, models load from the Hugging Face cache only. huggingface_hub reads HF_HUB_OFFLINE once,
+    when it is first imported, and Whisper or the context layer has imported it by now, so its
+    setting is changed too."""
     if offline:
-        os.environ["HF_HUB_OFFLINE"] = "1"  # models then load from the Hugging Face cache only
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        with contextlib.suppress(ImportError):
+            from huggingface_hub import constants
+
+            constants.HF_HUB_OFFLINE = True
+
+
+@contextlib.contextmanager
+def _no_downloads(hub: Any, offline: bool) -> Iterator[None]:
+    """Offline, `hub` refuses to download: torch.hub, which Demucs downloads weights with (where the
+    Hugging Face hub does not have them), has no offline mode of its own. A model already in its cache
+    loads as usual."""
+    if not offline:
+        yield
+        return
+
+    def refuse(url: str, *args: Any, **kwargs: Any) -> None:
+        raise OSError(f"{url} is not downloaded")
+
+    download = hub.download_url_to_file
+    hub.download_url_to_file = refuse
+    try:
+        yield
+    finally:
+        hub.download_url_to_file = download
 
 
 def _failure(what: str, name: str, offline: bool, exc: Exception) -> DependencyError:
@@ -114,7 +141,7 @@ class DemucsSeparator:
         self.torch, self.torchaudio = _libraries()
         _offline(offline)
         try:
-            with _quiet():
+            with _quiet(), _no_downloads(self.torch.hub, offline):
                 from demucs.apply import apply_model
                 from demucs.pretrained import get_model
 
@@ -215,7 +242,7 @@ class EcapaEncoder:
                 self.model = EncoderClassifier.from_hparams(
                     source=ENCODER,
                     savedir=str(cache_dir / "ecapa"),
-                    run_opts={"device": device},
+                    run_opts={"device": "cuda:0" if device == "cuda" else device},  # it wants an index
                     local_strategy=strategy,
                 )
         except Exception as exc:

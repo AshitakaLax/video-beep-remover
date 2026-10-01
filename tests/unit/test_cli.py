@@ -1,3 +1,4 @@
+import io
 import sys
 import tomllib
 from pathlib import Path
@@ -12,8 +13,10 @@ from typer.testing import CliRunner
 from video_beep_remover import __version__
 from video_beep_remover.batch import collect_inputs
 from video_beep_remover.cli import app
+from video_beep_remover.cli.console import ConsoleUI, print_result, utf8_streams
 from video_beep_remover.config.schema import Config
 from video_beep_remover.errors import UsageError
+from video_beep_remover.pipeline import FileResult
 
 runner = CliRunner()
 
@@ -191,6 +194,26 @@ def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.Monke
     downloaded.update({"unitary/unbiased-toxic-roberta", "Qwen/Qwen3-4B-Instruct-2507"})
     ok, details = context_status(_config(tmp_path, **judged))[1:]
     assert ok is True and "not downloaded" not in details
+    online = {**on, "context.judge": "api", "context.api.api_key": "k", "context.api.fallback_models": ["x"]}
+    assert (
+        "judge gemini:gemini-3.5-flash-lite and 1 fallback model (online"
+        in context_status(_config(tmp_path, **online))[2]
+    )
+
+    # Whisper sees a GPU that a CPU-only build of PyTorch cannot use.
+    cpu_only = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setitem(sys.modules, "torch", cpu_only)
+    monkeypatch.setattr("video_beep_remover.asr.faster_whisper.cuda_available", lambda: True)
+    details = context_status(_config(tmp_path, **{"context.enabled": True}))[2]
+    assert "no judge (no GPU)" in details and "PyTorch cannot use the GPU that Whisper uses" in details
+
+    # A GPU too small for the default judge.
+    laptop = SimpleNamespace(
+        is_available=lambda: True, get_device_properties=lambda index: SimpleNamespace(total_memory=6 << 30)
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=laptop))
+    details = context_status(_config(tmp_path, **{"context.enabled": True}))[2]
+    assert "no judge (the GPU has 6 GB; the default judge needs about 9)" in details
 
 
 def test_cache_info_and_clear(tmp_path: Path) -> None:
@@ -218,3 +241,34 @@ def test_cache_info_and_clear(tmp_path: Path) -> None:
     assert "removed 0 transcript files" in cleared.output
     assert "removed 1 files of context judge answers" in cleared.output
     assert not list((tmp_path / "c" / "context").glob("*.jsonl"))
+
+
+def test_results_go_to_stdout_and_messages_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    result = FileResult(
+        Path("movie.mkv"),
+        "scanned",
+        report=Path("movie.vbr.json"),
+        detections=2,
+        intervals=2,
+        strategy="full",
+    )
+    ConsoleUI().warn("a message")
+    print_result(ConsoleUI(), result)
+    out, err = capsys.readouterr()
+    assert "✔ movie.mkv: 2 listed words, 2 spans to mute (full)" in out and "report: movie.vbr.json" in out
+    assert "a message" in err and "movie.mkv" not in err
+    print_result(ConsoleUI(quiet=True), result)
+    assert "report:" not in capsys.readouterr().out  # --quiet: the result alone
+
+
+def test_redirected_output_is_written_in_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows writes a redirected stream in its ANSI code page, which has no "→" or "✔"."""
+    written = [io.BytesIO(), io.BytesIO()]
+    stdout, stderr = (io.TextIOWrapper(raw, encoding="cp1252") for raw in written)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    utf8_streams()
+    for stream in (stdout, stderr):
+        stream.write("✔ muted 2 spans → movie.clean.mkv")
+        stream.flush()
+    assert [raw.getvalue().decode("utf-8") for raw in written] == ["✔ muted 2 spans → movie.clean.mkv"] * 2

@@ -23,6 +23,7 @@ _CLIP_TOLERANCE_S = 0.01  # segment start times are rounded to milliseconds
 
 
 def cuda_available() -> bool:
+    load_pip_libraries()  # before ctranslate2 is imported (asr/cuda.py)
     try:
         import ctranslate2
 
@@ -103,12 +104,12 @@ class FasterWhisperTranscriber:
         offline: bool,
         download_root: Path | None = None,
     ) -> None:
+        if choice.device == "cuda":
+            load_pip_libraries()  # before ctranslate2 is imported (asr/cuda.py)
         try:
             from faster_whisper import BatchedInferencePipeline, WhisperModel
         except ImportError as exc:
             raise DependencyError("faster-whisper is not installed: pip install faster-whisper") from exc
-        if choice.device == "cuda":
-            load_pip_libraries()
         self.name = choice.describe()
         self.choice = choice
         self.beam_size = beam_size

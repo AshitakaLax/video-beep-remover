@@ -1,20 +1,22 @@
 """Voice replacement's choices and array helpers (DESIGN.md §16, §17.6), without its models."""
 
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 
-from helpers import say
+from helpers import RecordingUI, say
 from video_beep_remover.context.analyse import ContextResult, Verdict, choose_substitutes
 from video_beep_remover.context.lines import Line
 from video_beep_remover.context.models import Question
 from video_beep_remover.errors import DependencyError
 from video_beep_remover.models import CensorInterval, Detection
 from video_beep_remover.report import review_srt
-from video_beep_remover.voice import _said
-from video_beep_remover.voice.models import check_installed
+from video_beep_remover.voice import Replacer, _said, replace_words
+from video_beep_remover.voice.models import DemucsSeparator, EcapaEncoder, _offline, check_installed
 from video_beep_remover.voice.splice import change, dialogue_channels, fade_mask, fit_case, utterance
 
 TABLE = {"damn": ["darn"], "*fuck*": ["freaking", "frick"], "hell": ["heck"]}
@@ -90,6 +92,34 @@ def test_the_sentence_is_said_again_with_the_substitute() -> None:
     assert utterance(heard, detection("hell", 9.0, 9.3), "heck") is None  # nothing heard there
 
 
+def test_a_word_is_said_again_only_alone_in_its_muted_span() -> None:
+    crowded, hell = detection("damn", 1.0, 1.3), detection("hell", 1.4, 1.6)  # muted together
+    kept, unheard = detection("damn", 3.0, 3.3), detection("damn", 5.0, 5.3)
+    unused: Any = SimpleNamespace()  # no word gets as far as the models, or reading the file
+    ui = RecordingUI()
+    done = replace_words(
+        Replacer(unused, unused, unused, unused, lambda audio, start: []),
+        [crowded, hell, kept, unheard],
+        ["darn", None, "darn", "darn"],  # "hell" has no substitute: it stays muted
+        [crowded, hell, unheard],  # "kept" was kept as harmless: it is not muted at all
+        [CensorInterval(0.9, 1.7), CensorInterval(4.9, 5.4)],
+        [],  # nothing was heard: "unheard" was only estimated from the subtitles
+        source=Path("movie.mkv"),
+        stream=unused,
+        duration=10.0,
+        workdir=Path("work"),
+        ui=ui,
+    )
+    assert [(r.detection, r.start, r.end, r.replaced, r.reason) for r in done] == [
+        (0, 0.9, 1.7, False, "another muted word shares its span"),
+        (3, 4.9, 5.4, False, "the word was not heard, only estimated"),
+    ]
+    assert ui.infos == [
+        "Voice replacement: 0 of 2 words said again; the rest stay muted (another muted word shares its "
+        "span; the word was not heard, only estimated)"
+    ]
+
+
 def test_the_substitute_takes_the_case_and_punctuation_of_the_word() -> None:
     assert [fit_case(w, "heck") for w in ("hell", "Hell,", "HELL!", "(hell")] == [
         "heck",
@@ -145,3 +175,88 @@ def test_without_the_extra_replacement_says_how_to_install_it(monkeypatch: pytes
     monkeypatch.setitem(sys.modules, "f5_tts", None)
     with pytest.raises(DependencyError, match=r"video-beep-remover\[voice\]"):
         check_installed()
+
+
+def stand_ins(monkeypatch: pytest.MonkeyPatch, modules: dict[str, Any]) -> None:
+    """Modules of the [voice] extra, which CI does not install, replaced by stand-ins."""
+    for name, module in {"torch": SimpleNamespace(), "torchaudio": SimpleNamespace(), **modules}.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+class Separation:
+    sources = ("drums", "bass", "other", "vocals")
+
+    def to(self, device: str) -> "Separation":
+        return self
+
+    def eval(self) -> "Separation":
+        return self
+
+
+def test_offline_the_hub_stays_offline_although_it_was_imported_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """huggingface_hub reads HF_HUB_OFFLINE on import, and Whisper imports it before any voice model."""
+    from huggingface_hub import constants
+
+    monkeypatch.setattr(constants, "HF_HUB_OFFLINE", False)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    _offline(True)
+    assert constants.HF_HUB_OFFLINE
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_offline_the_separation_model_is_not_downloaded(
+    monkeypatch: pytest.MonkeyPatch, offline: bool
+) -> None:
+    """Demucs downloads its weights with torch.hub, which has no offline mode."""
+    downloads: list[str] = []
+    hub = SimpleNamespace(download_url_to_file=lambda url, *args, **kwargs: downloads.append(url))
+
+    def get_model(name: str) -> Separation:
+        hub.download_url_to_file(f"https://example.com/{name}.th", "checkpoint")  # as torch.hub does
+        return Separation()
+
+    stand_ins(
+        monkeypatch,
+        {
+            "torch": SimpleNamespace(hub=hub),
+            "demucs": SimpleNamespace(),
+            "demucs.apply": SimpleNamespace(apply_model=None),
+            "demucs.pretrained": SimpleNamespace(get_model=get_model),
+        },
+    )
+    if offline:
+        with pytest.raises(DependencyError, match=r"offline mode.*htdemucs\.th is not downloaded"):
+            DemucsSeparator("htdemucs", device="cpu", offline=True)
+        assert downloads == []
+    else:
+        DemucsSeparator("htdemucs", device="cpu", offline=False)
+        assert downloads == ["https://example.com/htdemucs.th"]
+
+
+def test_the_speaker_encoder_gets_a_cuda_device_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SpeechBrain warns about "cuda" without one, and then picks device 0 itself."""
+    options: dict[str, Any] = {}
+
+    def from_hparams(**given: Any) -> None:
+        options.update(given)
+
+    stand_ins(
+        monkeypatch,
+        {
+            "speechbrain": SimpleNamespace(),
+            "speechbrain.inference": SimpleNamespace(),
+            "speechbrain.inference.speaker": SimpleNamespace(
+                EncoderClassifier=SimpleNamespace(from_hparams=from_hparams)
+            ),
+            "speechbrain.utils": SimpleNamespace(),
+            "speechbrain.utils.fetching": SimpleNamespace(LocalStrategy=SimpleNamespace(COPY=1, SYMLINK=2)),
+        },
+    )
+    EcapaEncoder(tmp_path, device="cuda", offline=False)
+    assert options["run_opts"] == {"device": "cuda:0"}
+    EcapaEncoder(tmp_path, device="cpu", offline=False)
+    assert options["run_opts"] == {"device": "cpu"}

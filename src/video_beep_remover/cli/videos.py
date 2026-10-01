@@ -40,7 +40,7 @@ from video_beep_remover.cli.options import (
 from video_beep_remover.config.loader import LoadedConfig, load_config
 from video_beep_remover.errors import EXIT_PARTIAL, DependencyError, UsageError, VbrError
 from video_beep_remover.outputs import find_report
-from video_beep_remover.pipeline import FileResult, Pipeline, RunOptions
+from video_beep_remover.pipeline import FileResult, Pipeline, RunOptions, remove_stale_workdirs
 
 
 def _inputs(
@@ -78,6 +78,7 @@ def _run(
         pipeline = Pipeline(loaded, ui=ui, categories=categories.split(",") if categories else None)
     except VbrError as exc:
         raise fail(exc) from exc
+    remove_stale_workdirs()
 
     for result in skipped:
         print_result(ui, result)
@@ -276,6 +277,7 @@ def render_command(
         pipeline = Pipeline(loaded, ui=ui, categories=categories.split(",") if categories else None)
     except VbrError as exc:
         raise fail(exc) from exc
+    remove_stale_workdirs()
     for result in skipped:
         print_result(ui, result)
     failures = 0

@@ -138,6 +138,7 @@ class ContextApiConfig(_Model):
     provider: Literal["gemini", "jev", "openai"] = "gemini"  # "openai": any OpenAI-compatible chat API
     url: str = ""  # "": the provider's
     model: str = ""  # "": the provider's default
+    fallback_models: list[str] = Field(default_factory=list)  # asked in order while those before are busy
     api_key: str = ""
     reasoning_effort: str = "auto"  # "auto": Gemini thinks little ("none" on 2.5); "": never sent
     timeout_s: float = Field(30, gt=0)

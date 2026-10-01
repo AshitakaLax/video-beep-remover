@@ -283,10 +283,10 @@ def test_the_whisperx_backend_aligns_the_models_that_find_words(tmp_path: Path) 
         return run
 
     plain, aligned = pipeline(), pipeline(**{"transcription.backend": "whisperx"})
-    assert not plain.model_choice("hybrid").align
-    assert aligned.model_choice("hybrid").align and aligned.model_choice("full").align
-    assert not aligned.model_choice("anchor").align  # anchors are only matched as text
-    assert aligned.model_choice("hybrid").describe() == "large-v3-turbo (cpu, int8) with alignment"
+    assert not plain.models.model_choice("hybrid").align
+    assert aligned.models.model_choice("hybrid").align and aligned.models.model_choice("full").align
+    assert not aligned.models.model_choice("anchor").align  # anchors are only matched as text
+    assert aligned.models.model_choice("hybrid").describe() == "large-v3-turbo (cpu, int8) with alignment"
 
     def key(run: Pipeline, role: str) -> str:
         store = run.transcripts(role)
@@ -310,7 +310,7 @@ def test_the_pipeline_wraps_faster_whisper_when_aligning(
             built.append(choice)
             self.choice, self.name = choice, choice.describe()
 
-    monkeypatch.setattr("video_beep_remover.pipeline.FasterWhisperTranscriber", Whisper)
+    monkeypatch.setattr("video_beep_remover.model_pool.FasterWhisperTranscriber", Whisper)
     loaded = load_config(
         None,
         env={},
@@ -322,6 +322,6 @@ def test_the_pipeline_wraps_faster_whisper_when_aligning(
         },
     )
     run = Pipeline(loaded, ui=StrictUI(), ff=NO_FFMPEG)
-    assert isinstance(run._load_transcriber(run.model_choice("hybrid")), WhisperXTranscriber)
-    assert isinstance(run._load_transcriber(run.model_choice("anchor")), Whisper)
+    assert isinstance(run.models._load_transcriber(run.models.model_choice("hybrid")), WhisperXTranscriber)
+    assert isinstance(run.models._load_transcriber(run.models.model_choice("anchor")), Whisper)
     assert fake.loaded == [("ja", "cpu", "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", False)]

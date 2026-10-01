@@ -159,6 +159,19 @@ def test_in_place_the_censored_copy_takes_the_subtitle_files_place(
     )
 
 
+@pytest.mark.parametrize("ending", ["\r\n", "\n"])
+def test_the_censored_copy_keeps_the_files_line_endings(tmp_path: Path, ending: str) -> None:
+    """Written in text mode, a file's "\\r\\n" became "\\r\\r\\n" on Windows."""
+    subtitle = tmp_path / "Movie.en.srt"
+    text = srt((1.0, 2.0, "Damn it"), (3.0, 4.0, "Nothing here"))
+    subtitle.write_bytes(text.replace("\n", ending).encode("utf-8"))
+    copy = write_censored_copy(
+        subtitle, video=tmp_path / "Movie.mkv", output=tmp_path / "Movie.clean.mkv", language="en",
+        lexicon=LEXICON, mask="first_letter", fps=None, overwrite=False,
+    )  # fmt: skip
+    assert copy.path.read_bytes() == text.replace("Damn", "D***").replace("\n", ending).encode("utf-8")
+
+
 def test_removing_keeps_line_breaks_and_drops_what_is_left_empty() -> None:
     assert mask_text("You son of a\nbitch!", LEXICON, "remove").text == "You\n!"
     text = srt(

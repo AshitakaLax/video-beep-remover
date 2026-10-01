@@ -40,11 +40,15 @@ Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the
 
 | Extra | Adds |
 |---|---|
-| `gpu` | The cuBLAS and cuDNN libraries that Whisper needs on NVIDIA GPUs, on Linux. vbr loads them itself, so there is no `LD_LIBRARY_PATH` to set. The NVIDIA driver is still needed. |
+| `gpu` | The cuBLAS and cuDNN libraries that Whisper needs on NVIDIA GPUs, on Linux. vbr loads them itself, so there is no `LD_LIBRARY_PATH` to set. The NVIDIA driver is still needed. On Windows, Whisper uses PyTorch's copies instead (see below). |
 | `align` | [WhisperX](https://github.com/m-bain/whisperX) forced alignment, for tighter word edges (see [Word edges](#word-edges)). It brings PyTorch, a large download. |
 | `sync` | [ffsubsync](https://github.com/smacke/ffsubsync), to re-time subtitles that are badly out of sync. |
 | `context` | PyTorch and transformers, for [context analysis](#context-analysis-preview). On Linux without a GPU, install the CPU build of PyTorch first to save gigabytes. |
 | `voice` | F5-TTS, Demucs and SpeechBrain, for [voice replacement](#voice-replacement-experimental). A large install; F5-TTS's model weights are licensed for non-commercial use only. |
+
+The `context` and `voice` extras run on PyTorch, which uses an NVIDIA GPU only in its CUDA build. On Windows, PyPI has the CPU build only, so install PyTorch's CUDA build from [pytorch.org](https://pytorch.org) first. When PyTorch cannot use the GPU that Whisper uses, vbr runs these models on the CPU and says so.
+
+On Windows, Whisper also uses the CUDA libraries of PyTorch's CUDA build: nothing needs adding to `PATH`, and the copy of cuDNN that Whisper's library brings no longer breaks PyTorch's.
 
 ## Use
 
@@ -75,12 +79,12 @@ Useful options:
 - `--categories strong,religious` enables exactly those word categories.
 - `--model large-v3-turbo` picks a Whisper model, and `--device cpu` forces the CPU.
 - `--audio-stream N` picks the dialogue track by its ffprobe index.
-- `--review-srt` also writes `.review.srt`: one subtitle per muted span naming the word, to spot-check the result in a player.
+- `--review-srt` also writes `.review.srt`: one subtitle per muted span naming the word, to spot-check the result in a player. vbr never takes it for a video's subtitles.
 - `--context` adds context analysis to the report ([preview](#context-analysis-preview)), and `--replace` says a milder word instead of muting ([experimental](#voice-replacement-experimental)).
 - `--backup` or `--in-place` put the cleaned file in the original's place (see below).
 - `--overwrite` or `--skip-existing` decide what happens when outputs already exist.
 
-Run `vbr clean --help` for everything.
+Run `vbr clean --help` for everything. Each file's result goes to standard output, and messages and progress to standard error, so `vbr scan ~/Videos -r > results.txt` keeps the results alone.
 
 **Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own files found there are skipped: files named like another input's output (`Movie.clean.mkv`) or backup (`Movie.orig.mkv`), and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed (not one with replaced words, which are heard again once written). A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
 
@@ -133,17 +137,25 @@ $ vbr scan movie.mkv --context --review-srt
 
   Phrases with an innocent sense too ("hook up the printer") only make a line *possibly* sexual on their own.
 - **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
-- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU with about 8 GB of memory. On a CPU it takes 20–35 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless, and an ambiguous word such as "hell" is never replaced, only muted.
+- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU with at least 9 GB of memory: its weights alone take 7.5 GB. vbr checks, and on a smaller GPU it runs without a judge and says why. On a CPU the judge takes 20–35 s per question, so without a GPU vbr skips it too. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless, and an ambiguous word such as "hell" is never replaced, only muted.
 - **A judge online.** Without a big enough GPU, `context.judge = "api"` asks a service instead, set in `[context.api]`:
-  - `provider = "gemini"` (the default): Google's Gemini API, `gemini-3.5-flash-lite`. Its free tier needs only a key from Google AI Studio; Google may use what is sent on the free tier to improve its products. The free tier limits requests per minute; vbr waits as long as Gemini asks.
+  - `provider = "gemini"` (the default): Google's Gemini API, `gemini-3.5-flash-lite`. Its free tier needs only a key from Google AI Studio; Google may use what is sent on the free tier to improve its products. The free tier limits each model's requests per minute and per day separately, so `fallback_models` can list more of the models your key may use, in order of preference. While one is rate-limited or overloaded, the next answers; one whose daily quota is spent is skipped for the rest of the run. vbr waits as long as Gemini asks only when every model is busy, and the report counts each model's answers (`judge_models`).
   - `provider = "jev"`: Jev's decision API, which answers each question as choices with probabilities. A use it is less than 70 % sure of stays unsure.
   - `provider = "openai"`: any OpenAI-compatible chat API, such as OpenRouter or a local Ollama server, with its `url` and `model`.
 
-  The key comes from `VBR_JUDGE_API_KEY` by default. A question the service can't answer leaves the word unsure, so it is muted; a key it rejects stops the run.
+  The key comes from `VBR_JUDGE_API_KEY` by default. A question the service can't answer leaves the word unsure, so it is muted, and after three such questions in a row the service isn't asked again in that run. A key it rejects stops the run.
+
+  ```toml
+  [context]
+  judge = "api"
+
+  [context.api]
+  fallback_models = ["gemini-3.8-flash"]  # asked while gemini-3.5-flash-lite is busy
+  ```
 
   ```console
   $ export VBR_JUDGE_API_KEY=...          # e.g. from https://aistudio.google.com/apikey
-  $ vbr clean movie.mkv --replace --review-srt   # with judge = "api" in [context]
+  $ vbr clean movie.mkv --replace --review-srt
   ```
 - **Privacy.** The models run locally, and download once. With `context.judge = "api"`, each line the judge is asked about is sent to the service with its neighbouring lines; no audio and no file names. `--offline` turns that off.
 - **Acting on the verdicts (experimental).** Two settings in `[context]` change what is muted:
@@ -183,7 +195,7 @@ $ export OPENSUBTITLES_USERNAME=... OPENSUBTITLES_PASSWORD=...   # optional: a l
 $ vbr doctor                                                     # checks that the key is accepted
 ```
 
-- **What is sent.** The file's OpenSubtitles hash (computed from 128 KiB of the file) and its size, then, if nothing matches the hash, the title and year or the season and episode from the file name. `vbr subs` shows exactly what it sends. `--offline` sends nothing.
+- **What is sent.** The file's OpenSubtitles hash (computed from 128 KiB of the file) and its size. If nothing matches the hash, an IMDb id from a Kodi-style `.nfo` file next to the video, and if that finds nothing, the title and year or the season and episode from the file name. For an episode named without its show (`S01E02 - Pilot.mkv`), the show comes from its `.nfo` file or from a library's folders (`Show/Season 01/`); otherwise no title is sent. `vbr subs` shows exactly what it sends. `--offline` sends nothing.
 - **Quota.** Searches are free; each download counts against a daily quota (5 without logging in). Only the subtitles that are actually tried are downloaded, and when the quota runs out the run falls back to transcribing everything. The report says when the quota renews.
 - **Cache.** Downloaded subtitles are kept in your cache folder, so a file never costs quota twice, and they are reused even offline or without a key. `vbr cache clear --subtitles` deletes them.
 
