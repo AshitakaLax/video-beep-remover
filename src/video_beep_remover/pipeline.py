@@ -52,6 +52,7 @@ from video_beep_remover.context import (
     review_cues,
     review_labels,
     review_notes,
+    torch_device,
     verdict_dict,
     word_lines,
 )
@@ -206,11 +207,6 @@ def _free_memory() -> None:
         torch.cuda.empty_cache()
 
 
-def _context_device(setting: str) -> str:
-    """The device the context models run on: transcription.device's."""
-    return ("cuda" if cuda_available() else "cpu") if setting == "auto" else setting
-
-
 class _Track:
     """The decoded soundtrack, decoded at most once per file and shared by every stage that needs it."""
 
@@ -283,6 +279,7 @@ class Pipeline:
         self._voice_models = voice_models  # (separator, editor, speaker encoder) factories, for tests
         self._replacer: Replacer | None = None
         self._check_role = "full"  # the transcriber that checks replaced words: the analysis's
+        self._device: str | None = None  # of the context and voice models, once decided
 
     def opensubtitles(self) -> OpenSubtitlesClient | None:
         """The OpenSubtitles client, when there is a key and the network may be used. One client
@@ -900,14 +897,26 @@ class Pipeline:
         else:
             shutil.rmtree(job.workdir, ignore_errors=True)
 
+    def model_device(self) -> str:
+        """Where the context and voice models run (context.models.torch_device), decided once, with a
+        warning when PyTorch cannot use the GPU that Whisper uses."""
+        if self._device is None:
+            setting = self.config.transcription.device
+            self._device = torch_device(setting)
+            if setting == "auto" and self._device == "cpu" and cuda_available():
+                self.ui.warn(
+                    "PyTorch cannot use the GPU that Whisper uses (is it a CPU-only build?), so the "
+                    "context and voice models run on the CPU"
+                )
+        return self._device
+
     def context_layer(self) -> ContextLayer:
         """The context layer (DESIGN.md §17), created once: its models serve every file of a batch."""
         if self._context is None:
-            device = _context_device(self.config.transcription.device)
             classifier, judge = self._context_models or (None, None)
             self._context = ContextLayer(
                 self.config,
-                device=device,
+                device=self.model_device(),
                 cache_dir=cache_root(self.config) / "context",
                 classifier_factory=classifier,
                 judge_factory=judge,
@@ -1047,7 +1056,7 @@ class Pipeline:
             separator, editor, encoder = self._voice_models or (None, None, None)
             models = VoiceModels(
                 cfg.replace,
-                device=_context_device(cfg.transcription.device),
+                device=self.model_device(),
                 offline=cfg.offline,
                 cache_dir=cache_root(cfg) / "voice",
                 separator=separator,

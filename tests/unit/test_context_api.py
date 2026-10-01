@@ -1,6 +1,8 @@
 """Judges behind an API (DESIGN.md §17.10) against mocked HTTP (respx)."""
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -9,8 +11,8 @@ import respx
 
 from video_beep_remover.config import load_config
 from video_beep_remover.config.schema import ContextApiConfig
-from video_beep_remover.context import judge_model
-from video_beep_remover.context.analyse import _REASONS, ask, sense_question
+from video_beep_remover.context import ContextLayer, judge_model
+from video_beep_remover.context.analyse import REASONS, ask, sense_question
 from video_beep_remover.context.api import _REASON_TEXT, api_judge
 from video_beep_remover.context.lines import Line
 from video_beep_remover.context.models import CachedJudge, JudgeError, Question
@@ -190,7 +192,29 @@ def test_jev_picks_a_substitute_or_none_and_answers_yes_or_no() -> None:
 
 
 def test_every_reason_is_described_for_jev() -> None:
-    assert tuple(_REASON_TEXT) == _REASONS
+    assert tuple(_REASON_TEXT) == REASONS
+
+
+def test_the_api_judge_stays_when_the_models_are_freed(tmp_path: Path) -> None:
+    """Freeing memory for Whisper drops the classifier; a judge behind an API holds no model."""
+    loaded = load_config(None, env={"VBR_JUDGE_API_KEY": "k"}, overrides={"context.judge": "api"})
+    made: list[str] = []
+
+    def judge(name: str, device: str) -> Any:
+        made.append(name)
+        return SimpleNamespace(name=name)
+
+    layer = ContextLayer(
+        loaded.config,
+        device="cpu",
+        cache_dir=tmp_path,
+        classifier_factory=lambda *_: object(),
+        judge_factory=judge,
+    )
+    first = layer.judge()
+    layer.classifier()
+    assert layer.release() and layer.judge() is first and made == ["gemini:gemini-3.5-flash-lite"]
+    assert not layer.release()  # nothing left to free
 
 
 def test_the_api_judge_is_named_and_off_offline() -> None:

@@ -1,8 +1,11 @@
 """Console output shared by the commands: messages, progress bars, logging and per-file summaries."""
 
+import codecs
 import contextlib
+import io
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -16,7 +19,16 @@ from video_beep_remover.errors import VbrError
 from video_beep_remover.pipeline import FileResult
 from video_beep_remover.pipeline import Progress as ProgressFn
 
-console = Console(stderr=True, highlight=False)
+console = Console(stderr=True, highlight=False)  # messages and progress
+results = Console(highlight=False, soft_wrap=True)  # each file's result, never wrapped
+
+
+def utf8_streams() -> None:
+    """Write UTF-8 when the output goes to a file or a pipe. Windows would otherwise use its ANSI code
+    page, which has no "→" or "✔": Python writes "\\u2192" instead, or fails on stdout."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper) and codecs.lookup(stream.encoding).name != "utf-8":
+            stream.reconfigure(encoding="utf-8")
 
 
 class ConsoleUI:
@@ -97,7 +109,10 @@ def summarize(result: FileResult) -> str:
 
 
 def print_result(ui: ConsoleUI, result: FileResult) -> None:
-    console.print(f"[green]✔[/] {escape(summarize(result))}")
+    """A file's result, on stdout, so that it can be redirected apart from the messages on stderr."""
+    results.print(f"[green]✔[/] {escape(summarize(result))}")
+    if ui.quiet:
+        return
     for label, path in (
         ("original kept as", result.backup if result.status != "skipped" else None),
         ("report", result.report),
@@ -106,4 +121,4 @@ def print_result(ui: ConsoleUI, result: FileResult) -> None:
         ("censored subtitles", result.subtitle_copy),
     ):
         if path:
-            ui.info(f"  {label}: {path}")
+            results.print(escape(f"  {label}: {path}"))

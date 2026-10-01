@@ -30,6 +30,7 @@ from video_beep_remover.context.models import (
     Question,
     ToxicityClassifier,
     _libraries,
+    torch_device,
 )
 from video_beep_remover.context.rules import Phrases, delivery, intensity, sexual_sounds
 from video_beep_remover.errors import DependencyError
@@ -339,6 +340,18 @@ def test_the_judge_runs_by_default_only_on_a_gpu() -> None:
     assert judge_model("someone/model", "cpu") == "someone/model"
 
 
+def test_the_models_run_where_pytorch_can_run_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whisper (ctranslate2) can see a GPU that a CPU-only build of PyTorch cannot use."""
+    assert (torch_device("cuda"), torch_device("cpu")) == ("cuda", "cpu")
+    gpu = SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=gpu))
+    assert torch_device("auto") == "cpu"
+    gpu.is_available = lambda: True
+    assert torch_device("auto") == "cuda"
+    monkeypatch.setitem(sys.modules, "torch", None)  # the extra is not installed
+    assert torch_device("auto") == "cpu"
+
+
 def test_judge_answers_are_cached_on_disk(tmp_path: Path) -> None:
     judge = Judge({"x": '{"sexual": true}'})
     cached = CachedJudge(judge, tmp_path, version=1)
@@ -495,18 +508,19 @@ def test_without_the_extra_a_run_fails_before_anything_is_transcribed(
         pipeline.prepare(tmp_path / "movie.mkv", RunOptions(dry_run=True))
 
 
+class WarningsUI(StrictUI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.warnings: list[str] = []
+
+    def warn(self, message: str) -> None:
+        self.warnings.append(message)
+
+
 def test_acting_on_verdicts_warns_that_it_is_experimental(tmp_path: Path) -> None:
-    class UI(StrictUI):
-        def __init__(self) -> None:
-            super().__init__()
-            self.warnings: list[str] = []
-
-        def warn(self, message: str) -> None:
-            self.warnings.append(message)
-
     acting = {"context.harmless": "keep", "context.sexual": "mute", "transcription.device": "cpu"}
     loaded = load_config(None, env={}, cwd=tmp_path, overrides={"context.enabled": True, **acting})
-    ui = UI()
+    ui = WarningsUI()
     no_ffmpeg: Any = SimpleNamespace()
     models = (lambda name, device: Classifier(), lambda name, device: Judge({}))
     Pipeline(loaded, ui=ui, ff=no_ffmpeg, context_models=models).context_layer()
@@ -514,6 +528,17 @@ def test_acting_on_verdicts_warns_that_it_is_experimental(tmp_path: Path) -> Non
         "acting on context verdicts is experimental",
         'context.harmless = "keep" keeps nothing without a judge (context.judge)',  # "auto" on a CPU
     ]
+
+
+def test_a_gpu_that_pytorch_cannot_use_is_named_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cpu_only = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setitem(sys.modules, "torch", cpu_only)
+    monkeypatch.setattr("video_beep_remover.pipeline.cuda_available", lambda: True)  # Whisper sees one
+    ui = WarningsUI()
+    no_ffmpeg: Any = SimpleNamespace()
+    pipeline = Pipeline(load_config(None, env={}, cwd=tmp_path), ui=ui, ff=no_ffmpeg)
+    assert (pipeline.model_device(), pipeline.model_device()) == ("cpu", "cpu")
+    assert len(ui.warnings) == 1 and "CPU-only" in ui.warnings[0]
 
 
 def test_ambiguous_words_are_scored_masked_so_their_sense_is_not_prejudged() -> None:

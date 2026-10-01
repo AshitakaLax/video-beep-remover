@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from video_beep_remover.config import load_config
@@ -5,7 +7,7 @@ from video_beep_remover.config.loader import config_hash
 from video_beep_remover.errors import UsageError
 from video_beep_remover.models import CensorInterval as Span
 from video_beep_remover.models import Detection
-from video_beep_remover.report import report_detections, report_intervals, review_srt, srt_time
+from video_beep_remover.report import report_detections, report_intervals, review_srt, srt_time, write_text
 
 
 def test_review_srt_names_what_was_heard_in_each_span() -> None:
@@ -21,6 +23,14 @@ def test_review_srt_names_what_was_heard_in_each_span() -> None:
         "3\n00:00:09,021 --> 00:00:09,521\n[muted]\n"
     )
     assert srt_time(3725.5) == "01:02:05,500" and srt_time(-0.2) == "00:00:00,000"
+
+
+def test_a_failed_write_leaves_the_file_as_it_was(tmp_path: Path) -> None:
+    edl = tmp_path / "movie.edl"
+    write_text(edl, "1.000\t2.000\t1\n")
+    with pytest.raises(UnicodeEncodeError):
+        write_text(edl, "3.000\t4.000\t1\n\ud800")  # fails partway through
+    assert edl.read_text("utf-8") == "1.000\t2.000\t1\n"
 
 
 def test_report_intervals_are_sorted_merged_and_checked() -> None:

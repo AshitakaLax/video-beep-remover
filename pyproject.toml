@@ -45,15 +45,16 @@ dependencies = [
 gpu = ["nvidia-cublas-cu12; sys_platform == 'linux'", "nvidia-cudnn-cu12==9.*; sys_platform == 'linux'"]
 align = ["whisperx>=3.8.1"]  # transcription.backend = "whisperx": forced alignment, with PyTorch
 context = ["torch>=2.2", "transformers>=4.56"]  # context analysis (DESIGN.md §17): local classifier and judge
-# voice replacement (DESIGN.md §16): F5-TTS (its weights are CC BY-NC 4.0), Demucs and SpeechBrain
-voice = ["torch>=2.2", "torchaudio>=2.2", "f5-tts>=1.1", "demucs>=4.0", "speechbrain>=1.0"]
+# voice replacement (DESIGN.md §16): F5-TTS (its weights are CC BY-NC 4.0), Demucs and SpeechBrain.
+# F5-TTS is held to the release tested: voice/models.py uses its internals (ema_model, sample).
+voice = ["torch>=2.2", "torchaudio>=2.2", "f5-tts>=1.1,<1.2", "demucs>=4.0", "speechbrain>=1.0"]
 sync = ["ffsubsync>=0.4.25"]  # re-times subtitles that fail the sync check
 dev = [
   "hypothesis>=6",
-  "mypy>=1.10",
+  "mypy>=2.3,<2.4",  # the checkers are held to one release: a new one can fail code that passed
   "pytest>=8",
   "respx>=0.20",
-  "ruff>=0.6",
+  "ruff>=0.16,<0.17",
 ]
 
 [project.urls]
@@ -96,16 +97,23 @@ ignore = ["RUF001", "RUF002", "RUF003"]  # typographic characters (–, →, ×)
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["E501"]  # expected FFmpeg command lines are long
 
+[tool.ruff.format]
+exclude = ["*.md"]  # the code in the docs is compact on purpose (DESIGN.md §5.3)
+
+# mypy checks for the Python it runs on: 3.11, the oldest supported, in CI's lint job. Telling it 3.11
+# on a newer Python fails, since numpy's stubs there use syntax that 3.11 lacks.
 [tool.mypy]
-python_version = "3.11"
 files = ["src"]
 strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
+# Imported inside functions and used untyped: skipped, so that mypy gives the same answer whether or not
+# they are installed (CI has none of the extras).
 [[tool.mypy.overrides]]
 module = [
   "faster_whisper.*", "ctranslate2.*", "whisperx.*", "nltk.*", "torch.*", "torchaudio.*", "transformers.*",
   "demucs.*", "f5_tts.*", "speechbrain.*",
 ]
 ignore_missing_imports = true
+follow_imports = "skip"

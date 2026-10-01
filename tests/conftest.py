@@ -23,5 +23,17 @@ def _isolated_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pyte
         lambda: home / "video-beep-remover" / "config.toml",
     )
     monkeypatch.setattr("video_beep_remover.config.loader.user_cache_path", lambda: home / "cache")
-    for name in ("OPENSUBTITLES_API_KEY", "OPENSUBTITLES_USERNAME", "OPENSUBTITLES_PASSWORD"):
+    for name in (
+        "OPENSUBTITLES_API_KEY",
+        "OPENSUBTITLES_USERNAME",
+        "OPENSUBTITLES_PASSWORD",
+        "VBR_JUDGE_API_KEY",
+    ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ffsubsync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ffsubsync, the optional [sync] extra, changes what happens to subtitles that fail the sync check:
+    tests that want it put in a stand-in."""
+    monkeypatch.setattr("video_beep_remover.subtitles.ffsubsync.ffsubsync_command", lambda: None)

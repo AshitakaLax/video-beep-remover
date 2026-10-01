@@ -23,9 +23,9 @@ log = logging.getLogger(__name__)
 QUESTIONS_VERSION = 1  # bump when a question changes, so cached answers are not reused
 Use = Literal["profane", "harmless", "unsure"]
 _RUDE = ("toxicity", "obscene", "insult")
-_REASONS = ("curse", "insult", "exclamation", "sexual", "literal", "religious", "place", "name", "other")
+REASONS = ("curse", "insult", "exclamation", "sexual", "literal", "religious", "place", "name", "other")
 _HARMLESS_REASONS = ("literal", "religious", "place", "name", "other")
-_EMOTIONS = ("anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise")
+EMOTIONS = ("anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise")
 _JSON = re.compile(r"\{.*?\}", re.DOTALL)
 
 
@@ -96,8 +96,8 @@ def sense_question(
         '- "use" is "profane" for a swear word, an insult, a curse, a sexual reference or an '
         'exclamation that takes God\'s name in vain, and "harmless" for a literal, reverent, place or '
         "name sense;\n"
-        f'- "reason" is one of {", ".join(_quote(r) for r in _REASONS)};\n'
-        f'- "emotion" is the speaker\'s emotion, one of {", ".join(_quote(e) for e in _EMOTIONS)}.'
+        f'- "reason" is one of {", ".join(_quote(r) for r in REASONS)};\n'
+        f'- "emotion" is the speaker\'s emotion, one of {", ".join(_quote(e) for e in EMOTIONS)}.'
     )
     return Question("sense", text, dialogue, word)
 
@@ -146,9 +146,9 @@ def parse_answer(text: str) -> dict[str, Any]:
         answer: dict[str, Any] = {}
         if data.get("use") in ("profane", "harmless"):
             answer["use"] = data["use"]
-        if data.get("reason") in _REASONS:
+        if data.get("reason") in REASONS:
             answer["reason"] = data["reason"]
-        if data.get("emotion") in _EMOTIONS:
+        if data.get("emotion") in EMOTIONS:
             answer["emotion"] = data["emotion"]
         if isinstance(data.get("sexual"), bool):
             answer["sexual"] = data["sexual"]

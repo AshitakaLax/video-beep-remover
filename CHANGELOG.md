@@ -16,7 +16,7 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
   - `hybrid` (the default) transcribes around subtitle lines with listed words, plus any speech no subtitle covers.
   - `targeted` transcribes around subtitle lines with listed words only.
   - `full` transcribes the whole soundtrack.
-- Subtitles come from inside the file, from next to it, or from OpenSubtitles.com with your own API key.
+- Subtitles come from inside the file, from next to it, or from OpenSubtitles.com with your own API key. vbr's own review subtitles are never taken for a video's subtitles.
 - Subtitles are used only if a sync check passes. The check finds offsets and frame-rate differences, and can re-time subtitles with the optional ffsubsync (`[sync]` extra).
 - An optional `whisperx` backend (`[align]` extra) re-times words with wav2vec2 forced alignment.
 
@@ -26,7 +26,7 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 - Only the audio is re-encoded; video, chapters and attachments are copied untouched.
 - Every muted span is checked for silence before the output is kept, and the output must keep every stream and the input's length.
 - Other audio tracks get the same mutes when their dialogue matches the analysed track; tracks that don't match are dropped.
-- Listed words are masked in text subtitle tracks, and in a copy of the subtitle file that guided the search.
+- Listed words are masked in text subtitle tracks, and in a copy of the subtitle file that guided the search, which keeps the file's line endings.
 - An optional edge refinement (`censor.refine_edges`) moves each edge to the quietest 10 ms nearby.
 
 ### Output and workflow
@@ -38,6 +38,7 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 - OpenSubtitles answers that aren't JSON, and network errors while downloading, make the service unavailable for the file instead of failing it.
 - `--backup` puts the cleaned file in the original's place and keeps the unmodified original as `Movie.orig.mp4`; `--in-place` does the same with no backup (`output.mode`). The original is only touched once the new file is verified.
 - A transcript cache makes re-runs fast, for example after editing the word list.
+- Each file's result goes to standard output, and messages and progress to standard error, both in UTF-8 when redirected.
 - Other commands: `vbr doctor`, `vbr subs`, `vbr cache` and `vbr config init/show/check`.
 
 ### Context analysis (preview)
@@ -49,12 +50,14 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 - A `sexual` word category of phrases of a sexual nature, off by default.
 - `scripts/evaluate_context.py`, a labelled set of 71 lines and a set of crafted lines, to measure the context layer.
 - `context.judge = "api"` asks a service online instead of a local judge (`[context.api]`): Google's Gemini API (`gemini-3.5-flash-lite`, which has a free tier), Jev's decision API, or any OpenAI-compatible chat API. Only the lines asked about are sent; `--offline` turns it off. An unanswered question mutes the word.
+- The context and voice models run on the GPU only when PyTorch can use it. With a CPU-only build of PyTorch they run on the CPU, and vbr says so.
 
 ### Voice replacement (experimental)
 
 - `--replace` (`[voice]` extra) says a milder word in the speaker's voice instead of muting, where a substitute from `[replace.substitutes]` fits: "damn" becomes "darn". F5-TTS says the word again inside its sentence, over the dialogue that Demucs separates from the music and effects.
 - Every replaced word is checked: Whisper must hear the substitute and no listed word, and it must sound like the speaker. It is heard again in the rendered file, where no listed word may be heard. Anything else, including a model error on the word, is muted as before. The span stays muted in other audio tracks, the EDL and `vbr render`.
 - Only one large model is in memory at a time: Whisper, the context models, Demucs or F5-TTS. Each is freed before the next loads, so replacement fits a 6 GB GPU. `models.keep_loaded = true` keeps them all loaded.
+- `--offline` keeps the voice models off the network too: they load from the cache, or not at all.
 - F5-TTS's model weights are licensed for non-commercial use only.
 
 [Unreleased]: https://github.com/AshitakaLax/video-beep-remover/compare/v0.1.0...HEAD

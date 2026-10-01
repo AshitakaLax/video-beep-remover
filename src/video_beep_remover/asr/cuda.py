@@ -34,9 +34,17 @@ def _pip_libraries() -> list[Path]:
 @functools.cache
 def load_pip_libraries() -> int:
     """Load pip's cuBLAS and cuDNN, if installed (Linux). Returns how many libraries were loaded."""
-    if not sys.platform.startswith("linux"):
+    # An if and an else, not an early return: checked on Windows, mypy would call what follows one
+    # unreachable.
+    if sys.platform.startswith("linux"):
+        return _load(_pip_libraries())
+    else:
         return 0
-    pending, loaded = _pip_libraries(), 0
+
+
+def _load(pending: list[Path]) -> int:
+    """Load libraries by path, globally, so that ctranslate2 finds them by name. Returns how many loaded."""
+    loaded = 0
     for _ in range(2):  # a library that needs one later in the list loads on the second pass
         failed = []
         for library in pending:

@@ -22,7 +22,7 @@ from typing import Any
 import httpx
 
 from video_beep_remover.config.schema import ContextApiConfig
-from video_beep_remover.context.analyse import _EMOTIONS
+from video_beep_remover.context.analyse import EMOTIONS
 from video_beep_remover.context.models import SYSTEM, JudgeError, Question
 from video_beep_remover.errors import DependencyError
 
@@ -60,7 +60,7 @@ _REASON_TEXT = {
     "place": "part of a place's name",
     "name": "part of a name or title",
     "other": "some other innocent sense",
-}  # one for each of analyse._REASONS
+}  # one for each of analyse.REASONS
 
 
 def endpoint(api: ContextApiConfig) -> tuple[str, str]:
@@ -70,7 +70,7 @@ def endpoint(api: ContextApiConfig) -> tuple[str, str]:
 
 
 def judge_name(api: ContextApiConfig) -> str:
-    """The judge's name in the report and its answer cache, e.g. "gemini:gemini-2.5-flash"."""
+    """The judge's name in the report and its answer cache, e.g. "gemini:gemini-3.5-flash-lite"."""
     return f"{api.provider}:{endpoint(api)[1]}"
 
 
@@ -209,7 +209,7 @@ class JevJudge:
                 "use": _choice(f"How is the word {word} used in the line marked >>?", _USES),
                 "reason": _choice(f"Why is the word {word} used in the line marked >>?", _REASON_TEXT),
                 "emotion": _choice(
-                    "What does the speaker of the line marked >> feel?", {e: e for e in _EMOTIONS}
+                    "What does the speaker of the line marked >> feel?", {e: e for e in EMOTIONS}
                 ),
             }
         elif question.kind == "sexual":

@@ -67,6 +67,15 @@ def test_sidecars_next_to_the_video_and_in_subs_folders(tmp_path: Path) -> None:
     }
 
 
+def test_review_subtitles_are_not_sidecars(tmp_path: Path) -> None:
+    """vbr's own review subtitles (a scan's, and a clean's next to its output) name what was muted."""
+    video = tmp_path / "Movie.mkv"
+    touch(
+        video, tmp_path / "Movie.en.srt", tmp_path / "Movie.review.srt", tmp_path / "Movie.clean.review.srt"
+    )
+    assert [c.label for c in sidecar_candidates(video)] == ["Movie.en.srt"]
+
+
 def test_season_pack_layout(tmp_path: Path) -> None:
     episode = tmp_path / "Show.S01E02.mkv"
     touch(

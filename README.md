@@ -46,6 +46,8 @@ Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the
 | `context` | PyTorch and transformers, for [context analysis](#context-analysis-preview). On Linux without a GPU, install the CPU build of PyTorch first to save gigabytes. |
 | `voice` | F5-TTS, Demucs and SpeechBrain, for [voice replacement](#voice-replacement-experimental). A large install; F5-TTS's model weights are licensed for non-commercial use only. |
 
+The `context` and `voice` extras run on PyTorch, which uses an NVIDIA GPU only in its CUDA build. On Windows, PyPI has the CPU build only, so install PyTorch's CUDA build from [pytorch.org](https://pytorch.org) first. When PyTorch cannot use the GPU that Whisper uses, vbr runs these models on the CPU and says so.
+
 ## Use
 
 ```console
@@ -75,12 +77,12 @@ Useful options:
 - `--categories strong,religious` enables exactly those word categories.
 - `--model large-v3-turbo` picks a Whisper model, and `--device cpu` forces the CPU.
 - `--audio-stream N` picks the dialogue track by its ffprobe index.
-- `--review-srt` also writes `.review.srt`: one subtitle per muted span naming the word, to spot-check the result in a player.
+- `--review-srt` also writes `.review.srt`: one subtitle per muted span naming the word, to spot-check the result in a player. vbr never takes it for a video's subtitles.
 - `--context` adds context analysis to the report ([preview](#context-analysis-preview)), and `--replace` says a milder word instead of muting ([experimental](#voice-replacement-experimental)).
 - `--backup` or `--in-place` put the cleaned file in the original's place (see below).
 - `--overwrite` or `--skip-existing` decide what happens when outputs already exist.
 
-Run `vbr clean --help` for everything.
+Run `vbr clean --help` for everything. Each file's result goes to standard output, and messages and progress to standard error, so `vbr scan ~/Videos -r > results.txt` keeps the results alone.
 
 **Folders.** Every video in a folder is processed in turn (`-r` for subfolders). vbr's own files found there are skipped: files named like another input's output (`Movie.clean.mkv`) or backup (`Movie.orig.mkv`), and files tagged `VBR_CENSORED`. The Whisper model stays loaded, and each file is written in the background while the next one is analysed (not one with replaced words, which are heard again once written). A file that fails doesn't stop the batch; the exit code is then 4. Two inputs that would be written to the same output (say `Season 1/Episode 01.mkv` and `Season 2/Episode 01.mkv` with `-o ~/Clean`) are caught before anything is rendered: the later one fails.
 

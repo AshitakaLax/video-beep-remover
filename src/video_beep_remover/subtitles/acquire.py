@@ -11,6 +11,7 @@ from video_beep_remover.errors import MediaError, SubtitleError
 from video_beep_remover.languages import lang_matches, language_code
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
 from video_beep_remover.media.probe import VIDEO_SUFFIXES, MediaInfo
+from video_beep_remover.outputs import REVIEW_SUFFIX
 from video_beep_remover.subtitles.parse import read_subtitle_file
 
 CandidateSource = Literal["explicit", "embedded", "sidecar", "opensubtitles"]
@@ -107,7 +108,10 @@ def name_flags(tokens: Sequence[str]) -> tuple[str | None, bool, bool]:
 
 
 def _is_subtitle(path: Path) -> bool:
-    return path.suffix.lower() in SIDECAR_SUFFIXES and path.is_file()
+    """A subtitle file, other than vbr's own review subtitles ("Movie.review.srt"): those name what was
+    muted, not what is said."""
+    name = path.name.lower()
+    return path.suffix.lower() in SIDECAR_SUFFIXES and not name.endswith(REVIEW_SUFFIX) and path.is_file()
 
 
 def _named_for(path: Path, stem: str) -> str | None:

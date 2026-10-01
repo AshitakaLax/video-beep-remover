@@ -27,6 +27,7 @@ from video_beep_remover.context.models import (
     LocalJudge,
     ToxicityClassifier,
     check_installed,
+    torch_device,
 )
 from video_beep_remover.models import CensorInterval, Detection, Word
 
@@ -43,6 +44,7 @@ __all__ = [
     "review_cues",
     "review_labels",
     "review_notes",
+    "torch_device",
     "verdict_dict",
     "word_lines",
 ]
@@ -122,11 +124,15 @@ class ContextLayer:
         return self._judge
 
     def release(self) -> bool:
-        """Drop the classifier and the judge, so their memory can be freed; their next use loads them
-        again. Returns whether either was loaded."""
-        loaded = self._classifier is not None or self._judge is not None
-        self._classifier = self._judge = None
-        return loaded
+        """Drop the classifier and a local judge, so their memory can be freed; their next use loads them
+        again. A judge behind an API holds no model, so it stays, with its connection and its answers.
+        Returns whether anything was dropped."""
+        keep_judge = self.judge_setting == "api"
+        dropped = self._classifier is not None or (self._judge is not None and not keep_judge)
+        self._classifier = None
+        if not keep_judge:
+            self._judge = None
+        return dropped
 
     def run(
         self, detections: Sequence[Detection], lines: Sequence[Line], heard: Sequence[Word] | None = None

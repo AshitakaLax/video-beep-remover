@@ -14,9 +14,11 @@ from video_beep_remover.cli import (  # noqa: F401  (registers the commands)
     videos,
 )
 from video_beep_remover.cli.app import app
+from video_beep_remover.cli.console import utf8_streams
 
 __all__ = ["app", "main"]
 
 
 def main() -> None:
+    utf8_streams()
     app()

@@ -58,10 +58,10 @@ def test_spans_are_muted_with_fades_on_the_requested_samples(ff: FFmpeg, tmp_pat
 def test_encoder_priming_that_moves_the_output_timeline_is_measured(ff: FFmpeg, tmp_path: Path) -> None:
     """AAC at 22.05 kHz in Matroska starts 46 ms before zero, and re-encoding moves everything 46 ms
     later on the output's timeline. The mutes still hit the right samples, and verification has to
-    look 46 ms later too."""
+    look 46 ms later too. FFmpeg 9 starts such a track at zero, so the timeline does not move."""
     source = make_clip(tmp_path / "in.mkv", sample_rate=22_050)
     info = probe(ff, source)
-    assert info.start_time == pytest.approx(-0.046, abs=0.001)
+    assert info.start_time == pytest.approx(-0.046, abs=0.001) or info.start_time == 0.0
     analysed = select_audio_stream(info, "en")
     config = OutputConfig()
     plan = plan_streams(info, analysed, config, "en")
@@ -78,7 +78,7 @@ def test_encoder_priming_that_moves_the_output_timeline_is_measured(ff: FFmpeg, 
         workdir=workdir,
     )
     shift = result.timeline_shift
-    assert shift == pytest.approx(0.046, abs=0.002)
+    assert shift == pytest.approx(-info.start_time, abs=0.002)
     samples = decode(result.output)
     assert tone_gain(samples, 1.9 + shift) == pytest.approx(1.0, abs=0.1)
     assert tone_gain(samples, 2.02 + shift) < 0.01

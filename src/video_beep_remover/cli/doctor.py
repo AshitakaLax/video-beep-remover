@@ -125,7 +125,7 @@ def context_status(cfg: Config) -> tuple[str, bool | None, str]:
     from importlib.util import find_spec
 
     from video_beep_remover.asr.faster_whisper import cuda_available
-    from video_beep_remover.context import judge_model
+    from video_beep_remover.context import judge_model, torch_device
 
     name = "context analysis"
     installed = find_spec("torch") is not None and find_spec("transformers") is not None
@@ -134,9 +134,7 @@ def context_status(cfg: Config) -> tuple[str, bool | None, str]:
         if not enabled:
             return name, None, "off; optional: pip install 'video-beep-remover[context]', then --context"
         return name, False, "context.enabled, but not installed: pip install 'video-beep-remover[context]'"
-    device = cfg.transcription.device
-    if device == "auto":
-        device = "cuda" if cuda_available() else "cpu"
+    device = torch_device(cfg.transcription.device)
     judge = judge_model(cfg.context.judge, device, cfg.context.api, offline=cfg.offline)
     online = cfg.context.judge == "api"
     models = [cfg.context.classifier] + ([judge] if judge and not online else [])
@@ -152,6 +150,8 @@ def context_status(cfg: Config) -> tuple[str, bool | None, str]:
     else:
         why = {"auto": " (no GPU)", "api": " (offline)"}.get(cfg.context.judge, "")
         details += f"no judge{why}"
+    if cfg.transcription.device == "auto" and device == "cpu" and cuda_available():
+        details += "; PyTorch cannot use the GPU that Whisper uses (is it a CPU-only build?)"
     actions = []
     if cfg.context.harmless == "keep":
         actions.append("keeps harmless uses")

@@ -91,7 +91,9 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, "utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, "utf-8")
+    tmp.replace(path)
 
 
 def read_report(path: Path) -> dict[str, Any]:

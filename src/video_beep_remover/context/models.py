@@ -35,6 +35,19 @@ def check_installed() -> None:
         raise DependencyError(_MISSING)
 
 
+def torch_device(setting: str) -> str:
+    """The device the context and voice models run on, from transcription.device. They run on PyTorch,
+    so "auto" asks it: its CPU-only build, the one PyPI has for Windows, cannot use a GPU that Whisper
+    (ctranslate2) can."""
+    if setting != "auto":
+        return setting
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def _libraries() -> tuple[Any, Any]:
     try:
         import torch

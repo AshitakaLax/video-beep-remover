@@ -18,6 +18,7 @@ from video_beep_remover.config.schema import OutputConfig
 from video_beep_remover.errors import ConfigError, UsageError
 
 MODE_FLAGS = {"backup": "--backup", "in_place": "--in-place"}
+REVIEW_SUFFIX = ".review.srt"
 
 
 def _name(template: str, source: Path, key: str) -> Path:
@@ -108,4 +109,4 @@ def edl_path(source: Path, backup: Path | None) -> Path:
 
 
 def review_path(video: Path) -> Path:
-    return video.with_name(f"{video.stem}.review.srt")
+    return video.with_name(f"{video.stem}{REVIEW_SUFFIX}")
