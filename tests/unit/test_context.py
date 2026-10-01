@@ -9,10 +9,11 @@ from typing import Any
 
 import pytest
 
-from helpers import StrictUI, say, srt
+from helpers import RecordingUI, StrictUI, say, srt
 from video_beep_remover.config import load_config
 from video_beep_remover.context import (
     ContextLayer,
+    analyse_file,
     judge_model,
     kept_cues,
     review_cues,
@@ -21,7 +22,15 @@ from video_beep_remover.context import (
     verdict_dict,
 )
 from video_beep_remover.context.analyse import Settings, analyse_context, mask_words, parse_answer
-from video_beep_remover.context.lines import Line, build_lines, cue_lines, heard_share, line_for, word_lines
+from video_beep_remover.context.lines import (
+    Line,
+    build_lines,
+    cue_lines,
+    heard_share,
+    line_for,
+    line_spans,
+    word_lines,
+)
 from video_beep_remover.context.models import (
     DEFAULT_JUDGE,
     LABELS,
@@ -171,6 +180,16 @@ def test_detections_find_their_line() -> None:
     assert line_for(detection("hell", 6.0), lines) == 1
     assert line_for(detection("hell", 9.1), lines) is None  # a sound-only line has nothing said
     assert line_for(detection("hell", 30.0), lines) is None
+
+
+def test_a_line_is_spoken_from_its_first_heard_word_to_its_last() -> None:
+    lines = [Line(1.0, 3.0, "Did you sleep with him?", cue=1), Line(5.0, 6.0, "Come to bed.")]
+    heard = [
+        Word(" Did", 0.7, 0.9),  # before the cue, but within COVER_MARGIN_S of it
+        Word(" him?", 2.5, 2.9),
+        Word(" Later", 4.0, 4.2),  # near neither line
+    ]
+    assert line_spans(lines, heard) == [(0.7, 2.9, True), (5.0, 6.0, False)]  # nothing heard: the cue's
 
 
 def test_rules_read_sounds_capitals_and_exclamations() -> None:
@@ -433,6 +452,53 @@ def test_the_layer_reports_verdicts_and_sexual_lines(tmp_path: Path) -> None:
     }
 
 
+def test_the_verdicts_on_a_file_decide_what_is_muted(tmp_path: Path) -> None:
+    acting = {"context.judge": "fake-judge", "context.harmless": "keep", "context.sexual": "mute"}
+    judge = Judge(
+        {
+            "road to hell": '{"use": "harmless", "reason": "place", "emotion": "neutral"}',
+            "sleep with": '{"sexual": true}',
+        }
+    )
+    layer = ContextLayer(
+        load_config(None, env={}, cwd=tmp_path, overrides=acting).config,
+        device="cpu",
+        cache_dir=None,
+        classifier_factory=lambda name, device: Classifier(),
+        judge_factory=lambda name, device: judge,
+    )
+    lines = [
+        Line(1.0, 2.0, "Damn it.", cue=1),
+        Line(3.0, 5.0, "The road to hell is paved with good intentions.", cue=2),
+        Line(6.0, 8.0, "Did you sleep with the captain?", cue=3),
+    ]
+    heard = say(lines[0].text, 1.0, 2.0) + say(lines[1].text, 3.0, 5.0)
+    said = say(lines[2].text, 6.3, 7.6)  # no listed word there, so the analysis did not hear it
+    asked: list[list[tuple[float, float]]] = []
+
+    def hear_again(spans: list[tuple[float, float]]) -> list[Word]:
+        asked.append(spans)
+        return heard + said
+
+    damn, hell = detection("damn", 1.0, 1), detection("hell", 3.7, 2)
+    ui = RecordingUI()
+    found = analyse_file(layer, [damn, hell], lines, heard, ui, hear_again=hear_again)
+    assert asked == [[(6.0, 8.0)]]  # only the line to mute is transcribed again
+    sexual = Detection(6.3, said[-1].end, lines[2].text, "sexual line", "context", 1.0, "asr", 3)
+    assert found.to_mute == [damn, sexual]  # the harmless "hell" is kept
+    assert [verdict["use"] for verdict in found.verdicts] == ["profane", "harmless"]
+    assert found.section["kept"] == 1
+    assert found.section["sexual_lines"][0]["muted"] == {
+        "start": 6.3,
+        "end": round(said[-1].end, 3),
+        "from": "heard",
+    }
+    assert ui.infos == [
+        "Context: 1 profane, 1 probably harmless, 0 unsure · 1 sexual lines · 1 kept as harmless · "
+        "1 sexual lines muted"
+    ]
+
+
 def test_review_subtitles_show_the_verdicts() -> None:
     detections = [detection("hell", 1.0), detection("damn", 5.0)]
     verdicts = [{"use": "harmless", "reason": "place"}, {"use": "profane", "reason": "listed"}]
@@ -541,19 +607,10 @@ def test_without_the_extra_a_run_fails_before_anything_is_transcribed(
         pipeline.prepare(tmp_path / "movie.mkv", RunOptions(dry_run=True))
 
 
-class WarningsUI(StrictUI):
-    def __init__(self) -> None:
-        super().__init__()
-        self.warnings: list[str] = []
-
-    def warn(self, message: str) -> None:
-        self.warnings.append(message)
-
-
 def test_acting_on_verdicts_warns_that_it_is_experimental(tmp_path: Path) -> None:
     acting = {"context.harmless": "keep", "context.sexual": "mute", "transcription.device": "cpu"}
     loaded = load_config(None, env={}, cwd=tmp_path, overrides={"context.enabled": True, **acting})
-    ui = WarningsUI()
+    ui = RecordingUI()
     no_ffmpeg: Any = SimpleNamespace()
     models = (lambda name, device: Classifier(), lambda name, device: Judge({}))
     Pipeline(loaded, ui=ui, ff=no_ffmpeg, context_models=models).models.context_layer()
@@ -567,7 +624,7 @@ def test_a_gpu_that_pytorch_cannot_use_is_named_once(tmp_path: Path, monkeypatch
     cpu_only = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
     monkeypatch.setitem(sys.modules, "torch", cpu_only)
     monkeypatch.setattr("video_beep_remover.model_pool.cuda_available", lambda: True)  # Whisper sees one
-    ui = WarningsUI()
+    ui = RecordingUI()
     no_ffmpeg: Any = SimpleNamespace()
     pipeline = Pipeline(load_config(None, env={}, cwd=tmp_path), ui=ui, ff=no_ffmpeg)
     assert (pipeline.models.device(), pipeline.models.device()) == ("cpu", "cpu")

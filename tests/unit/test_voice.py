@@ -8,14 +8,14 @@ from typing import Any
 import numpy as np
 import pytest
 
-from helpers import say
+from helpers import RecordingUI, say
 from video_beep_remover.context.analyse import ContextResult, Verdict, choose_substitutes
 from video_beep_remover.context.lines import Line
 from video_beep_remover.context.models import Question
 from video_beep_remover.errors import DependencyError
 from video_beep_remover.models import CensorInterval, Detection
 from video_beep_remover.report import review_srt
-from video_beep_remover.voice import _said
+from video_beep_remover.voice import Replacer, _said, replace_words
 from video_beep_remover.voice.models import DemucsSeparator, EcapaEncoder, _offline, check_installed
 from video_beep_remover.voice.splice import change, dialogue_channels, fade_mask, fit_case, utterance
 
@@ -90,6 +90,34 @@ def test_the_sentence_is_said_again_with_the_substitute() -> None:
     assert utterance(phrase, whole, "son of a gun") is not None
     assert utterance(phrase, whole, "son of a gun").text == "You son of a gun!"  # type: ignore[union-attr]
     assert utterance(heard, detection("hell", 9.0, 9.3), "heck") is None  # nothing heard there
+
+
+def test_a_word_is_said_again_only_alone_in_its_muted_span() -> None:
+    crowded, hell = detection("damn", 1.0, 1.3), detection("hell", 1.4, 1.6)  # muted together
+    kept, unheard = detection("damn", 3.0, 3.3), detection("damn", 5.0, 5.3)
+    unused: Any = SimpleNamespace()  # no word gets as far as the models, or reading the file
+    ui = RecordingUI()
+    done = replace_words(
+        Replacer(unused, unused, unused, unused, lambda audio, start: []),
+        [crowded, hell, kept, unheard],
+        ["darn", None, "darn", "darn"],  # "hell" has no substitute: it stays muted
+        [crowded, hell, unheard],  # "kept" was kept as harmless: it is not muted at all
+        [CensorInterval(0.9, 1.7), CensorInterval(4.9, 5.4)],
+        [],  # nothing was heard: "unheard" was only estimated from the subtitles
+        source=Path("movie.mkv"),
+        stream=unused,
+        duration=10.0,
+        workdir=Path("work"),
+        ui=ui,
+    )
+    assert [(r.detection, r.start, r.end, r.replaced, r.reason) for r in done] == [
+        (0, 0.9, 1.7, False, "another muted word shares its span"),
+        (3, 4.9, 5.4, False, "the word was not heard, only estimated"),
+    ]
+    assert ui.infos == [
+        "Voice replacement: 0 of 2 words said again; the rest stay muted (another muted word shares its "
+        "span; the word was not heard, only estimated)"
+    ]
 
 
 def test_the_substitute_takes_the_case_and_punctuation_of_the_word() -> None:

@@ -27,10 +27,11 @@ from video_beep_remover.detect.lexicon import Lexicon
 from video_beep_remover.detect.matcher import detect_in_words
 from video_beep_remover.detect.normalize import normalize_token, split_words
 from video_beep_remover.errors import DependencyError
-from video_beep_remover.media.audio import Audio
+from video_beep_remover.media.audio import Audio, read_pcm_windows
 from video_beep_remover.media.ffmpeg import FFmpeg, file_arg
 from video_beep_remover.media.probe import StreamInfo
-from video_beep_remover.models import Detection, Word
+from video_beep_remover.models import CensorInterval, Detection, Word
+from video_beep_remover.ui import UI
 from video_beep_remover.voice import splice
 from video_beep_remover.voice.models import (
     DemucsSeparator,
@@ -43,7 +44,7 @@ from video_beep_remover.voice.models import (
 )
 from video_beep_remover.voice.splice import FloatArray
 
-__all__ = ["Candidate", "Replacement", "Replacer", "VoiceModels", "check_installed"]
+__all__ = ["Candidate", "Replacement", "Replacer", "VoiceModels", "check_installed", "replace_words"]
 
 log = logging.getLogger(__name__)
 
@@ -353,3 +354,68 @@ class Replacer:
             _cosine(encoder.embed(edited[first:last], rate), speaker),
             _cosine(encoder.embed(voice[first:last], rate), speaker),
         )
+
+
+def replace_words(
+    replacer: Replacer,
+    detections: Sequence[Detection],
+    substitutes: Sequence[str | None],
+    to_mute: Sequence[Detection],
+    intervals: Sequence[CensorInterval],
+    heard: Sequence[Word],
+    *,
+    source: Path,
+    stream: StreamInfo,
+    duration: float,
+    workdir: Path,
+    ui: UI,
+) -> list[Replacement]:
+    """Say a milder word in place of each detection that has a substitute (one per detection, or None)
+    and is muted (`to_mute`, in `intervals`): a replacement for each, said again or still muted, and why.
+    A word's span is replaced only if no other muted word shares it; any failure mutes it."""
+    candidates = []
+    for index, (detection, substitute) in enumerate(zip(detections, substitutes, strict=True)):
+        if substitute is None or detection not in to_mute:
+            continue
+        middle = (detection.start + detection.end) / 2
+        span = next((i for i in intervals if i.start <= middle <= i.end), None)
+        if span is None:
+            continue
+        crowded = any(d != detection and d.start < span.end and span.start < d.end for d in to_mute)
+        candidates.append((index, detection, substitute, span, crowded))
+    planned: list[Candidate | Replacement] = []
+    for index, detection, substitute, span, crowded in candidates:
+        if crowded:
+            planned.append(
+                Replacement(
+                    index, span.start, span.end, detection.heard.strip(), substitute, False,
+                    "another muted word shares its span",
+                )
+            )  # fmt: skip
+        else:
+            planned.append(
+                replacer.plan(
+                    index=index,
+                    detection=detection,
+                    span=(span.start, span.end),
+                    substitute=substitute,
+                    heard=heard,
+                    duration=duration,
+                )
+            )
+    todo = [c for c in planned if isinstance(c, Candidate)]
+    said_again: list[Replacement] = []
+    if todo:
+        windows = read_pcm_windows(replacer.ff, source, stream, [c.window for c in todo])
+        with ui.progress("Replacing words", 3 * len(todo)) as update:
+            said_again = replacer.replace(todo, windows, stream, workdir, on_progress=update)
+    results = iter(said_again)
+    done = [next(results) if isinstance(item, Candidate) else item for item in planned]
+    if candidates:
+        replaced = sum(r.replaced for r in done)
+        reasons = sorted({r.reason for r in done if not r.replaced})
+        ui.info(
+            f"Voice replacement: {replaced} of {len(done)} words said again"
+            + (f"; the rest stay muted ({'; '.join(reasons)})" if reasons else "")
+        )
+    return done

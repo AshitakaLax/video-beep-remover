@@ -205,3 +205,18 @@ class StrictUI:
     def status(self, label: str) -> Iterator[None]:
         with self._live(label):
             yield
+
+
+class RecordingUI(StrictUI):
+    """A StrictUI that keeps the lines it is given."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.infos: list[str] = []
+        self.warnings: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.infos.append(message)
+
+    def warn(self, message: str) -> None:
+        self.warnings.append(message)

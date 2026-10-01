@@ -4,6 +4,7 @@ uses judged harmless unmuted, and context.sexual = "mute" mutes the lines flagge
 
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ from video_beep_remover.context.analyse import (
     analyse_context,
     choose_substitutes,
 )
-from video_beep_remover.context.lines import Line, build_lines, word_lines
+from video_beep_remover.context.lines import Line, build_lines, line_spans, word_lines
 from video_beep_remover.context.models import (
     DEFAULT_JUDGE,
     JUDGE_GPU_GB,
@@ -33,13 +34,16 @@ from video_beep_remover.context.models import (
     torch_device,
 )
 from video_beep_remover.models import CensorInterval, Detection, Word
+from video_beep_remover.ui import UI
 
 __all__ = [
     "Choice",
     "ContextLayer",
     "ContextResult",
+    "FileContext",
     "Line",
     "ModelFactory",
+    "analyse_file",
     "build_lines",
     "check_installed",
     "gpu_memory_gb",
@@ -214,6 +218,93 @@ def _api_judge(api: ContextApiConfig) -> Any:
     from video_beep_remover.context.api import api_judge
 
     return api_judge(api)
+
+
+@dataclass
+class FileContext:
+    """What context analysis found in one file, and what it changes."""
+
+    result: ContextResult
+    section: dict[str, Any]  # the report's "context" section
+    verdicts: list[dict[str, Any]]  # the report's verdict on each detection
+    to_mute: list[Detection]  # the detections, less the uses kept, plus a span for each sexual line muted
+
+
+def analyse_file(
+    layer: ContextLayer,
+    detections: Sequence[Detection],
+    lines: Sequence[Line],
+    heard: Sequence[Word],
+    ui: UI,
+    *,
+    hear_again: Callable[[list[tuple[float, float]]], Sequence[Word]],
+) -> FileContext:
+    """Context verdicts for the report and the review subtitles, and what to mute: the detections, less
+    the uses kept as harmless with context.harmless = "keep", plus a span for each line flagged as sexual
+    with context.sexual = "mute". `heard`: the words the analysis heard. `hear_again(spans)`: those
+    words, with spans of subtitle lines transcribed again in windows of their own, so that all of a line
+    to mute is heard (DESIGN.md §17.5); the analysis only transcribed around listed words."""
+    with ui.status("Reading the dialogue in context"):
+        result, section = layer.run(detections, lines, heard)
+    verdicts = [verdict_dict(v, result.lines) for v in result.verdicts]
+    keep = layer.harmless == "keep"
+    to_mute = [
+        d for d, v in zip(detections, result.verdicts, strict=True) if not (keep and v.use == "harmless")
+    ]
+    actions = []
+    if keep:
+        section["kept"] = len(detections) - len(to_mute)
+        actions.append(f"{section['kept']} kept as harmless")
+    if layer.sexual == "mute":
+        flagged = [(i, s) for i, s in enumerate(result.sexual) if s.certain and s.line.text]
+        cued = [(found.line.start, found.line.end) for _, found in flagged if found.line.cue is not None]
+        spans = line_spans([found.line for _, found in flagged], hear_again(cued) if cued else heard)
+        for (i, found), (start, end, said) in zip(flagged, spans, strict=True):
+            section["sexual_lines"][i]["muted"] = {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "from": "heard" if said else "cue",
+            }
+            to_mute.append(
+                Detection(
+                    start,
+                    end,
+                    found.line.text,
+                    "sexual line",
+                    "context",
+                    1.0,
+                    "asr" if said else "cue",
+                    found.line.cue,
+                )
+            )
+        actions.append(f"{len(flagged)} sexual lines muted")
+    ui.info(_summary(section, actions, judged=bool(layer.judge_name)))
+    return FileContext(result, section, verdicts, to_mute)
+
+
+def _summary(section: dict[str, Any], actions: Sequence[str], *, judged: bool) -> str:
+    """One line on a file's verdicts, and what they changed."""
+    counts = section["verdicts"]
+    certain = sum(item["certain"] for item in section["sexual_lines"])
+    possible = len(section["sexual_lines"]) - certain
+    models: dict[str, int] = section.get("judge_models") or {}  # a judge behind an API, by model
+    return (
+        f"Context{'' if actions else ' (report only)'}: {counts['profane']} profane, "
+        f"{counts['harmless']} probably harmless, {counts['unsure']} unsure · {certain} sexual lines"
+        + (f" (+{possible} possible)" if possible else "")
+        + "".join(f" · {action}" for action in actions)
+        + ("" if judged else " · no judge: " + section.get("judge_off", "off"))
+        + (
+            f" · {section['judge_unanswered']} judge questions unanswered"
+            if section["judge_unanswered"]
+            else ""
+        )
+        + (
+            " · answered by " + ", ".join(f"{model} ({count})" for model, count in models.items())
+            if len(models) > 1
+            else ""
+        )
+    )
 
 
 def verdict_dict(verdict: Verdict, lines: Sequence[Line]) -> dict[str, Any]:

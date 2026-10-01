@@ -73,7 +73,9 @@ docs/DESIGN.md       §3 CLI, §4 config, §5 architecture, §6 stages, §13 pla
 - **Test with media.** `helpers.make_clip` builds a clip in which a 440 Hz tone stands in for speech;
   `Track(surround=True)` makes a 5.1 track. `FakeTranscriber` returns scripted words. `decode` and
   `tone_gain` measure what was muted. `Pipeline` takes stand-ins for every model:
-  `transcriber_factory`, `speech_detector`, `context_models` and `voice_models`.
+  `transcriber_factory`, `speech_detector`, `context_models` and `voice_models`. `RecordingUI` keeps
+  the lines a run prints. The context and voice steps (`context.analyse_file`, `voice.replace_words`)
+  can also be tested on their own, without FFmpeg.
 - **Change the report.** `pipeline.py` puts it together. Its main sections are typed and built in
   `report/__init__.py`, so mypy checks them; the strategies and the context layer add their own.
   `report/__init__.py` also reads a report back for `vbr render`. Adding a field is compatible. Bump
