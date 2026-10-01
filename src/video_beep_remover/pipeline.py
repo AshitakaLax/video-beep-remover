@@ -81,13 +81,18 @@ from video_beep_remover.models import CensorInterval, Detection, Word
 from video_beep_remover.outputs import Placement, edl_path, place, report_path, review_path
 from video_beep_remover.report import (
     SCHEMA_VERSION,
+    StrategySection,
+    audio_stream_section,
     detection_dict,
     edl_text,
+    input_section,
     interval_dict,
+    output_section,
     read_report,
     report_detection_items,
     report_intervals,
     review_srt,
+    transcription_section,
     write_json,
     write_text,
 )
@@ -613,38 +618,21 @@ class Pipeline:
             + (f", {result.replaced} of them replaced" if result.replaced else "")
         )
 
-        model = analysis.model
         job.report = {
             "schema_version": SCHEMA_VERSION,
             "tool_version": __version__,
             "created": datetime.now(UTC).isoformat(timespec="seconds"),
-            "input": {
-                "path": str(source),
-                "size": info.size,
-                "oshash": opensubtitles_hash(source),
-                "duration": round(info.duration, 3),
-            },
-            "audio_stream": {
-                "index": stream.index,
-                "codec": stream.codec,
-                "channels": stream.channels,
-                "language": stream.language,
-            },
-            "strategy": {
-                "requested": cfg.analysis.strategy,
-                "used": analysis.strategy,
-                "fallback_reason": analysis.fallback_reason,
-            },
+            "input": input_section(source, info),
+            "audio_stream": audio_stream_section(stream),
+            "strategy": StrategySection(
+                requested=cfg.analysis.strategy,
+                used=analysis.strategy,
+                fallback_reason=analysis.fallback_reason,
+            ),
             **analysis.report,
-            "transcription": {
-                "backend": ("whisperx" if model.align else "faster-whisper") if model else None,
-                "model": model.name if model else None,
-                "device": model.device if model else None,
-                "compute_type": model.compute_type if model else None,
-                "prompt": self.prompt,
-                "words": analysis.words,
-                "from_cache": analysis.from_cache,
-            },
+            "transcription": transcription_section(
+                analysis.model, self.prompt, analysis.words, analysis.from_cache
+            ),
             "categories": list(self.lexicon.categories),
             "detections": [
                 detection_dict(d) | ({"context": v} if v is not None else {})
@@ -726,18 +714,17 @@ class Pipeline:
         result.output = job.output
         result.backup = job.backup
         result.notes = list(plan.notes)
-        output: dict[str, Any] = {
-            "path": str(job.output),
-            "backup": str(job.backup) if job.backup else None,
-            "encoders": {str(index): encoder for index, encoder in rendered.encoders.items()},
-            "muted_spans": [interval_dict(i) for i in rendered.intervals],
-            "verified_spans": rendered.verified_spans,
-            "timeline_shift": round(rendered.timeline_shift, 3),
-            "audio_checks": audio_checks,
-            "subtitles": subtitles.report,
-            "subtitle_copy": None,
-            "notes": list(plan.notes),
-        }
+        output = output_section(
+            job.output,
+            job.backup,
+            encoders=rendered.encoders,
+            muted=rendered.intervals,
+            verified=rendered.verified_spans,
+            shift=rendered.timeline_shift,
+            audio_checks=audio_checks,
+            subtitles=subtitles.report,
+            notes=plan.notes,
+        )
         used = job.subtitle or {}
         if cfg.output.subtitle_streams == "censor" and used.get("source") in ("sidecar", "explicit"):
             path = Path(str(used.get("path")))

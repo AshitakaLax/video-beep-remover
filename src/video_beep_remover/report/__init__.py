@@ -1,18 +1,134 @@
 """JSON report, EDL and review SRT outputs (DESIGN.md §6.12), and reading a report back for
-`vbr render`."""
+`vbr render`.
+
+The report's sections that the pipeline writes are typed here; `vbr render` reads input, audio_stream
+and intervals back. The strategies and the context layer add sections of their own."""
 
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
+from video_beep_remover.asr.faster_whisper import ModelChoice
 from video_beep_remover.errors import UsageError
+from video_beep_remover.media.probe import MediaInfo, StreamInfo
 from video_beep_remover.models import CensorInterval, Detection
+from video_beep_remover.subtitles.oshash import opensubtitles_hash
 
 SCHEMA_VERSION = 1
 _HOW = {"estimate": " (estimated from subtitles)", "cue": " (whole subtitle cue)"}
+
+
+class InputSection(TypedDict):
+    path: str
+    size: int
+    oshash: str | None
+    duration: float
+
+
+class AudioStreamSection(TypedDict):
+    index: int
+    codec: str | None
+    channels: int | None
+    language: str | None
+
+
+class StrategySection(TypedDict):
+    requested: str
+    used: str
+    fallback_reason: str | None
+
+
+class TranscriptionSection(TypedDict):
+    backend: Literal["faster-whisper", "whisperx"] | None  # None: nothing was transcribed
+    model: str | None
+    device: str | None
+    compute_type: str | None
+    prompt: str | None
+    words: int
+    from_cache: Literal["all", "some", "none"] | None
+
+
+class IntervalDict(TypedDict):
+    start: float
+    end: float
+
+
+class OutputSection(TypedDict):
+    path: str
+    backup: str | None
+    encoders: dict[str, str]  # input stream index -> encoder
+    muted_spans: list[IntervalDict]  # as rendered: lengthened and merged (media/render.py)
+    verified_spans: int
+    timeline_shift: float
+    audio_checks: list[dict[str, Any]]  # media/dialogue.py
+    subtitles: list[dict[str, Any]]  # subtitles/output.py
+    subtitle_copy: dict[str, Any] | None
+    notes: list[str]
+
+
+def input_section(source: Path, info: MediaInfo) -> InputSection:
+    """What identifies the file: `vbr render` refuses a report made for another one."""
+    return {
+        "path": str(source),
+        "size": info.size,
+        "oshash": opensubtitles_hash(source),
+        "duration": round(info.duration, 3),
+    }
+
+
+def audio_stream_section(stream: StreamInfo) -> AudioStreamSection:
+    return {
+        "index": stream.index,
+        "codec": stream.codec,
+        "channels": stream.channels,
+        "language": stream.language,
+    }
+
+
+def transcription_section(
+    model: ModelChoice | None,
+    prompt: str | None,
+    words: int,
+    from_cache: Literal["all", "some", "none"] | None,
+) -> TranscriptionSection:
+    return {
+        "backend": ("whisperx" if model.align else "faster-whisper") if model else None,
+        "model": model.name if model else None,
+        "device": model.device if model else None,
+        "compute_type": model.compute_type if model else None,
+        "prompt": prompt,
+        "words": words,
+        "from_cache": from_cache,
+    }
+
+
+def output_section(
+    output: Path,
+    backup: Path | None,
+    *,
+    encoders: Mapping[int, str],
+    muted: Sequence[CensorInterval],
+    verified: int,
+    shift: float,
+    audio_checks: list[dict[str, Any]],
+    subtitles: list[dict[str, Any]],
+    notes: Sequence[str],
+) -> OutputSection:
+    return {
+        "path": str(output),
+        "backup": str(backup) if backup else None,
+        "encoders": {str(index): encoder for index, encoder in encoders.items()},
+        "muted_spans": [interval_dict(i) for i in muted],
+        "verified_spans": verified,
+        "timeline_shift": round(shift, 3),
+        "audio_checks": audio_checks,
+        "subtitles": subtitles,
+        "subtitle_copy": None,
+        "notes": list(notes),
+    }
 
 
 def edl_text(intervals: Sequence[CensorInterval]) -> str:
@@ -78,7 +194,7 @@ def detection_dict(detection: Detection) -> dict[str, Any]:
     return data
 
 
-def interval_dict(interval: CensorInterval) -> dict[str, float]:
+def interval_dict(interval: CensorInterval) -> IntervalDict:
     return {"start": round(interval.start, 3), "end": round(interval.end, 3)}
 
 

@@ -631,7 +631,7 @@ In every mode the renderer writes `<output stem>.partial<ext>`, verifies it, and
 ```json
 {
   "schema_version": 1,
-  "input": {"path": "The Movie (2019).mkv", "size": 4368124121, "duration": 7442.3},
+  "input": {"path": "The Movie (2019).mkv", "size": 4368124121, "oshash": "8e245d9679d31e12", "duration": 7442.3},
   "audio_stream": {"index": 1, "codec": "eac3", "channels": 6, "language": "eng"},
   "strategy": {"requested": "hybrid", "used": "hybrid", "fallback_reason": null},
   "subtitle_candidates": [{"source": "embedded", "label": "embedded #4 'English SDH' (eng)", "cues": 1412,
@@ -644,12 +644,12 @@ In every mode the renderer writes `<output stem>.partial<ext>`, verifies it, and
               "audio_seconds": 281.0, "coverage": 0.038, "expanded": 2, "cached": 0, "partly_cached": 0},
   "confirmation": {"strong_flags": 41, "confirmed": 40},
   "transcription": {"backend": "faster-whisper", "model": "large-v3-turbo", "device": "cuda",
-                    "compute_type": "float16", "words": 3120, "from_cache": "none"},
+                    "compute_type": "float16", "prompt": "Damn, hell, …", "words": 3120, "from_cache": "none"},
   "detections": [{"start": 4383.41, "end": 4383.78, "heard": "hell", "term": "hell", "category": "mild",
                   "confidence": 0.94, "source": "asr", "cue": 812}],
   "unconfirmed": [{"cue": 1033, "text": "Get the h*** out!", "resolution": "estimate"}],
   "intervals": [{"start": 4383.29, "end": 4383.98}],
-  "output": {"path": "The Movie (2019).clean.mkv", "backup": null,
+  "output": {"path": "The Movie (2019).clean.mkv", "backup": null, "encoders": {"1": "eac3"},
              "muted_spans": [{"start": 4383.29, "end": 4383.98}],
              "verified_spans": 44, "timeline_shift": 0.0,
              "audio_checks": [{"stream": 2, "same_dialogue": true, "correlation": 0.97, "lag": 0.0}],

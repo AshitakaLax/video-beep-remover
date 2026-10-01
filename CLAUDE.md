@@ -74,9 +74,10 @@ docs/DESIGN.md       §3 CLI, §4 config, §5 architecture, §6 stages, §13 pla
   `Track(surround=True)` makes a 5.1 track. `FakeTranscriber` returns scripted words. `decode` and
   `tone_gain` measure what was muted. `Pipeline` takes stand-ins for every model:
   `transcriber_factory`, `speech_detector`, `context_models` and `voice_models`.
-- **Change the report.** `pipeline.py` builds it and `report/__init__.py` reads it back for `vbr
-  render`. Adding a field is compatible. Bump `SCHEMA_VERSION` only if a field changes meaning or goes
-  away, since old reports are still read.
+- **Change the report.** `pipeline.py` puts it together. Its main sections are typed and built in
+  `report/__init__.py`, so mypy checks them; the strategies and the context layer add their own.
+  `report/__init__.py` also reads a report back for `vbr render`. Adding a field is compatible. Bump
+  `SCHEMA_VERSION` only if a field changes meaning or goes away, since old reports are still read.
 - **Change where files go.** Go through `outputs.py`: `place()` decides for every command, and
   `batch.py` uses it to skip outputs and backups.
 
