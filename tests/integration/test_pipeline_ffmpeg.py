@@ -1,6 +1,7 @@
 """The whole pipeline with real FFmpeg and a scripted transcriber."""
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,19 @@ def test_no_fallback_fails_without_subtitles(tmp_path: Path) -> None:
     run = pipeline(tmp_path, **{"analysis.fallback_to_full": False})
     with pytest.raises(VbrError, match=r"no subtitles found .*; fallback_to_full is false"):
         run.process(source, RunOptions())
+
+
+def test_a_failed_analysis_leaves_no_temporary_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The error's traceback holds the decoded track, which is memory-mapped, and Windows deletes no
+    file while it is mapped."""
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    source = make_clip(tmp_path / "movie.mkv")
+    run = pipeline(tmp_path, **{"analysis.fallback_to_full": False})  # hybrid decodes the track first
+    with pytest.raises(VbrError, match="fallback_to_full is false"):
+        run.process(source, RunOptions())
+    assert list(temp.iterdir()) == []
 
 
 def test_existing_edl_is_not_overwritten(tmp_path: Path) -> None:

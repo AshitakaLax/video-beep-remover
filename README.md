@@ -40,13 +40,15 @@ Whisper runs on an NVIDIA GPU when CUDA 12 and cuDNN 9 are available, and on the
 
 | Extra | Adds |
 |---|---|
-| `gpu` | The cuBLAS and cuDNN libraries that Whisper needs on NVIDIA GPUs, on Linux. vbr loads them itself, so there is no `LD_LIBRARY_PATH` to set. The NVIDIA driver is still needed. |
+| `gpu` | The cuBLAS and cuDNN libraries that Whisper needs on NVIDIA GPUs, on Linux. vbr loads them itself, so there is no `LD_LIBRARY_PATH` to set. The NVIDIA driver is still needed. On Windows, Whisper uses PyTorch's copies instead (see below). |
 | `align` | [WhisperX](https://github.com/m-bain/whisperX) forced alignment, for tighter word edges (see [Word edges](#word-edges)). It brings PyTorch, a large download. |
 | `sync` | [ffsubsync](https://github.com/smacke/ffsubsync), to re-time subtitles that are badly out of sync. |
 | `context` | PyTorch and transformers, for [context analysis](#context-analysis-preview). On Linux without a GPU, install the CPU build of PyTorch first to save gigabytes. |
 | `voice` | F5-TTS, Demucs and SpeechBrain, for [voice replacement](#voice-replacement-experimental). A large install; F5-TTS's model weights are licensed for non-commercial use only. |
 
 The `context` and `voice` extras run on PyTorch, which uses an NVIDIA GPU only in its CUDA build. On Windows, PyPI has the CPU build only, so install PyTorch's CUDA build from [pytorch.org](https://pytorch.org) first. When PyTorch cannot use the GPU that Whisper uses, vbr runs these models on the CPU and says so.
+
+On Windows, Whisper also uses the CUDA libraries of PyTorch's CUDA build: nothing needs adding to `PATH`, and the copy of cuDNN that Whisper's library brings no longer breaks PyTorch's.
 
 ## Use
 
@@ -135,13 +137,13 @@ $ vbr scan movie.mkv --context --review-srt
 
   Phrases with an innocent sense too ("hook up the printer") only make a line *possibly* sexual on their own.
 - **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
-- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU with about 8 GB of memory. On a CPU it takes 20–35 s per question, so without a GPU vbr skips it. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless, and an ambiguous word such as "hell" is never replaced, only muted.
+- **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU with at least 9 GB of memory: its weights alone take 7.5 GB. vbr checks, and on a smaller GPU it runs without a judge and says why. On a CPU the judge takes 20–35 s per question, so without a GPU vbr skips it too. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless, and an ambiguous word such as "hell" is never replaced, only muted.
 - **A judge online.** Without a big enough GPU, `context.judge = "api"` asks a service instead, set in `[context.api]`:
   - `provider = "gemini"` (the default): Google's Gemini API, `gemini-3.5-flash-lite`. Its free tier needs only a key from Google AI Studio; Google may use what is sent on the free tier to improve its products. The free tier limits requests per minute; vbr waits as long as Gemini asks.
   - `provider = "jev"`: Jev's decision API, which answers each question as choices with probabilities. A use it is less than 70 % sure of stays unsure.
   - `provider = "openai"`: any OpenAI-compatible chat API, such as OpenRouter or a local Ollama server, with its `url` and `model`.
 
-  The key comes from `VBR_JUDGE_API_KEY` by default. A question the service can't answer leaves the word unsure, so it is muted; a key it rejects stops the run.
+  The key comes from `VBR_JUDGE_API_KEY` by default. A question the service can't answer leaves the word unsure, so it is muted, and after three such questions in a row the service isn't asked again in that run. A key it rejects stops the run.
 
   ```console
   $ export VBR_JUDGE_API_KEY=...          # e.g. from https://aistudio.google.com/apikey
@@ -185,7 +187,7 @@ $ export OPENSUBTITLES_USERNAME=... OPENSUBTITLES_PASSWORD=...   # optional: a l
 $ vbr doctor                                                     # checks that the key is accepted
 ```
 
-- **What is sent.** The file's OpenSubtitles hash (computed from 128 KiB of the file) and its size, then, if nothing matches the hash, the title and year or the season and episode from the file name. `vbr subs` shows exactly what it sends. `--offline` sends nothing.
+- **What is sent.** The file's OpenSubtitles hash (computed from 128 KiB of the file) and its size. If nothing matches the hash, an IMDb id from a Kodi-style `.nfo` file next to the video, and if that finds nothing, the title and year or the season and episode from the file name. For an episode named without its show (`S01E02 - Pilot.mkv`), the show comes from its `.nfo` file or from a library's folders (`Show/Season 01/`); otherwise no title is sent. `vbr subs` shows exactly what it sends. `--offline` sends nothing.
 - **Quota.** Searches are free; each download counts against a daily quota (5 without logging in). Only the subtitles that are actually tried are downloaded, and when the quota runs out the run falls back to transcribing everything. The report says when the quota renews.
 - **Cache.** Downloaded subtitles are kept in your cache folder, so a file never costs quota twice, and they are reused even offline or without a key. `vbr cache clear --subtitles` deletes them.
 

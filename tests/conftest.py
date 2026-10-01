@@ -1,4 +1,5 @@
 import os
+import tempfile
 
 import pytest
 
@@ -11,6 +12,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason="ffmpeg/ffprobe not on PATH"))
         if "asr" in item.keywords and os.environ.get("VBR_RUN_ASR_TESTS") != "1":
             item.add_marker(pytest.mark.skip(reason="set VBR_RUN_ASR_TESTS=1 to run Whisper tests"))
+        if "models" in item.keywords and os.environ.get("VBR_RUN_MODEL_TESTS") != "1":
+            item.add_marker(pytest.mark.skip(reason="set VBR_RUN_MODEL_TESTS=1 to run the real models"))
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +33,13 @@ def _isolated_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pyte
         "VBR_JUDGE_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _own_temp_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Temporary folders go to one of the test's own: one a test leaves behind stays out of the system's
+    temp dir, and the sweep of stale ones (pipeline.remove_stale_workdirs) sees only the test's."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path_factory.mktemp("temp")))
 
 
 @pytest.fixture(autouse=True)

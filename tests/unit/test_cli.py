@@ -202,6 +202,14 @@ def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.Monke
     details = context_status(_config(tmp_path, **{"context.enabled": True}))[2]
     assert "no judge (no GPU)" in details and "PyTorch cannot use the GPU that Whisper uses" in details
 
+    # A GPU too small for the default judge.
+    laptop = SimpleNamespace(
+        is_available=lambda: True, get_device_properties=lambda index: SimpleNamespace(total_memory=6 << 30)
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=laptop))
+    details = context_status(_config(tmp_path, **{"context.enabled": True}))[2]
+    assert "no judge (the GPU has 6 GB; the default judge needs about 9)" in details
+
 
 def test_cache_info_and_clear(tmp_path: Path) -> None:
     config = tmp_path / "vbr.toml"

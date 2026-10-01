@@ -23,7 +23,7 @@ import httpx
 
 from video_beep_remover.config.schema import ContextApiConfig
 from video_beep_remover.context.analyse import EMOTIONS
-from video_beep_remover.context.models import SYSTEM, JudgeError, Question
+from video_beep_remover.context.models import SYSTEM, JudgeError, JudgeSkipped, Question
 from video_beep_remover.errors import DependencyError
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ PROVIDERS = {
     "openai": ("", ""),
 }
 ATTEMPTS = 4  # for rate limits (429), server errors and network errors
+MAX_FAILURES = 3  # questions in a row the service could not answer, after which it is asked nothing more
 MAX_WAIT_S = 60.0
 CHAT_TOKENS = 512  # the JSON answer is short; the rest is room for a model that thinks first
 MIN_PROBABILITY = 0.7  # Jev: a use it is less sure of than this is left unsure, which mutes it
@@ -117,6 +118,7 @@ class _Service:
     ) -> None:
         self.url, self.model = endpoint(api)
         self.host = httpx.URL(self.url).host
+        self.failures = 0  # questions in a row it could not answer
         self._sleep = sleep
         self._http = httpx.Client(
             headers={"Authorization": f"Bearer {api.api_key}", "Content-Type": "application/json"},
@@ -125,8 +127,29 @@ class _Service:
         )
 
     def post(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
-        for attempt in range(ATTEMPTS):
-            last = attempt + 1 == ATTEMPTS
+        """The service's answer to one question. A service that is down would cost minutes of retries per
+        question, so after a question it could not answer, the next ones get one attempt each, and
+        after MAX_FAILURES in a row it is asked nothing more."""
+        if self.failures >= MAX_FAILURES:
+            raise JudgeSkipped(f"{self.host} is not asked: it could not answer {self.failures} in a row")
+        try:
+            data = self._post(url, body, 1 if self.failures else ATTEMPTS)
+        except JudgeError:
+            self.failures += 1
+            if self.failures == MAX_FAILURES:
+                log.warning(
+                    "the context judge at %s could not answer %d questions in a row; it is asked nothing "
+                    "more, so the uses still to judge stay unsure (muted)",
+                    self.host,
+                    MAX_FAILURES,
+                )
+            raise
+        self.failures = 0
+        return data
+
+    def _post(self, url: str, body: dict[str, Any], attempts: int) -> dict[str, Any]:
+        for attempt in range(attempts):
+            last = attempt + 1 == attempts
             wait = min(MAX_WAIT_S, 5.0 * 2**attempt)
             try:
                 response = self._http.post(url, json=body)
@@ -138,7 +161,8 @@ class _Service:
             except httpx.HTTPError as exc:
                 raise JudgeError(f"request to {self.host} failed: {exc}") from exc
             status = response.status_code
-            if status in (401, 403):
+            # Gemini answers a key it does not know with a 400.
+            if status in (401, 403) or (status == 400 and "API_KEY_INVALID" in response.text):
                 raise DependencyError(
                     f"{self.host} rejected the API key (context.api.api_key): {_message(response)}"
                 )
@@ -187,10 +211,15 @@ class ChatJudge:
             body["reasoning_effort"] = self.effort
         data = self.service.post(f"{self.service.url}/chat/completions", body)
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise JudgeError(f"no answer in the response from {self.service.host}") from exc
-        return content.strip() if isinstance(content, str) else ""
+        if not isinstance(content, str) or not content.strip():
+            # E.g. a model that thought until it ran out of tokens: not an answer to keep in the cache.
+            reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+            raise JudgeError(f"an empty answer from {self.service.host}" + (f" ({reason})" if reason else ""))
+        return content.strip()
 
 
 class JevJudge:

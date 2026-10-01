@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 INSTALL = 'pip install "video-beep-remover[context]"'
 LABELS = ("toxicity", "obscene", "insult", "sexual_explicit")
 DEFAULT_JUDGE = "Qwen/Qwen3-4B-Instruct-2507"
+JUDGE_GPU_GB = 9.0  # its weights take 7.5 GB (4 billion parameters in bfloat16), plus room to run
 BATCH = 32
 MAX_TOKENS = 128  # a subtitle line is far shorter
 ANSWER_TOKENS = 64
@@ -46,6 +47,18 @@ def torch_device(setting: str) -> str:
     except ImportError:
         return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def gpu_memory_gb() -> float | None:
+    """The memory of the GPU PyTorch uses, in GiB; None without one (or without PyTorch)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return float(torch.cuda.get_device_properties(0).total_memory) / 1024**3
+    except Exception:  # no PyTorch, or a driver it cannot use
+        return None
 
 
 def _libraries() -> tuple[Any, Any]:
@@ -139,6 +152,10 @@ class JudgeError(VbrError):
     unanswered, which leaves the use unsure: it is muted."""
 
 
+class JudgeSkipped(JudgeError):
+    """The judge was not asked at all: its service could not answer several questions in a row."""
+
+
 class Judge(Protocol):
     name: str
 
@@ -164,10 +181,11 @@ class LocalJudge:
         self.device = device
         try:
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(name, local_files_only=offline)
+            # Straight to the device: built in system memory first, the default judge takes 7.5 GB of it.
             model = transformers.AutoModelForCausalLM.from_pretrained(
-                name, dtype=torch.bfloat16, local_files_only=offline
+                name, dtype=torch.bfloat16, local_files_only=offline, device_map=device
             )
-            self.model = model.to(device).eval()
+            self.model = model.eval()
         except Exception as exc:  # a failed download, or out of GPU memory
             raise _load_failure("judge model", name, offline, exc) from exc
 
@@ -192,13 +210,15 @@ class LocalJudge:
 
 class CachedJudge:
     """A judge whose answers are kept on disk, by model, question version and question, so re-running
-    a file asks nothing twice. Counts the questions actually asked and the time they took."""
+    a file asks nothing twice. Counts the questions actually asked, the time they took, and those left
+    unanswered."""
 
     def __init__(self, judge: Judge, folder: Path | None, version: int) -> None:
         self.judge = judge
         self.name = judge.name
         self.asked = 0
         self.seconds = 0.0
+        self.unanswered = 0
         self.path = None
         self.answers: dict[str, str] = {}
         if folder is not None:
@@ -225,7 +245,11 @@ class CachedJudge:
         if key in self.answers:
             return self.answers[key]
         started = time.monotonic()
-        answer = self.judge.ask(question)
+        try:
+            answer = self.judge.ask(question)
+        except JudgeError:
+            self.unanswered += 1
+            raise
         self.seconds += time.monotonic() - started
         self.asked += 1
         self.answers[key] = answer

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:  # a branch without a pull request: Actions > CI > Run workflow
 
 permissions:
   contents: read
@@ -31,9 +32,10 @@ jobs:
         os: [ubuntu-latest]
         python: ["3.11", "3.12", "3.13"]
         include:
-          # No FFmpeg on these runners: the ffmpeg-marked tests skip themselves.
+          # No FFmpeg on macOS: the ffmpeg-marked tests skip themselves there.
           - os: macos-latest
             python: "3.12"
+          # Windows gets the latest FFmpeg release; Linux gets the distribution's older one.
           - os: windows-latest
             python: "3.12"
     runs-on: ${{ matrix.os }}
@@ -46,6 +48,12 @@ jobs:
       - name: Install FFmpeg
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install FFmpeg
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+      - name: FFmpeg version
+        if: runner.os != 'macOS'
+        run: ffmpeg -version
       - run: pip install -e ".[dev]"
       - run: pytest -q
 

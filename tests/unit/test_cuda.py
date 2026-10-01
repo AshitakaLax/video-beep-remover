@@ -47,7 +47,7 @@ def test_pip_installed_cuda_libraries_are_loaded_by_path(wheels: list[str]) -> N
     assert cuda.load_pip_libraries() == 4 and len(wheels) == 4  # once per process
 
 
-def test_nothing_is_loaded_without_the_gpu_extra_or_off_linux(
+def test_nothing_is_loaded_without_the_gpu_extra_or_pytorchs_cuda_build(
     wheels: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cuda.importlib.util, "find_spec", lambda name: None)
@@ -60,6 +60,27 @@ def test_nothing_is_loaded_without_the_gpu_extra_or_off_linux(
     monkeypatch.setattr(cuda.importlib.util, "find_spec", missing)
     assert cuda.load_pip_libraries() == 0
     cuda.load_pip_libraries.cache_clear()
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "win32")  # and no PyTorch
+    assert cuda.load_pip_libraries() == 0
+    cuda.load_pip_libraries.cache_clear()
+    monkeypatch.setattr(sys, "platform", "darwin")
     assert cuda.load_pip_libraries() == 0
     assert wheels == []
+
+
+def test_on_windows_pytorchs_cuda_libraries_are_loaded(
+    wheels: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ctranslate2 finds no cuBLAS on Windows, and the cuDNN it loads on import breaks PyTorch's."""
+    lib = tmp_path / "torch" / "lib"
+    lib.mkdir(parents=True)
+    for name in (*cuda.TORCH_LIBRARIES, "torch_cpu.dll"):
+        (lib / name).write_bytes(b"")
+    torch = SimpleNamespace(submodule_search_locations=[str(tmp_path / "torch")])
+    monkeypatch.setattr(cuda.importlib.util, "find_spec", lambda name: torch if name == "torch" else None)
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert cuda.load_pip_libraries() == 4
+    assert wheels == ["cudart64_12.dll", "cublasLt64_12.dll", "cublas64_12.dll", "cudnn64_9.dll"]
+    cuda.load_pip_libraries.cache_clear()
+    (lib / "cudnn64_9.dll").unlink()  # PyTorch's CPU build has none of them
+    assert cuda.load_pip_libraries() == 0

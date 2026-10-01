@@ -25,6 +25,7 @@ pip install -e ".[dev]"            # and FFmpeg 5.1+ (ffmpeg and ffprobe) on the
 pytest -q                          # about 430 tests in 1–1.5 min; FFmpeg tests skip themselves without it
 pytest -q tests/unit               # about 340 tests in seconds, no FFmpeg needed
 VBR_RUN_ASR_TESTS=1 pytest -m asr  # real Whisper on synthesized speech (downloads a model, needs espeak-ng)
+VBR_RUN_MODEL_TESTS=1 pytest -m models  # the real context and voice models (the extras; a GPU helps)
 ruff check . && ruff format --check . && python -m mypy
 ```
 
@@ -107,6 +108,9 @@ docs/DESIGN.md       §3 CLI, §4 config, §5 architecture, §6 stages, §13 pla
   both.
 - Text read from a file keeps its `\r\n`. Write it back with `newline=""`, or Windows doubles each one.
 - Tests must not depend on what is installed, since CI has none of the extras. `conftest.py` turns
-  ffsubsync off and clears the API keys; the extras' modules are replaced in `sys.modules`, as in
-  `test_voice.py`.
+  ffsubsync off, clears the API keys and gives each test its own temp dir; the extras' modules are
+  replaced in `sys.modules`, as in `test_voice.py`. Only the opt-in model tests load the real models.
+- On Windows, `asr/cuda.py`'s `load_pip_libraries()` must run before anything imports ctranslate2,
+  faster_whisper's VAD included: the Pipeline calls it first. Otherwise ctranslate2 loads its own cuDNN,
+  and a PyTorch model that then uses cuDNN aborts the process.
 - The first run after a restart reads the models from a cold disk, so don't take its timings.

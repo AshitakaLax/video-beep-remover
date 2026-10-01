@@ -1,3 +1,6 @@
+import os
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -8,6 +11,7 @@ from video_beep_remover.config.schema import Category, LexiconConfig, Transcript
 from video_beep_remover.detect.lexicon import compile_lexicon
 from video_beep_remover.errors import ConfigError
 from video_beep_remover.outputs import resolve_output
+from video_beep_remover.pipeline import KEEP_MARKER, STALE_AFTER_S, remove_stale_workdirs
 
 MOVIE = Path("/videos/The Movie (2019).mkv")
 
@@ -81,3 +85,20 @@ def test_anchor_model_is_small_and_matches_the_language() -> None:
     assert resolve_anchor_model(cpu, language="en").describe() == "base.en (cpu, int8)"
     assert resolve_anchor_model(cpu, language="de").name == "base"
     assert not resolve_anchor_model(TranscriptionConfig(device="cuda"), language="en").batched
+
+
+def test_temporary_folders_that_dead_runs_left_are_swept() -> None:
+    """A run that is killed, or runs out of memory, cleans up nothing."""
+    temp = Path(tempfile.gettempdir())  # the test's own (conftest.py)
+    folders = {name: temp / name for name in ("vbr-old", "vbr-busy", "vbr-kept", "other-old")}
+    for folder in folders.values():
+        folder.mkdir()
+        (folder / "audio.f32").write_bytes(b"\0" * 64)
+    (folders["vbr-kept"] / KEEP_MARKER).touch()  # --keep-temp
+    long_ago = time.time() - STALE_AFTER_S - 60
+    for folder in folders.values():
+        for path in (folder, *folder.iterdir()):
+            os.utime(path, (long_ago, long_ago))
+    os.utime(folders["vbr-busy"] / "audio.f32")  # still being written
+    assert remove_stale_workdirs() == 1
+    assert sorted(p.name for p in temp.iterdir()) == ["other-old", "vbr-busy", "vbr-kept"]

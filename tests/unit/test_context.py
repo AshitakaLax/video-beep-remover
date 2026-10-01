@@ -30,6 +30,7 @@ from video_beep_remover.context.models import (
     Question,
     ToxicityClassifier,
     _libraries,
+    gpu_memory_gb,
     torch_device,
 )
 from video_beep_remover.context.rules import Phrases, delivery, intensity, sexual_sounds
@@ -333,11 +334,40 @@ def test_answers_keep_only_known_fields() -> None:
     assert parse_answer("no json at all") == {}
 
 
-def test_the_judge_runs_by_default_only_on_a_gpu() -> None:
+def test_the_judge_runs_by_default_only_on_a_gpu_with_room_for_it() -> None:
     assert judge_model("auto", "cuda") == DEFAULT_JUDGE
     assert judge_model("auto", "cpu") is None
     assert judge_model("", "cuda") is None
     assert judge_model("someone/model", "cpu") == "someone/model"
+    assert judge_model("auto", "cuda", gpu_gb=12.0) == DEFAULT_JUDGE
+    assert judge_model("auto", "cuda", gpu_gb=6.0) is None  # a laptop GPU: the model alone takes 7.5 GB
+    assert judge_model("someone/model", "cuda", gpu_gb=6.0) == "someone/model"  # named: tried anyway
+
+
+def test_the_gpu_memory_is_what_pytorch_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    gpu = SimpleNamespace(
+        is_available=lambda: True, get_device_properties=lambda index: SimpleNamespace(total_memory=6 << 30)
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=gpu))
+    assert gpu_memory_gb() == 6.0
+    gpu.is_available = lambda: False
+    assert gpu_memory_gb() is None
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert gpu_memory_gb() is None
+
+
+def test_a_gpu_too_small_for_the_judge_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("video_beep_remover.context.gpu_memory_gb", lambda: 6.0)
+    layer = ContextLayer(
+        load_config(None, env={}, cwd=tmp_path).config,
+        device="cuda",
+        cache_dir=None,
+        classifier_factory=lambda name, device: Classifier(),
+        judge_factory=lambda name, device: pytest.fail("the judge does not fit"),
+    )
+    _, section = layer.run([detection("hell", 1.2, 1)], [Line(1.0, 2.0, "Go to hell.", cue=1)])
+    assert section["judge"] is None
+    assert section["judge_off"].startswith('the GPU has 6 GB: context.judge = "auto" needs about 9 GB')
 
 
 def test_the_models_run_where_pytorch_can_run_them(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -462,13 +492,15 @@ def test_without_the_extra_the_classifier_says_how_to_install_it(monkeypatch: py
 
 
 def test_a_judge_that_does_not_fit_says_how_to_go_without(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Model:
-        def to(self, device: str) -> Any:
-            raise RuntimeError("CUDA out of memory")
+    loaded: dict[str, Any] = {}
+
+    def from_pretrained(name: str, **options: Any) -> Any:
+        loaded.update(options)
+        raise RuntimeError("CUDA out of memory")
 
     transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=lambda name, **options: object()),
-        AutoModelForCausalLM=SimpleNamespace(from_pretrained=lambda name, **options: Model()),
+        AutoModelForCausalLM=SimpleNamespace(from_pretrained=from_pretrained),
         logging=SimpleNamespace(set_verbosity_error=lambda: None, disable_progress_bar=lambda: None),
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(bfloat16="bfloat16"))
@@ -477,6 +509,7 @@ def test_a_judge_that_does_not_fit_says_how_to_go_without(monkeypatch: pytest.Mo
         DependencyError, match=r'context\.judge = "" runs without a judge: CUDA out of memory'
     ):
         LocalJudge(DEFAULT_JUDGE, device="cuda", offline=False)
+    assert loaded["device_map"] == "cuda"  # the weights go straight to the GPU, not through system memory
 
 
 def test_models_load_without_a_progress_bar_unless_the_run_is_verbose(

@@ -21,12 +21,14 @@ from video_beep_remover.context.analyse import (
 from video_beep_remover.context.lines import Line, build_lines, word_lines
 from video_beep_remover.context.models import (
     DEFAULT_JUDGE,
+    JUDGE_GPU_GB,
     CachedJudge,
     Classifier,
     Judge,
     LocalJudge,
     ToxicityClassifier,
     check_installed,
+    gpu_memory_gb,
     torch_device,
 )
 from video_beep_remover.models import CensorInterval, Detection, Word
@@ -39,7 +41,9 @@ __all__ = [
     "ModelFactory",
     "build_lines",
     "check_installed",
+    "gpu_memory_gb",
     "judge_model",
+    "judge_off_reason",
     "kept_cues",
     "review_cues",
     "review_labels",
@@ -53,19 +57,40 @@ ModelFactory = Callable[[str, str], Any]  # (model name, device) -> a Classifier
 
 
 def judge_model(
-    setting: str, device: str, api: ContextApiConfig | None = None, *, offline: bool = False
+    setting: str,
+    device: str,
+    api: ContextApiConfig | None = None,
+    *,
+    offline: bool = False,
+    gpu_gb: float | None = None,
 ) -> str | None:
-    """The judge to run: "auto" runs the default one only on a GPU, where it is fast; "api" the service
-    of context.api (DESIGN.md §17.10), except offline."""
+    """The judge to run: "auto" runs the default one only on a GPU, where it is fast, and only if the GPU
+    has room for it (`gpu_gb`, its memory, when known); "api" the service of context.api (DESIGN.md
+    §17.10), except offline."""
     if not setting:
         return None
     if setting == "auto":
-        return DEFAULT_JUDGE if device == "cuda" else None
+        fits = gpu_gb is None or gpu_gb >= JUDGE_GPU_GB
+        return DEFAULT_JUDGE if device == "cuda" and fits else None
     if setting == "api":
         from video_beep_remover.context.api import judge_name
 
         return None if offline else judge_name(api or ContextApiConfig())
     return setting
+
+
+def judge_off_reason(setting: str, device: str, gpu_gb: float | None) -> str:
+    """Why judge_model chose no judge, for the report."""
+    if not setting:
+        return 'turned off (context.judge = "")'
+    if setting == "api":
+        return 'offline: context.judge = "api" needs the network'
+    if device == "cuda" and gpu_gb is not None:
+        return (
+            f'the GPU has {gpu_gb:.0f} GB: context.judge = "auto" needs about {JUDGE_GPU_GB:.0f} GB for '
+            f'{DEFAULT_JUDGE}; "api" asks a service instead'
+        )
+    return 'no GPU: context.judge = "auto" runs the judge only on an NVIDIA GPU'
 
 
 class ContextLayer:
@@ -96,7 +121,11 @@ class ContextLayer:
         self.sexual = settings.sexual
         self.classifier_name = settings.classifier
         self.judge_setting = settings.judge
-        self.judge_name = judge_model(settings.judge, device, settings.api, offline=config.offline)
+        gpu_gb = gpu_memory_gb() if settings.judge == "auto" and device == "cuda" else None
+        self.judge_name = judge_model(
+            settings.judge, device, settings.api, offline=config.offline, gpu_gb=gpu_gb
+        )
+        self.judge_off = None if self.judge_name else judge_off_reason(settings.judge, device, gpu_gb)
         self.cache_dir = cache_dir
         offline = config.offline
         self._classifier_factory = classifier_factory or (
@@ -140,7 +169,7 @@ class ContextLayer:
         """Verdicts and sexual lines, and the report's `context` section. `heard`: the words heard in
         the audio, against which subtitle lines are checked (None: trust every line)."""
         judge = self.judge()
-        asked, seconds = (judge.asked, judge.seconds) if judge else (0, 0.0)
+        asked, seconds, unanswered = (judge.asked, judge.seconds, judge.unanswered) if judge else (0, 0.0, 0)
         result = analyse_context(
             detections,
             lines,
@@ -160,17 +189,12 @@ class ContextLayer:
             "lines": len(lines),
             "verdicts": {use: uses.count(use) for use in ("profane", "harmless", "unsure")},
             "judge_questions": (judge.asked - asked) if judge else 0,
+            "judge_unanswered": (judge.unanswered - unanswered) if judge else 0,
             "judge_seconds": round(judge.seconds - seconds, 1) if judge else 0.0,
             "sexual_lines": [_sexual_dict(s) for s in result.sexual],
         }
-        if self.judge_name is None:
-            if not self.judge_setting:
-                section["judge_off"] = 'turned off (context.judge = "")'
-            elif self.judge_setting == "api":
-                section["judge_off"] = 'offline: context.judge = "api" needs the network'
-            else:
-                section["judge_off"] = 'no GPU: context.judge = "auto" runs the judge only on an NVIDIA GPU'
-
+        if self.judge_off is not None:
+            section["judge_off"] = self.judge_off
         return result, section
 
     def substitutes(

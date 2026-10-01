@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 from video_beep_remover.context import rules
 from video_beep_remover.context.lines import Line, heard_share, line_for, neighbours
-from video_beep_remover.context.models import LABELS, Classifier, Judge, JudgeError, Question
+from video_beep_remover.context.models import LABELS, Classifier, Judge, JudgeError, JudgeSkipped, Question
 from video_beep_remover.models import Detection, Word
 
 log = logging.getLogger(__name__)
@@ -130,7 +130,9 @@ def ask(judge: Judge, question: Question) -> dict[str, Any]:
     try:
         return parse_answer(judge.ask(question))
     except JudgeError as exc:
-        log.warning("the judge did not answer (%s question): %s", question.kind, exc)
+        # A service that stopped being asked said so once (api.py); its skipped questions need no more.
+        level = logging.DEBUG if isinstance(exc, JudgeSkipped) else logging.WARNING
+        log.log(level, "the judge did not answer (%s question): %s", question.kind, exc)
         return {}
 
 

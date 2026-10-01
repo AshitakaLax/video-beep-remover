@@ -1,6 +1,7 @@
 """Judges behind an API (DESIGN.md §17.10) against mocked HTTP (respx)."""
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -116,6 +117,68 @@ def test_a_rejected_key_or_model_stops_the_run(status: int, message: str) -> Non
     respx.post(GEMINI).mock(return_value=httpx.Response(status, json=[{"error": {"message": "no"}}]))
     with pytest.raises(DependencyError, match=f"{message}.*: no$"):
         ask(gemini(), sense())  # not a JudgeError: every question would fail the same way
+
+
+@respx.mock
+def test_a_service_that_keeps_failing_is_asked_less_then_not_at_all(caplog: pytest.LogCaptureFixture) -> None:
+    """A service that is down would otherwise cost minutes of retries for every question."""
+    caplog.set_level(logging.DEBUG)
+    route = respx.post(GEMINI).mock(side_effect=httpx.ConnectError("refused"))
+    judge = CachedJudge(gemini(), None, version=1)
+    questions = [sense_question(LINES, 1, word) for word in ("hell", "damn", "ass", "bitch", "piss")]
+    assert [ask(judge, question) for question in questions] == [{}] * 5  # each use stays unsure
+    assert route.call_count == 4 + 1 + 1  # every retry, then one attempt each, then nothing
+    assert judge.unanswered == 5
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    # One warning per question asked, and one that the service is given up on; skipped questions are quiet.
+    assert len(warnings) == 4 and sum("asked nothing more" in warning for warning in warnings) == 1
+
+
+@respx.mock
+def test_an_answer_brings_the_retries_back() -> None:
+    route = respx.post(GEMINI).mock(
+        side_effect=[
+            *[httpx.ConnectError("down")] * 4,
+            chat('{"sexual": true}'),
+            httpx.ConnectError("blip"),
+            chat("{}"),
+        ]
+    )
+    judge = gemini()
+    question = Question("sexual", "Is it?", ">> Hi")
+    with pytest.raises(JudgeError, match="cannot reach"):
+        judge.ask(question)  # four attempts
+    assert judge.ask(question) == '{"sexual": true}'  # one attempt
+    assert judge.ask(question) == "{}"  # retried again
+    assert route.call_count == 4 + 1 + 2
+
+
+@respx.mock
+def test_gemini_rejecting_the_key_stops_the_run() -> None:
+    """Gemini answers an unknown key with a 400; any other 400 fails only its question."""
+    key = [
+        {"error": {"code": 400, "message": "API key not valid.", "details": [{"reason": "API_KEY_INVALID"}]}}
+    ]
+    route = respx.post(GEMINI).mock(return_value=httpx.Response(400, json=key))
+    with pytest.raises(DependencyError, match=r"rejected the API key.*API key not valid"):
+        ask(gemini(), sense())
+    route.mock(
+        return_value=httpx.Response(400, json={"error": {"message": "Unsupported value: 'temperature'"}})
+    )
+    with pytest.raises(JudgeError, match="HTTP 400: Unsupported value"):
+        gemini().ask(sense())
+
+
+@respx.mock
+def test_an_empty_answer_is_not_kept() -> None:
+    """A model that thinks until it runs out of tokens answers nothing; asked again, it may answer."""
+    empty = httpx.Response(200, json={"choices": [{"message": {"content": None}, "finish_reason": "length"}]})
+    respx.post(GEMINI).mock(side_effect=[empty, chat('{"sexual": true}')])
+    judge = CachedJudge(gemini(), None, version=1)
+    question = Question("sexual", "Is it?", ">> Hi")
+    with pytest.raises(JudgeError, match=r"an empty answer from .* \(length\)"):
+        judge.ask(question)
+    assert judge.answers == {} and judge.ask(question) == '{"sexual": true}'
 
 
 @respx.mock

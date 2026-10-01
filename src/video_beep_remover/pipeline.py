@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ from video_beep_remover import guided as guided_analysis
 from video_beep_remover.asr.base import Clip, Transcriber, build_prompt
 from video_beep_remover.asr.cache import VERSION as TRANSCRIPT_VERSION
 from video_beep_remover.asr.cache import TranscriptCache, TranscriptStore, settings_key
+from video_beep_remover.asr.cuda import load_pip_libraries
 from video_beep_remover.asr.faster_whisper import (
     FasterWhisperTranscriber,
     ModelChoice,
@@ -114,6 +116,42 @@ log = logging.getLogger(__name__)
 
 Status = Literal["cleaned", "copied", "clean", "scanned", "skipped"]
 TranscriberFactory = Callable[[ModelChoice], Transcriber]
+
+WORKDIR_PREFIX = "vbr-"  # each file's temporary folder, in the system's temp dir
+STALE_AFTER_S = 12 * 3600  # a temporary folder untouched this long was left by a run that died
+KEEP_MARKER = ".keep"  # marks a folder kept with --keep-temp, which is never swept
+
+
+def remove_stale_workdirs(now: float | None = None) -> int:
+    """Delete the temporary folders that runs which died (killed, or out of memory) left behind: those
+    where nothing changed for STALE_AFTER_S, except ones kept with --keep-temp. Returns how many went."""
+    now = time.time() if now is None else now
+    removed = 0
+    for folder in Path(tempfile.gettempdir()).glob(f"{WORKDIR_PREFIX}*"):
+        try:
+            if not folder.is_dir() or (folder / KEEP_MARKER).exists():
+                continue
+            changed = max([folder.stat().st_mtime] + [entry.stat().st_mtime for entry in folder.iterdir()])
+        except OSError:
+            continue
+        if now - changed > STALE_AFTER_S:
+            shutil.rmtree(folder, ignore_errors=True)
+            removed += not folder.exists()
+    return removed
+
+
+def _release_frames(error: BaseException) -> None:
+    """Clear the local variables of the frames an error, and every error it chains, went through. They
+    can hold the memory-mapped track, and Windows deletes no file while it is mapped."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [error]
+    while pending:
+        found = pending.pop()
+        if found is None or id(found) in seen:
+            continue
+        seen.add(id(found))
+        traceback.clear_frames(found.__traceback__)
+        pending += [found.__cause__, found.__context__]
 
 
 @dataclass(frozen=True)
@@ -258,6 +296,9 @@ class Pipeline:
         voice_models: tuple[Callable[[], Any], Callable[[], Any], Callable[[], Any]] | None = None,
     ) -> None:
         self.config = loaded.config
+        if self.config.transcription.device != "cpu":
+            # Before anything imports ctranslate2, even the speech detector (asr/cuda.py).
+            load_pip_libraries()
         self.ui: UI = ui or NullUI()
         self.ff = ff or FFmpeg(self.config.tools.ffmpeg, self.config.tools.ffprobe)
         self.lexicon = compile_lexicon(self.config.lexicon, only=categories, base_dir=loaded.base_dir)
@@ -567,7 +608,7 @@ class Pipeline:
             many=many,
             info=info,
             stream=stream,
-            workdir=Path(tempfile.mkdtemp(prefix="vbr-")),
+            workdir=Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX)),
             result=FileResult(source, "scanned"),
             output=placement.output if placement else None,
             started=started,
@@ -577,7 +618,8 @@ class Pipeline:
         job.lap("probe")
         try:
             self._analyse_job(job)
-        except BaseException:
+        except BaseException as error:
+            _release_frames(error)
             self._cleanup(job, self.ui)
             raise
         return job
@@ -893,9 +935,13 @@ class Pipeline:
 
     def _cleanup(self, job: Job, ui: UI) -> None:
         if job.options.keep_temp:
+            with contextlib.suppress(OSError):
+                (job.workdir / KEEP_MARKER).touch()
             ui.info(f"kept temporary files in {job.workdir}")
-        else:
-            shutil.rmtree(job.workdir, ignore_errors=True)
+            return
+        shutil.rmtree(job.workdir, ignore_errors=True)
+        if job.workdir.exists():  # e.g. a file another program holds open: a later run sweeps it
+            log.debug("could not delete the temporary folder %s", job.workdir)
 
     def model_device(self) -> str:
         """Where the context and voice models run (context.models.torch_device), decided once, with a
@@ -1007,6 +1053,11 @@ class Pipeline:
             )
             + "".join(f" · {action}" for action in actions)
             + ("" if layer.judge_name else " · no judge: " + section.get("judge_off", "off"))
+            + (
+                f" · {section['judge_unanswered']} judge questions unanswered"
+                if section["judge_unanswered"]
+                else ""
+            )
         )
         job.lap("context")
         return to_mute, result
@@ -1200,7 +1251,7 @@ class Pipeline:
             many=many,
             info=info,
             stream=stream,
-            workdir=Path(tempfile.mkdtemp(prefix="vbr-")),
+            workdir=Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX)),
             result=FileResult(
                 source, "scanned", detections=len(detections), intervals=len(intervals), strategy="report"
             ),

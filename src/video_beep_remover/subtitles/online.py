@@ -2,9 +2,10 @@
 
 Subtitles downloaded for this video before are offered first, from the cache, even offline or
 without an API key. Online, the movie hash is searched first; subtitles that match it were timed
-against this exact file, so they are trusted. Only when nothing matches the hash is the title
-(or an IMDb id from a .nfo file) searched. Each download counts against the user's daily quota, so
-only the candidates that are actually tried are downloaded, and every download is cached."""
+against this exact file, so they are trusted. Only when nothing matches the hash is an IMDb id from a
+.nfo file searched, and the title only when that finds nothing. Each download counts against the
+user's daily quota, so only the candidates that are actually tried are downloaded, and every download
+is cached."""
 
 import math
 from pathlib import Path
@@ -15,7 +16,13 @@ from video_beep_remover.errors import SubtitleError
 from video_beep_remover.media.probe import MediaInfo
 from video_beep_remover.subtitles.acquire import SubtitleCandidate
 from video_beep_remover.subtitles.cache import CachedSubtitle, SubtitleCache
-from video_beep_remover.subtitles.names import guess, imdb_id_from_nfo, release_similarity
+from video_beep_remover.subtitles.names import (
+    episode_nfo,
+    guess,
+    guess_video,
+    imdb_id_from_nfo,
+    release_similarity,
+)
 from video_beep_remover.subtitles.opensubtitles import (
     OnlineSubtitle,
     OpenSubtitlesClient,
@@ -42,19 +49,24 @@ class OnlineSubtitles:
         self.cache = cache
         self.movie_hash = opensubtitles_hash(info.path)
         self.fingerprint = f"{self.movie_hash}-{info.path.stat().st_size}" if self.movie_hash else None
-        self.video = guess(info.path.name)
+        self.video = guess_video(info.path)
+        if self.video.kind == "episode":
+            nfo = episode_nfo(info.path)
+            self.imdb_id = nfo.imdb_id if nfo else None
+        else:
+            self.imdb_id = imdb_id_from_nfo(info.path)
         self.quota: QuotaExceeded | None = None
         self.report: dict[str, Any] = {"movie_hash": self.movie_hash, "searches": [], "downloads": 0}
 
     def planned_searches(self) -> list[dict[str, Any]]:
-        """What would be sent: the movie hash, then the title (DESIGN.md §10)."""
+        """What may be sent, in order: the movie hash, the IMDb id from a .nfo file, the title (DESIGN.md
+        §10). Each runs only if the ones before found nothing usable (find)."""
         searches: list[dict[str, Any]] = []
         if self.movie_hash:
             searches.append({"moviehash": self.movie_hash})
-        imdb_id = imdb_id_from_nfo(self.info.path) if self.video.kind == "movie" else None
-        if imdb_id is not None:
-            searches.append({"imdb_id": imdb_id})
-        elif self.video.title:
+        if self.imdb_id is not None:
+            searches.append({"imdb_id": self.imdb_id})
+        if self.video.title:
             by_title: dict[str, Any] = {"query": self.video.title}
             if (
                 self.video.kind == "episode"
@@ -101,6 +113,7 @@ class OnlineSubtitles:
         )
         notes: list[str] = []
         found: dict[int, OnlineSubtitle] = {}
+        exclude = self.settings.exclude_machine_translated
         if self.offline:
             notes.append(f"OpenSubtitles: offline; {len(known)} subtitles cached for this file")
         elif self.client is None:
@@ -109,19 +122,23 @@ class OnlineSubtitles:
                 + (f"; {len(known)} subtitles cached for this file" if known else "")
             )
         elif not (searches := self.planned_searches()):
-            notes.append("OpenSubtitles: nothing to search by (no movie hash, and no title in the file name)")
+            notes.append("OpenSubtitles: nothing to search by (no movie hash, no IMDb id and no title)")
         else:
+            by_id = False  # the IMDb id found something usable
             try:
                 for params in searches:
                     if "moviehash" not in params and any(r.moviehash_match for r in found.values()):
                         break  # subtitles timed for this very file beat anything a title search finds
+                    if "query" in params and by_id:
+                        break  # the title could only add guesses
                     results = self.client.search(languages=self.languages, **params)
                     self.report["searches"].append(params | {"results": len(results)})
+                    usable = [r for r in results if not (exclude and r.machine_translated)]
+                    by_id = by_id or ("imdb_id" in params and bool(usable))
                     for result in results:
                         found.setdefault(result.file_id, result)
             except OpenSubtitlesError as exc:
                 notes.append(f"OpenSubtitles: {exc}")
-        exclude = self.settings.exclude_machine_translated
         candidates = [
             self._candidate(result, cached=self.cache.path(file_id) is not None)
             for file_id, result in found.items()
