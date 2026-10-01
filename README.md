@@ -139,15 +139,23 @@ $ vbr scan movie.mkv --context --review-srt
 - **The `sexual` category** of phrases is off by default. Turn it on (`[lexicon.categories.sexual] enabled = true`) to mute its phrases like any listed word.
 - **GPU or CPU.** The classifier (about 500 MB) is fast on a CPU. The judge (Qwen3-4B-Instruct by default) runs by default only on an NVIDIA GPU with at least 9 GB of memory: its weights alone take 7.5 GB. vbr checks, and on a smaller GPU it runs without a judge and says why. On a CPU the judge takes 20–35 s per question, so without a GPU vbr skips it too. Set `context.judge` to a model name to run one anyway, or to `""` to never run one. Without a judge, nothing is called harmless, and an ambiguous word such as "hell" is never replaced, only muted.
 - **A judge online.** Without a big enough GPU, `context.judge = "api"` asks a service instead, set in `[context.api]`:
-  - `provider = "gemini"` (the default): Google's Gemini API, `gemini-3.5-flash-lite`. Its free tier needs only a key from Google AI Studio; Google may use what is sent on the free tier to improve its products. The free tier limits requests per minute; vbr waits as long as Gemini asks.
+  - `provider = "gemini"` (the default): Google's Gemini API, `gemini-3.5-flash-lite`. Its free tier needs only a key from Google AI Studio; Google may use what is sent on the free tier to improve its products. The free tier limits each model's requests per minute and per day separately, so `fallback_models` can list more of the models your key may use, in order of preference. While one is rate-limited or overloaded, the next answers; one whose daily quota is spent is skipped for the rest of the run. vbr waits as long as Gemini asks only when every model is busy, and the report counts each model's answers (`judge_models`).
   - `provider = "jev"`: Jev's decision API, which answers each question as choices with probabilities. A use it is less than 70 % sure of stays unsure.
   - `provider = "openai"`: any OpenAI-compatible chat API, such as OpenRouter or a local Ollama server, with its `url` and `model`.
 
   The key comes from `VBR_JUDGE_API_KEY` by default. A question the service can't answer leaves the word unsure, so it is muted, and after three such questions in a row the service isn't asked again in that run. A key it rejects stops the run.
 
+  ```toml
+  [context]
+  judge = "api"
+
+  [context.api]
+  fallback_models = ["gemini-3.8-flash"]  # asked while gemini-3.5-flash-lite is busy
+  ```
+
   ```console
   $ export VBR_JUDGE_API_KEY=...          # e.g. from https://aistudio.google.com/apikey
-  $ vbr clean movie.mkv --replace --review-srt   # with judge = "api" in [context]
+  $ vbr clean movie.mkv --replace --review-srt
   ```
 - **Privacy.** The models run locally, and download once. With `context.judge = "api"`, each line the judge is asked about is sent to the service with its neighbouring lines; no audio and no file names. `--offline` turns that off.
 - **Acting on the verdicts (experimental).** Two settings in `[context]` change what is muted:

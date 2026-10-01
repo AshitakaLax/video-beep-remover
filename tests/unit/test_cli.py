@@ -194,6 +194,11 @@ def test_doctor_shows_context_analysis(tmp_path: Path, monkeypatch: pytest.Monke
     downloaded.update({"unitary/unbiased-toxic-roberta", "Qwen/Qwen3-4B-Instruct-2507"})
     ok, details = context_status(_config(tmp_path, **judged))[1:]
     assert ok is True and "not downloaded" not in details
+    online = {**on, "context.judge": "api", "context.api.api_key": "k", "context.api.fallback_models": ["x"]}
+    assert (
+        "judge gemini:gemini-3.5-flash-lite and 1 fallback model (online"
+        in context_status(_config(tmp_path, **online))[2]
+    )
 
     # Whisper sees a GPU that a CPU-only build of PyTorch cannot use.
     cpu_only = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))

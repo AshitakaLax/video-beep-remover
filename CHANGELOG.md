@@ -52,6 +52,7 @@ The first release: the complete v1 of [the design](https://github.com/AshitakaLa
 - A `sexual` word category of phrases of a sexual nature, off by default.
 - `scripts/evaluate_context.py`, a labelled set of 71 lines and a set of crafted lines, to measure the context layer.
 - `context.judge = "api"` asks a service online instead of a local judge (`[context.api]`): Google's Gemini API (`gemini-3.5-flash-lite`, which has a free tier), Jev's decision API, or any OpenAI-compatible chat API. Only the lines asked about are sent; `--offline` turns it off. An unanswered question mutes the word, and a service that fails three questions in a row isn't asked again in that run.
+- `context.api.fallback_models` lists more models of the same service, as Gemini's free tier limits each one separately: while one is rate-limited or overloaded, the next answers, and one out of its daily quota is skipped for the run.
 - The context and voice models run on the GPU only when PyTorch can use it. With a CPU-only build of PyTorch they run on the CPU, and vbr says so.
 - `context.judge = "auto"` runs the judge only on a GPU with room for it, about 9 GB; on a smaller one the report says why there is none. The judge loads straight onto the GPU, not through system memory.
 

@@ -16,8 +16,9 @@ from video_beep_remover.context import ContextLayer, judge_model
 from video_beep_remover.context.analyse import REASONS, ask, sense_question
 from video_beep_remover.context.api import _REASON_TEXT, api_judge
 from video_beep_remover.context.lines import Line
-from video_beep_remover.context.models import CachedJudge, JudgeError, Question
+from video_beep_remover.context.models import LABELS, CachedJudge, JudgeError, Question
 from video_beep_remover.errors import ConfigError, DependencyError
+from video_beep_remover.models import Detection
 
 GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 JEV = "https://thejevai.com/v1/systemone"
@@ -34,6 +35,21 @@ def jev() -> Any:
 
 def chat(content: str) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": content}}]})
+
+
+class Clock:
+    """Time that passes only when the code under test sleeps, or when the test says so."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.waits: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        self.now += seconds
 
 
 def sense() -> Question:
@@ -81,7 +97,6 @@ def test_any_openai_compatible_service_can_judge() -> None:
 
 @respx.mock
 def test_rate_limits_and_server_errors_are_retried() -> None:
-    waits: list[float] = []
     # Gemini says how long to wait in the body of a 429, inside a list.
     quota = [{"error": {"code": 429, "message": "quota", "details": [{"retryDelay": "45s"}]}}]
     route = respx.post(GEMINI).mock(
@@ -92,9 +107,138 @@ def test_rate_limits_and_server_errors_are_retried() -> None:
             chat('{"sexual": true}'),
         ]
     )
-    judge = api_judge(ContextApiConfig(api_key="secret"), sleep=waits.append)
+    clock = Clock()
+    judge = api_judge(ContextApiConfig(api_key="secret"), sleep=clock.sleep, clock=clock)
     assert judge.ask(Question("sexual", "Is it?", ">> Hi")) == '{"sexual": true}'
-    assert (route.call_count, waits) == (4, [45.0, 2.0, 20.0])
+    assert (route.call_count, clock.waits) == (4, [45.0, 2.0, 20.0])
+
+
+LITE, FLASH = "gemini-3.5-flash-lite", "gemini-3.8-flash"
+QUESTION = Question("sexual", "Is it?", ">> Hi")
+
+
+def busy(model: str, seconds: int, *, per: str = "Minute") -> httpx.Response:
+    """Gemini's 429 for a model whose free quota for the minute (or the day) is used up."""
+    error = {
+        "code": 429,
+        "message": f"You exceeded your current quota. Quota exceeded for metric: ..., model: {model}",
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [{"quotaId": f"GenerateRequestsPer{per}PerProjectPerModel-FreeTier"}],
+            },
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": f"{seconds}s"},
+        ],
+    }
+    return httpx.Response(429, json=[{"error": error}])
+
+
+def models(replies: dict[str, list[httpx.Response]]) -> list[str]:
+    """Gemini, each model giving its own replies in turn. Returns the models asked, in order."""
+    asked: list[str] = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        asked.append(model)
+        return replies[model].pop(0)
+
+    respx.post(GEMINI).mock(side_effect=reply)
+    return asked
+
+
+def rotating(clock: Clock, model: str = LITE, *fallbacks: str) -> Any:
+    api = ContextApiConfig(api_key="secret", model=model, fallback_models=list(fallbacks))
+    return api_judge(api, sleep=clock.sleep, clock=clock)
+
+
+@respx.mock
+def test_a_rate_limited_model_rests_while_the_next_one_answers() -> None:
+    """Gemini's free tier limits each model separately (context.api.fallback_models)."""
+    clock = Clock()
+    asked = models(
+        {
+            LITE: [busy(LITE, 30), chat('{"sexual": true}')],
+            FLASH: [chat('{"sexual": false}'), chat('{"sexual": false}')],
+        }
+    )
+    judge = rotating(clock, LITE, FLASH)
+    assert judge.ask(QUESTION) == '{"sexual": false}'  # the first is busy: the next answers at once
+    assert judge.ask(QUESTION) == '{"sexual": false}'  # the first still rests
+    clock.now += 30
+    assert judge.ask(QUESTION) == '{"sexual": true}'  # its rest is over
+    assert asked == [LITE, FLASH, FLASH, LITE]
+    assert clock.waits == [] and judge.answered == {FLASH: 2, LITE: 1}
+
+
+@respx.mock
+def test_a_model_out_of_its_daily_quota_is_asked_nothing_more(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING)
+    clock = Clock()
+    asked = models({LITE: [busy(LITE, 40, per="Day")], FLASH: [chat("{}"), chat("{}"), chat("{}")]})
+    judge = rotating(clock, LITE, FLASH)
+    judge.ask(QUESTION)
+    clock.now += 3600  # its 40 s are long over, but not the day
+    judge.ask(QUESTION)
+    judge.ask(QUESTION)
+    assert asked == [LITE, FLASH, FLASH, FLASH]
+    assert [record.getMessage() for record in caplog.records] == [
+        f"the context judge asks {LITE} nothing more in this run: it has used up its daily quota"
+    ]
+
+
+@respx.mock
+def test_when_every_model_rests_the_judge_waits_for_the_first_back() -> None:
+    clock = Clock()
+    asked = models({LITE: [busy(LITE, 20)], FLASH: [busy(FLASH, 10), chat('{"sexual": true}')]})
+    assert rotating(clock, LITE, FLASH).ask(QUESTION) == '{"sexual": true}'
+    assert (asked, clock.waits) == ([LITE, FLASH, FLASH], [10.0])
+
+
+@respx.mock
+def test_a_model_not_offered_or_overloaded_hands_over_to_the_next() -> None:
+    clock = Clock()
+    gone = httpx.Response(404, json=[{"error": {"message": "models/gemini-2.5-flash is not found"}}])
+    overloaded = httpx.Response(503, json=[{"error": {"message": "The model is overloaded."}}])
+    asked = models({"gemini-2.5-flash": [gone], LITE: [overloaded, chat("{}")], FLASH: [chat("{}")]})
+    judge = rotating(clock, "gemini-2.5-flash", LITE, FLASH)
+    judge.ask(QUESTION)  # 2.5 is not offered to this key, and Flash-Lite is overloaded: Flash answers
+    clock.now += 10
+    judge.ask(QUESTION)  # Flash-Lite has rested; 2.5 is never asked again
+    assert asked == ["gemini-2.5-flash", LITE, FLASH, LITE]
+
+
+@respx.mock
+def test_each_model_gets_its_own_reasoning_effort() -> None:
+    clock = Clock()
+    route = respx.post(GEMINI).mock(side_effect=[busy("gemini-2.5-flash", 9), busy(FLASH, 9), chat("{}")])
+    rotating(clock, "gemini-2.5-flash", FLASH, "gemma-3-27b-it").ask(QUESTION)
+    sent = [json.loads(call.request.content) for call in route.calls]
+    assert [(body["model"], body.get("reasoning_effort")) for body in sent] == [
+        ("gemini-2.5-flash", "none"),  # can answer without thinking
+        (FLASH, "low"),  # cannot
+        ("gemma-3-27b-it", None),  # takes none
+    ]
+
+
+@respx.mock
+def test_the_report_counts_the_answers_of_each_model() -> None:
+    clock = Clock()
+    models({LITE: [busy(LITE, 30)], FLASH: [chat('{"use": "profane", "reason": "exclamation"}')]})
+    overrides = {"context.judge": "api", "context.api.fallback_models": [FLASH]}
+    config = load_config(None, env={"VBR_JUDGE_API_KEY": "k"}, overrides=overrides).config
+    clean = SimpleNamespace(name="clean", score=lambda texts: [dict.fromkeys(LABELS, 0.0) for _ in texts])
+    layer = ContextLayer(
+        config,
+        device="cpu",
+        cache_dir=None,
+        classifier_factory=lambda *_: clean,
+        judge_factory=lambda name, device: api_judge(config.context.api, sleep=clock.sleep, clock=clock),
+    )
+    hell = Detection(1.2, 1.4, " hell", "hell", "mild", 0.9, "asr", 2)  # ambiguous: the judge is asked
+    _, section = layer.run([hell], LINES)
+    assert (section["judge"], section["judge_questions"]) == ("gemini:gemini-3.5-flash-lite", 1)
+    assert section["judge_models"] == {FLASH: 1}
 
 
 @respx.mock

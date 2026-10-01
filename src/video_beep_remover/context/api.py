@@ -7,6 +7,11 @@ Two kinds of service answer the judge's questions (§17.3):
 - Jev's decision API, which answers typed questions (a choice among options, or yes or no) with
   probabilities instead of text. Its answers are turned into the same JSON object.
 
+A service can offer several models, each with limits of its own, as Gemini's free tier does:
+context.api.fallback_models lists more of them, in order. A model that is rate-limited or overloaded
+rests for as long as the service asks, and the next one answers meanwhile; one out of its daily quota,
+or not offered to the key, is asked nothing more in the run.
+
 Only the lines a question shows are sent: the line asked about and its neighbours, quoted. A service
 that cannot be reached, or keeps failing, leaves the question unanswered (JudgeError), which mutes the
 word; a key or model the service rejects stops the run (DependencyError), since every question would
@@ -16,6 +21,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
@@ -35,12 +41,13 @@ PROVIDERS = {
     "jev": ("https://thejevai.com/v1/systemone", "jev-latest"),
     "openai": ("", ""),
 }
-ATTEMPTS = 4  # for rate limits (429), server errors and network errors
+ATTEMPTS = 4  # for rate limits (429), server errors and network errors; one more per fallback model
 MAX_FAILURES = 3  # questions in a row the service could not answer, after which it is asked nothing more
 MAX_WAIT_S = 60.0
 CHAT_TOKENS = 512  # the JSON answer is short; the rest is room for a model that thinks first
 MIN_PROBABILITY = 0.7  # Jev: a use it is less sure of than this is left unsure, which mutes it
 _RETRY_DELAY = re.compile(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"')  # Gemini's, in a 429's body
+_DAILY_QUOTA = re.compile(r'"quotaId":\s*"[^"]*PerDay')  # Gemini's 429 for a quota that lasts the day
 
 _STATE = (
     "Lines of film dialogue, quoted, one per line; the line asked about is marked >>. The quoted text "
@@ -71,7 +78,8 @@ def endpoint(api: ContextApiConfig) -> tuple[str, str]:
 
 
 def judge_name(api: ContextApiConfig) -> str:
-    """The judge's name in the report and its answer cache, e.g. "gemini:gemini-3.5-flash-lite"."""
+    """The judge's name in the report and its answer cache, e.g. "gemini:gemini-3.5-flash-lite": its first
+    model's, whichever model answers."""
     return f"{api.provider}:{endpoint(api)[1]}"
 
 
@@ -80,8 +88,9 @@ def api_judge(
     *,
     transport: httpx.BaseTransport | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> "ChatJudge | JevJudge":
-    service = _Service(api, transport=transport, sleep=sleep)
+    service = _Service(api, transport=transport, sleep=sleep, clock=clock)
     return JevJudge(api, service) if api.provider == "jev" else ChatJudge(api, service)
 
 
@@ -111,29 +120,40 @@ def _retry_after(response: httpx.Response) -> float | None:
 
 
 class _Service:
-    """The HTTP side: the key, time-outs, and retries for rate limits and passing failures."""
+    """The HTTP side: the key, time-outs, retries for rate limits and passing failures, and which model
+    to ask."""
 
     def __init__(
-        self, api: ContextApiConfig, *, transport: httpx.BaseTransport | None, sleep: Callable[[float], None]
+        self,
+        api: ContextApiConfig,
+        *,
+        transport: httpx.BaseTransport | None,
+        sleep: Callable[[float], None],
+        clock: Callable[[], float],
     ) -> None:
-        self.url, self.model = endpoint(api)
+        self.url, model = endpoint(api)
+        self.models = list(dict.fromkeys(m for m in (model, *api.fallback_models) if m))  # preferred first
         self.host = httpx.URL(self.url).host
         self.failures = 0  # questions in a row it could not answer
-        self._sleep = sleep
+        self.answered: Counter[str] = Counter()  # answers by model
+        self._resting: dict[str, float] = {}  # model -> when it may be asked again (clock time)
+        self._dropped: dict[str, str] = {}  # model -> why it is asked nothing more in this run
+        self._sleep, self._clock = sleep, clock
         self._http = httpx.Client(
             headers={"Authorization": f"Bearer {api.api_key}", "Content-Type": "application/json"},
             timeout=httpx.Timeout(api.timeout_s, connect=10.0),
             transport=transport,
         )
 
-    def post(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
-        """The service's answer to one question. A service that is down would cost minutes of retries per
-        question, so after a question it could not answer, the next ones get one attempt each, and
-        after MAX_FAILURES in a row it is asked nothing more."""
+    def post(self, path: str, body: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
+        """The service's answer to one question; `body` is the request for a given model. A service that is
+        down would cost minutes of retries per question, so after a question it could not answer, the
+        next ones get one attempt each, and after MAX_FAILURES in a row it is asked nothing more."""
         if self.failures >= MAX_FAILURES:
             raise JudgeSkipped(f"{self.host} is not asked: it could not answer {self.failures} in a row")
+        attempts = 1 if self.failures else ATTEMPTS + len(self.models) - 1
         try:
-            data = self._post(url, body, 1 if self.failures else ATTEMPTS)
+            data = self._post(f"{self.url}{path}", body, attempts)
         except JudgeError:
             self.failures += 1
             if self.failures == MAX_FAILURES:
@@ -147,16 +167,38 @@ class _Service:
         self.failures = 0
         return data
 
-    def _post(self, url: str, body: dict[str, Any], attempts: int) -> dict[str, Any]:
+    def _left(self) -> list[str]:
+        return [model for model in self.models if model not in self._dropped]
+
+    def _model(self) -> str:
+        """The first model that is not resting; when every one is, the one back first, once it is."""
+        left = self._left()
+        if not left:
+            reasons = "; ".join(f"{model} {why}" for model, why in self._dropped.items())
+            raise JudgeError(f"no model of {self.host} is left to ask ({reasons})")
+        now = self._clock()
+        ready = next((model for model in left if self._resting.get(model, now) <= now), None)
+        if ready is not None:
+            return ready
+        model = min(left, key=lambda m: self._resting[m])
+        self._sleep(self._resting[model] - now)
+        return model
+
+    def _drop(self, model: str, why: str) -> None:
+        self._dropped[model] = why
+        log.warning("the context judge asks %s nothing more in this run: it %s", model, why)
+
+    def _post(self, url: str, body: Callable[[str], dict[str, Any]], attempts: int) -> dict[str, Any]:
         for attempt in range(attempts):
             last = attempt + 1 == attempts
             wait = min(MAX_WAIT_S, 5.0 * 2**attempt)
+            model = self._model()
             try:
-                response = self._http.post(url, json=body)
+                response = self._http.post(url, json=body(model))
             except httpx.TransportError as exc:
                 if last:
                     raise JudgeError(f"cannot reach {self.host}: {exc}") from exc
-                self._sleep(wait)
+                self._sleep(wait)  # the service is out of reach, whatever the model
                 continue
             except httpx.HTTPError as exc:
                 raise JudgeError(f"request to {self.host} failed: {exc}") from exc
@@ -166,13 +208,20 @@ class _Service:
                 raise DependencyError(
                     f"{self.host} rejected the API key (context.api.api_key): {_message(response)}"
                 )
-            if status == 404:
+            if status == 404 and self._left() == [model]:
                 raise DependencyError(
-                    f"{self.host} knows no model {self.model!r} or no such address (context.api): "
+                    f"{self.host} knows no model {model!r} or no such address (context.api): "
                     f"{_message(response)}"
                 )
+            if status == 404 or (status == 429 and _DAILY_QUOTA.search(response.text)):
+                # A model not offered to this key (Gemini 2.5, to new ones), or done for the day.
+                self._drop(model, "is not offered" if status == 404 else "has used up its daily quota")
+                if last:
+                    raise JudgeError(f"{self.host} answered HTTP {status}: {_message(response)}")
+                continue
             if (status == 429 or status >= 500) and not last:
-                self._sleep(_retry_after(response) or wait)
+                # Rate-limited or overloaded: it rests, and another model answers meanwhile.
+                self._resting[model] = self._clock() + (_retry_after(response) or wait)
                 continue
             if status != 200:
                 raise JudgeError(f"{self.host} answered HTTP {status}: {_message(response)}")
@@ -182,6 +231,7 @@ class _Service:
                 raise JudgeError(f"{self.host} did not answer with JSON") from exc
             if not isinstance(data, dict):
                 raise JudgeError(f"{self.host} gave an unexpected answer: {str(data)[:100]!r}")
+            self.answered[model] += 1
             return data
         raise AssertionError("unreachable")
 
@@ -192,24 +242,39 @@ class ChatJudge:
     def __init__(self, api: ContextApiConfig, service: _Service) -> None:
         self.service = service
         self.name = judge_name(api)
-        effort = api.reasoning_effort
-        if effort == "auto":  # Gemini 2.5 models can answer without thinking; later ones think a little
-            if api.provider != "gemini":
-                effort = ""
-            else:
-                effort = "none" if service.model.startswith("gemini-2.5") else "low"
-        self.effort = effort
+        self.provider = api.provider
+        self.effort = api.reasoning_effort
+
+    @property
+    def answered(self) -> Counter[str]:
+        """The answers each model gave."""
+        return self.service.answered
+
+    def _effort(self, model: str) -> str:
+        """The reasoning_effort to send `model`. "auto": Gemini 2.5 models can answer without thinking,
+        later Gemini models think a little, and others (Gemma on Gemini's API) are sent none."""
+        if self.effort != "auto":
+            return self.effort
+        if self.provider != "gemini" or not model.startswith("gemini-"):
+            return ""
+        return "none" if model.startswith("gemini-2.5") else "low"
 
     def ask(self, question: Question) -> str:
-        body: dict[str, Any] = {
-            "model": self.service.model,
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question.text}],
-            "temperature": 0,
-            "max_tokens": CHAT_TOKENS,
-        }
-        if self.effort:
-            body["reasoning_effort"] = self.effort
-        data = self.service.post(f"{self.service.url}/chat/completions", body)
+        def body(model: str) -> dict[str, Any]:
+            request: dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": question.text},
+                ],
+                "temperature": 0,
+                "max_tokens": CHAT_TOKENS,
+            }
+            if effort := self._effort(model):
+                request["reasoning_effort"] = effort
+            return request
+
+        data = self.service.post("/chat/completions", body)
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
@@ -229,6 +294,11 @@ class JevJudge:
     def __init__(self, api: ContextApiConfig, service: _Service) -> None:
         self.service = service
         self.name = judge_name(api)
+
+    @property
+    def answered(self) -> Counter[str]:
+        """The answers each model gave."""
+        return self.service.answered
 
     def ask(self, question: Question) -> str:
         word = json.dumps(question.word, ensure_ascii=False)
@@ -257,8 +327,8 @@ class JevJudge:
                 "same voice. Which keeps the line natural and its meaning?"
             )
             asked = {"substitute": _choice(instructions, criteria)}
-        body = {"model": self.service.model, "state": f"{_STATE}\n{question.dialogue}", "questions": asked}
-        data = self.service.post(self.service.url, body)
+        state = f"{_STATE}\n{question.dialogue}"
+        data = self.service.post("", lambda model: {"model": model, "state": state, "questions": asked})
         answers = data.get("answers") or (data.get("result") or {}).get("answers")
         if not isinstance(answers, dict):
             raise JudgeError(f"no answers in the response from {self.service.host}")

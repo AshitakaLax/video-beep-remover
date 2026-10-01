@@ -1043,6 +1043,7 @@ class Pipeline:
             actions.append(f"{len(flagged)} sexual lines muted")
         counts = section["verdicts"]
         certain = sum(item["certain"] for item in section["sexual_lines"])
+        models: dict[str, int] = section.get("judge_models") or {}  # a judge behind an API, by model
         self.ui.info(
             f"Context{'' if actions else ' (report only)'}: {counts['profane']} profane, "
             f"{counts['harmless']} probably harmless, {counts['unsure']} unsure · {certain} sexual lines"
@@ -1056,6 +1057,11 @@ class Pipeline:
             + (
                 f" · {section['judge_unanswered']} judge questions unanswered"
                 if section["judge_unanswered"]
+                else ""
+            )
+            + (
+                " · answered by " + ", ".join(f"{model} ({count})" for model, count in models.items())
+                if len(models) > 1
                 else ""
             )
         )

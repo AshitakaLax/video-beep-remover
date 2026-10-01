@@ -216,6 +216,9 @@ provider = "gemini"                 # "gemini" (Google's Gemini API; its free ti
                                     # "openai": any OpenAI-compatible chat API (OpenRouter, Ollama...)
 url = ""                            # "": the provider's; needed for "openai"
 model = ""                          # "": gemini-3.5-flash-lite, or jev-latest; needed for "openai"
+fallback_models = []                # more models of the service, asked in order while those before are
+                                    # rate-limited, overloaded or out of their daily quota; on Gemini's
+                                    # free tier each model has limits of its own: ["gemini-3.8-flash"]
 api_key = "${VBR_JUDGE_API_KEY}"
 reasoning_effort = "auto"           # "auto": Gemini thinks little ("low"; "none" on 2.5); "": not sent
 timeout_s = 30

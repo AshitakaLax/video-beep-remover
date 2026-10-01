@@ -148,7 +148,9 @@ def context_status(cfg: Config) -> tuple[str, bool | None, str]:
         missing = []
     details = f"{'on' if enabled else 'off (--context turns it on)'}; classifier {cfg.context.classifier}; "
     if judge:
-        details += f"judge {judge}" + (" (online: the lines it judges are sent to it)" if online else "")
+        more = len(cfg.context.api.fallback_models) if online else 0
+        details += f"judge {judge}" + (f" and {more} fallback model{'s' * (more > 1)}" if more else "")
+        details += " (online: the lines it judges are sent to it)" if online else ""
     else:
         why = {"auto": " (no GPU)", "api": " (offline)"}.get(cfg.context.judge, "")
         if gpu is not None:  # too small for the default judge

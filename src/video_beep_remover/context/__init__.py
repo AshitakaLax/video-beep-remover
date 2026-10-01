@@ -2,6 +2,7 @@
 the report and the review subtitles. Acting on them is opt-in (M7): context.harmless = "keep" leaves
 uses judged harmless unmuted, and context.sexual = "mute" mutes the lines flagged as sexual."""
 
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -170,6 +171,9 @@ class ContextLayer:
         the audio, against which subtitle lines are checked (None: trust every line)."""
         judge = self.judge()
         asked, seconds, unanswered = (judge.asked, judge.seconds, judge.unanswered) if judge else (0, 0.0, 0)
+        # A judge behind an API counts the answers of each of its models (context.api.fallback_models).
+        answered: Counter[str] | None = getattr(judge.judge, "answered", None) if judge else None
+        before = Counter(answered or {})
         result = analyse_context(
             detections,
             lines,
@@ -193,6 +197,8 @@ class ContextLayer:
             "judge_seconds": round(judge.seconds - seconds, 1) if judge else 0.0,
             "sexual_lines": [_sexual_dict(s) for s in result.sexual],
         }
+        if answered is not None:
+            section["judge_models"] = dict(answered - before)
         if self.judge_off is not None:
             section["judge_off"] = self.judge_off
         return result, section
